@@ -9,6 +9,7 @@ export class BrowserHarness {
   private oscarContext: BrowserContext | undefined;
   private emulatorContext: BrowserContext | undefined;
   private scenario = "browser";
+  private readonly expectedMissingObservationIds = new Set<string>();
 
   constructor(private readonly config: SuiteConfig, private readonly reporter: RunReporter) {}
 
@@ -93,13 +94,24 @@ export class BrowserHarness {
         "Failed to load resource: the server responded with a status of 404",
         "MUI X: useResizeContainer",
       ].some((fragment) => text.includes(fragment));
-      if (!expectedHeadlessNoise) this.reporter.error(this.scenario, `${source}-console`, text, "", "warning");
+      const expectedMissingObservation = this.expectedMissingObservationIds.size > 0 &&
+        text.includes("Unable to resolve event by occupancy observation ID");
+      if (!expectedHeadlessNoise && !expectedMissingObservation)
+        this.reporter.error(this.scenario, `${source}-console`, text, "", "warning");
     });
     page.on("response", (response) => {
       if (response.status() === 404) {
         const url = response.url();
         const expectedPreparingRequest = /(?:\.m3u8|\/hls\/|\/sw\.js(?:\?|$)|\/favicon\.ico(?:\?|$))/i.test(url);
-        if (!expectedPreparingRequest) {
+        const expectedMissingObservation = [...this.expectedMissingObservationIds].some((observationId) => {
+          try {
+            return decodeURIComponent(new URL(url).pathname)
+              .endsWith(`/observations/${observationId}`);
+          } catch {
+            return false;
+          }
+        });
+        if (!expectedPreparingRequest && !expectedMissingObservation) {
           this.reporter.error(
             this.scenario,
             `${source}-http`,
@@ -140,6 +152,15 @@ export class BrowserHarness {
     if (!this.emulatorContext) throw new Error("Browser harness is not started");
     const page = await this.emulatorContext.newPage();
     return page;
+  }
+
+  async withExpectedMissingObservation<T>(observationId: string, operation: () => Promise<T>): Promise<T> {
+    this.expectedMissingObservationIds.add(observationId);
+    try {
+      return await operation();
+    } finally {
+      this.expectedMissingObservationIds.delete(observationId);
+    }
   }
 
   async screenshot(page: Page, label: string): Promise<string> {

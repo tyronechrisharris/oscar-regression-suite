@@ -1227,7 +1227,7 @@ export class RegressionScenarios {
         const searchPage = await this.browser.oscarPage();
         try {
           await this.goto(searchPage, "/event-log");
-          await searchPage.getByTestId("event-uuid-search-input").fill(eventUuid);
+          await searchPage.getByTestId("event-uuid-search-input").locator("input").fill(eventUuid);
           const navigation = searchPage.waitForURL(
             (url) => normalizePathname(url.pathname) === "/event-details" &&
               url.searchParams.get("eventId") === eventUuid,
@@ -1316,12 +1316,14 @@ export class RegressionScenarios {
         const missingPage = await this.browser.oscarPage();
         const missingUuid = randomUUID();
         try {
-          await this.goto(missingPage, `/event-details?eventId=${encodeURIComponent(missingUuid)}`);
-          const notFound = missingPage.getByTestId("event-lookup-not-found");
-          await notFound.waitFor({timeout: this.config.eventTimeoutMs});
-          const staleUuid = await missingPage.getByTestId("event-uuid-value").count() > 0;
-          const evidence = await this.browser.screenshot(missingPage, "event-uuid-not-found");
-          return {passed: !staleUuid, observed: `not-found state visible; stale event UUID visible=${staleUuid}`, evidence};
+          return await this.browser.withExpectedMissingObservation(missingUuid, async () => {
+            await this.goto(missingPage, `/event-details?eventId=${encodeURIComponent(missingUuid)}`);
+            const notFound = missingPage.getByTestId("event-lookup-not-found");
+            await notFound.waitFor({timeout: this.config.eventTimeoutMs});
+            const staleUuid = await missingPage.getByTestId("event-uuid-value").count() > 0;
+            const evidence = await this.browser.screenshot(missingPage, "event-uuid-not-found");
+            return {passed: !staleUuid, observed: `not-found state visible; stale event UUID visible=${staleUuid}`, evidence};
+          });
         } finally { await missingPage.close(); }
       });
     } finally { await page.close(); }
