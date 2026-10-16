@@ -27,6 +27,11 @@ export function safeName(value: string): string {
   return value.toLowerCase().replaceAll(/[^a-z0-9._-]+/g, "-").replaceAll(/^-+|-+$/g, "").slice(0, 96);
 }
 
+export function normalizePathname(pathname: string): string {
+  const normalized = pathname.replace(/\/+$/, "");
+  return normalized || "/";
+}
+
 export function describeError(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }

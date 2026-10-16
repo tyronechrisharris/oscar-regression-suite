@@ -8,7 +8,7 @@ import {RpmEmulatorClient} from "./emulator.js";
 import {MetricsSampler} from "./metrics.js";
 import {RunReporter} from "./reporter.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
-import {describeError, poll, safeName, sleep} from "./util.js";
+import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
 
 interface ProbeResult<T = undefined> {
   passed: boolean;
@@ -1132,7 +1132,7 @@ export class RegressionScenarios {
       const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
       await Promise.all([
         page.waitForURL(
-          (url) => url.pathname === "/event-details",
+          (url) => normalizePathname(url.pathname) === "/event-details",
           {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
         ),
         row.dblclick(),
@@ -1186,7 +1186,7 @@ export class RegressionScenarios {
           (value) => {
             try {
               const url = new URL(value);
-              return url.origin === origin && url.pathname === "/event-details" &&
+              return url.origin === origin && normalizePathname(url.pathname) === "/event-details" &&
                 url.searchParams.get("eventId") === eventUuid && Boolean(url.searchParams.get("nodeId"));
             } catch { return false; }
           },
@@ -1194,7 +1194,7 @@ export class RegressionScenarios {
         );
         const url = new URL(copied);
         return {
-          passed: url.origin === origin && url.pathname === "/event-details" &&
+          passed: url.origin === origin && normalizePathname(url.pathname) === "/event-details" &&
             url.searchParams.get("eventId") === eventUuid && Boolean(url.searchParams.get("nodeId")),
           observed: `${url.pathname}; eventId matches=${url.searchParams.get("eventId") === eventUuid}; nodeId present=${Boolean(url.searchParams.get("nodeId"))}`,
           value: copied,
@@ -1229,7 +1229,8 @@ export class RegressionScenarios {
           await this.goto(searchPage, "/event-log");
           await searchPage.getByTestId("event-uuid-search-input").fill(eventUuid);
           const navigation = searchPage.waitForURL(
-            (url) => url.pathname === "/event-details" && url.searchParams.get("eventId") === eventUuid,
+            (url) => normalizePathname(url.pathname) === "/event-details" &&
+              url.searchParams.get("eventId") === eventUuid,
             {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
           );
           await searchPage.getByTestId("event-uuid-search-submit").click();
