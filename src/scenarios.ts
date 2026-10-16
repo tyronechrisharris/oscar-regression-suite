@@ -1130,8 +1130,13 @@ export class RegressionScenarios {
       const occupancyCount = await this.triggerAlarm("gamma", "event-uuid");
       if (occupancyCount === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy count");
       const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
-      await row.dblclick();
-      await page.waitForURL((url) => url.pathname === "/event-details", {timeout: this.config.eventTimeoutMs});
+      await Promise.all([
+        page.waitForURL(
+          (url) => url.pathname === "/event-details",
+          {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
+        ),
+        row.dblclick(),
+      ]);
       await page.getByRole("heading", {name: "Event Details"}).waitFor();
 
       const eventUuid = await this.check({
@@ -1225,7 +1230,7 @@ export class RegressionScenarios {
           await searchPage.getByTestId("event-uuid-search-input").fill(eventUuid);
           const navigation = searchPage.waitForURL(
             (url) => url.pathname === "/event-details" && url.searchParams.get("eventId") === eventUuid,
-            {timeout: this.config.eventTimeoutMs},
+            {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
           );
           await searchPage.getByTestId("event-uuid-search-submit").click();
           await navigation;
@@ -1327,8 +1332,10 @@ export class RegressionScenarios {
     const page = await this.browser.oscarPage();
     try {
       const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
-      await row.dblclick();
-      await page.waitForURL(/\/event-details/);
+      await Promise.all([
+        page.waitForURL(/\/event-details/, {waitUntil: "domcontentloaded"}),
+        row.dblclick(),
+      ]);
       await page.getByRole("heading", {name: "Event Details"}).waitFor();
 
       const alarmFile = await this.check({
