@@ -1230,7 +1230,8 @@ export class RegressionScenarios {
           await searchPage.getByTestId("event-uuid-search-input").locator("input").fill(eventUuid);
           const navigation = searchPage.waitForURL(
             (url) => normalizePathname(url.pathname) === "/event-details" &&
-              url.searchParams.get("eventId") === eventUuid,
+              url.searchParams.get("eventId") === eventUuid &&
+              Boolean(url.searchParams.get("nodeId")),
             {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
           );
           await searchPage.getByTestId("event-uuid-search-submit").click();
