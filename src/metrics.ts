@@ -168,7 +168,9 @@ export class MetricsSampler {
       "-o", "BatchMode=yes",
       "-o", "StrictHostKeyChecking=yes",
       "-o", "ConnectTimeout=8",
-      ...(this.config.sshIdentityFile ? ["-i", this.config.sshIdentityFile] : []),
+      ...(this.config.sshIdentityFile
+        ? ["-o", "IdentitiesOnly=yes", "-i", this.config.sshIdentityFile]
+        : []),
       this.config.oscarSshTarget,
       command,
     ];
