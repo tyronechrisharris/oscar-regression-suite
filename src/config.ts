@@ -1,6 +1,6 @@
 import {mkdirSync, readFileSync} from "node:fs";
 import {resolve} from "node:path";
-import type {Profile, SuiteConfig} from "./types.js";
+import type {CapabilityMode, Profile, SuiteConfig} from "./types.js";
 
 function loadDotEnv(path = resolve(".env")): void {
   try {
@@ -65,6 +65,15 @@ function boolean(name: string, fallback: boolean): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
+function capabilityMode(name: string, fallback: CapabilityMode): CapabilityMode {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["auto", "required", "disabled"].includes(raw)) {
+    return raw as CapabilityMode;
+  }
+  throw new Error(`${name} must be auto, required, or disabled`);
+}
+
 interface ParsedArguments {
   profile?: string;
   scenario?: string;
@@ -121,7 +130,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "adjudication", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
   ]);
   const unknownScenarios = scenarioValues.filter((value) => !knownScenarios.has(value));
   if (unknownScenarios.length) {
@@ -160,6 +169,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     uiTimeoutMs: integer("UI_TIMEOUT_MS", 30_000, 1_000),
     eventTimeoutMs: integer("EVENT_TIMEOUT_MS", 90_000, 10_000),
     extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
+    eventUuidWorkflow: capabilityMode("EVENT_UUID_WORKFLOW", "auto"),
     resultsRoot,
     scenarioFilter: new Set(scenarioValues),
   };

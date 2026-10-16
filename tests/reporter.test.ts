@@ -12,7 +12,7 @@ const metadata: RunMetadata = {
   browser: "test", oscarBaseUrl: "https://oscar.test", oscarBuildLabel: "test",
   rpmEmulatorUrl: "http://emulator.test", emulatorBuildLabel: "test",
   testRpmId: "rpm-50", testLaneLabel: "Lane50", expectedLaneCount: 50,
-  expectedCameraCount: 50, remoteMetricsExpected: false,
+  expectedCameraCount: 50, eventUuidWorkflow: "auto", remoteMetricsExpected: false,
 };
 
 test("reporter aggregates correct and incorrect behavior and redacts secrets", () => {

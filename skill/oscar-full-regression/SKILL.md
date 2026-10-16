@@ -77,6 +77,11 @@ For diagnosis, pass a scenario filter such as:
 
 Full-profile filters still perform mandatory setup and cleanup.
 
+For a Viewer release that claims occupancy UUID lookup and export support, set
+`EVENT_UUID_WORKFLOW=required` and include `event-uuid` (or run the unfiltered
+full profile). Leave the default `auto` only when older deployments must remain
+testable; it records the absent capability as skipped.
+
 ## Interruption and recovery
 
 Normal errors and handled signals enter cleanup. A hard kill, power loss, network

@@ -1,5 +1,5 @@
 import {readFileSync, writeFileSync} from "node:fs";
-import {createHash} from "node:crypto";
+import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
 import type {Locator, Page} from "playwright";
 import {PDFParse} from "pdf-parse";
@@ -174,6 +174,7 @@ export class RegressionScenarios {
       await this.scenario("rpm-connection", () => this.connectionFault());
       await this.scenario("rpm-faults", () => this.faults());
       await this.scenario("rpm-alarms", () => this.alarms());
+      await this.scenario("event-uuid", () => this.eventUuidWorkflow());
       await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
       await this.scenario("extended-occupancy", () => this.extendedOccupancy());
       await this.scenario("adjudication-report", () => this.reporting([{reportType: "ADJUDICATION"}]));
@@ -1000,7 +1001,10 @@ export class RegressionScenarios {
     }
   }
 
-  private async triggerAlarm(type: "gamma" | "neutron"): Promise<number | undefined> {
+  private async triggerAlarm(
+    type: "gamma" | "neutron",
+    scenario = "rpm-alarms",
+  ): Promise<number | undefined> {
     const before = await this.emulator.waitForIdle(this.config.testRpmId);
     await this.emulator.trigger(this.config.testRpmId, type === "gamma", type === "neutron");
     const active = await this.emulator.waitForStatus(
@@ -1010,7 +1014,7 @@ export class RegressionScenarios {
       30_000,
     );
     this.reporter.outcome(
-      "rpm-alarms", "emulator-control", `trigger ${type} alarm`, this.config.testRpmId,
+      scenario, "emulator-control", `trigger ${type} alarm`, this.config.testRpmId,
       `occupancy count advances past ${before.occupancy_count} and ${type} latch becomes true`,
       `occupancy=${active.occupancy_count}; gamma=${active.is_gamma_alarm}; neutron=${active.is_neutron_alarm}`,
       active.occupancy_count > before.occupancy_count ? "correct" : "incorrect", 0,
@@ -1063,10 +1067,20 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
-  private async exportSelectedAlarm(page: Page): Promise<string> {
-    await page.getByRole("button", {name: /export alarm qr/i}).click();
+  private async exportSelectedAlarm(page: Page, expectedEventUuid?: string): Promise<string> {
+    const exportButton = page.getByRole("button", {name: /export alarm qr/i});
+    if (expectedEventUuid && !await exportButton.isEnabled()) {
+      throw new Error("Alarm QR export is disabled even though the occupancy UUID is resolved");
+    }
+    await exportButton.click();
     const dialog = page.getByRole("dialog");
     await dialog.getByText(/included|points/i).first().waitFor({timeout: 60_000});
+    if (expectedEventUuid) {
+      const displayedUuid = (await dialog.getByTestId("alarm-qr-export-uuid").innerText()).trim();
+      if (displayedUuid !== expectedEventUuid) {
+        throw new Error(`Alarm QR dialog UUID mismatch: expected ${expectedEventUuid}; got ${displayedUuid}`);
+      }
+    }
     const downloadPromise = page.waitForEvent("download");
     await dialog.getByRole("button", {name: /download alarm file/i}).click();
     const download = await downloadPromise;
@@ -1075,6 +1089,236 @@ export class RegressionScenarios {
     await download.saveAs(path);
     await dialog.getByRole("button", {name: /close/i}).click();
     return path;
+  }
+
+  private async eventUuidWorkflow(): Promise<void> {
+    const metadata: CheckMetadata = {
+      scenario: "event-uuid",
+      category: "event-identity",
+      action: "detect occupancy UUID workflow",
+      target: "Event Log",
+      expected: "UUID search controls are available",
+    };
+    if (this.config.eventUuidWorkflow === "disabled") {
+      this.skip(metadata, "EVENT_UUID_WORKFLOW=disabled");
+      return;
+    }
+
+    const page = await this.browser.oscarPage();
+    try {
+      await this.goto(page, "/event-log");
+      await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+      const searchInput = page.getByTestId("event-uuid-search-input");
+      const searchSubmit = page.getByTestId("event-uuid-search-submit");
+      const capabilityPresent = await searchInput.count() > 0 && await searchSubmit.count() > 0;
+      if (!capabilityPresent) {
+        if (this.config.eventUuidWorkflow === "auto") {
+          this.skip(metadata, "UUID workflow is not present on this build (auto detection)");
+        } else {
+          this.reporter.outcome(
+            metadata.scenario, metadata.category, metadata.action, metadata.target,
+            metadata.expected, "UUID search controls are absent", "incorrect", 0,
+          );
+        }
+        return;
+      }
+      this.reporter.outcome(
+        metadata.scenario, metadata.category, metadata.action, metadata.target,
+        metadata.expected, "UUID search input and submit controls detected", "correct", 0,
+      );
+
+      const occupancyCount = await this.triggerAlarm("gamma", "event-uuid");
+      if (occupancyCount === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy count");
+      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      await row.dblclick();
+      await page.waitForURL((url) => url.pathname === "/event-details", {timeout: this.config.eventTimeoutMs});
+      await page.getByRole("heading", {name: "Event Details"}).waitFor();
+
+      const eventUuid = await this.check({
+        scenario: "event-uuid", category: "event-identity", action: "show occupancy UUID on Event Details",
+        target: String(occupancyCount), expected: "the persisted occupancy observation identity is visible and canonicalized in the URL",
+      }, async () => {
+        const uuidValue = page.getByTestId("event-uuid-value");
+        await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
+        const uuid = (await uuidValue.innerText()).trim();
+        const current = new URL(page.url());
+        const validIdentity = uuid.length > 0 && uuid.length <= 128;
+        const canonical = current.searchParams.get("eventId") === uuid &&
+          Boolean(current.searchParams.get("nodeId"));
+        const passed = validIdentity && canonical;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "event-uuid-detail");
+        return {
+          passed,
+          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; nodeId=${current.searchParams.get("nodeId") ?? "missing"}`,
+          value: validIdentity ? uuid : undefined,
+          evidence,
+        };
+      });
+      if (!eventUuid) return;
+
+      const origin = new URL(this.config.oscarBaseUrl).origin;
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {origin});
+      await this.check({
+        scenario: "event-uuid", category: "event-identity", action: "copy occupancy UUID",
+        target: eventUuid, expected: "Copy UUID writes the exact observation identity to the clipboard",
+      }, async () => {
+        await page.getByTestId("copy-event-uuid").click();
+        const copied = await poll(
+          () => page.evaluate(() => navigator.clipboard.readText()),
+          (value) => value === eventUuid,
+          {timeoutMs: 5_000, intervalMs: 100, description: "copied occupancy UUID"},
+        );
+        return {passed: copied === eventUuid, observed: `clipboard matches=${copied === eventUuid}`};
+      });
+
+      const directLink = await this.check({
+        scenario: "event-uuid", category: "event-identity", action: "copy direct event link",
+        target: eventUuid, expected: "Copy Direct Link writes a canonical authenticated Viewer URL",
+      }, async () => {
+        await page.getByTestId("copy-event-direct-link").click();
+        const copied = await poll(
+          () => page.evaluate(() => navigator.clipboard.readText()),
+          (value) => {
+            try {
+              const url = new URL(value);
+              return url.origin === origin && url.pathname === "/event-details" &&
+                url.searchParams.get("eventId") === eventUuid && Boolean(url.searchParams.get("nodeId"));
+            } catch { return false; }
+          },
+          {timeoutMs: 5_000, intervalMs: 100, description: "copied direct event link"},
+        );
+        const url = new URL(copied);
+        return {
+          passed: url.origin === origin && url.pathname === "/event-details" &&
+            url.searchParams.get("eventId") === eventUuid && Boolean(url.searchParams.get("nodeId")),
+          observed: `${url.pathname}; eventId matches=${url.searchParams.get("eventId") === eventUuid}; nodeId present=${Boolean(url.searchParams.get("nodeId"))}`,
+          value: copied,
+        };
+      });
+
+      if (directLink) {
+        await this.check({
+          scenario: "event-uuid", category: "event-lookup", action: "open direct event link in a fresh page",
+          target: eventUuid, expected: "a fresh authenticated page resolves the same occupancy without Redux navigation state",
+        }, async () => {
+          const freshPage = await this.browser.oscarPage();
+          try {
+            const response = await freshPage.goto(directLink, {waitUntil: "domcontentloaded"});
+            const value = freshPage.getByTestId("event-uuid-value");
+            await value.waitFor({timeout: this.config.eventTimeoutMs});
+            const resolved = (await value.innerText()).trim();
+            const passed = (response?.status() ?? 0) < 400 && resolved === eventUuid &&
+              await freshPage.getByTestId("event-lookup-not-found").count() === 0;
+            const evidence = passed ? "" : await this.screenshotOnFailure(freshPage, "event-uuid-direct-link");
+            return {passed, observed: `HTTP ${response?.status() ?? 0}; resolved UUID matches=${resolved === eventUuid}`, evidence};
+          } finally { await freshPage.close(); }
+        });
+      }
+
+      await this.check({
+        scenario: "event-uuid", category: "event-lookup", action: "find event by occupancy UUID",
+        target: eventUuid, expected: "UUID search resolves and opens the canonical Event Details URL",
+      }, async () => {
+        const searchPage = await this.browser.oscarPage();
+        try {
+          await this.goto(searchPage, "/event-log");
+          await searchPage.getByTestId("event-uuid-search-input").fill(eventUuid);
+          const navigation = searchPage.waitForURL(
+            (url) => url.pathname === "/event-details" && url.searchParams.get("eventId") === eventUuid,
+            {timeout: this.config.eventTimeoutMs},
+          );
+          await searchPage.getByTestId("event-uuid-search-submit").click();
+          await navigation;
+          const value = searchPage.getByTestId("event-uuid-value");
+          await value.waitFor({timeout: this.config.eventTimeoutMs});
+          const resolved = (await value.innerText()).trim();
+          const url = new URL(searchPage.url());
+          const passed = resolved === eventUuid && Boolean(url.searchParams.get("nodeId"));
+          const evidence = passed ? "" : await this.screenshotOnFailure(searchPage, "event-uuid-search");
+          return {passed, observed: `resolved UUID matches=${resolved === eventUuid}; nodeId present=${Boolean(url.searchParams.get("nodeId"))}`, evidence};
+        } finally { await searchPage.close(); }
+      });
+
+      await this.check({
+        scenario: "event-uuid", category: "reports", action: "include occupancy UUID in printable PDF",
+        target: eventUuid, expected: "print-to-PDF output contains the full UUID while copy controls are omitted",
+      }, async () => {
+        const saved = join(this.reporter.downloadDir, `event-${safeName(eventUuid)}.pdf`);
+        await page.emulateMedia({media: "print"});
+        try {
+          const identityVisible = await page.getByTestId("event-identity").isVisible();
+          const copyUuidVisible = await page.getByTestId("copy-event-uuid").isVisible();
+          const copyLinkVisible = await page.getByTestId("copy-event-direct-link").isVisible();
+          const pdf = await page.pdf({format: "Letter", printBackground: true});
+          writeFileSync(saved, pdf);
+          const parser = new PDFParse({data: pdf});
+          let parsed;
+          try { parsed = await parser.getText(); } finally { await parser.destroy(); }
+          const includesUuid = parsed.text.includes(eventUuid);
+          return {
+            passed: parsed.total > 0 && identityVisible && includesUuid && !copyUuidVisible && !copyLinkVisible,
+            observed: `pages=${parsed.total}; identity visible=${identityVisible}; UUID present=${includesUuid}; copy controls hidden=${!copyUuidVisible && !copyLinkVisible}`,
+            evidence: join("downloads", basename(saved)),
+          };
+        } finally { await page.emulateMedia({media: "screen"}); }
+      });
+
+      const alarmFile = await this.check({
+        scenario: "event-uuid", category: "alarm-transfer", action: "include occupancy UUID in truncated QR export",
+        target: eventUuid, expected: "QR v1 transport document contains the same UUID in payload.event.observationId",
+      }, async () => {
+        const path = await this.exportSelectedAlarm(page, eventUuid);
+        const bytes = readFileSync(path);
+        const parsed = JSON.parse(bytes.toString("utf8")) as {
+          transport?: string;
+          payload?: {schema?: string; version?: number; event?: {observationId?: string}};
+        };
+        const passed = parsed.payload?.schema === "org.oscar.alarm-transfer" &&
+          parsed.payload.version === 1 && parsed.payload.event?.observationId === eventUuid &&
+          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
+        return {
+          passed,
+          observed: `${bytes.length} bytes; schema/version/UUID/transport valid=${passed}`,
+          value: path,
+          evidence: join("downloads", basename(path)),
+        };
+      });
+
+      if (alarmFile) {
+        await this.check({
+          scenario: "event-uuid", category: "alarm-transfer", action: "preserve UUID through QR import",
+          target: eventUuid, expected: "decoding the truncated transport reproduces and displays the same UUID",
+        }, async () => {
+          const importPage = await this.browser.oscarPage();
+          try {
+            await this.goto(importPage, "/alarm-transfer");
+            await importPage.locator('input[type="file"][accept*="json"]').setInputFiles(alarmFile);
+            await importPage.getByText("The alarm data passed its SHA-256 integrity check.", {exact: true})
+              .waitFor({timeout: this.config.eventTimeoutMs});
+            const importedUuid = (await importPage.getByTestId("alarm-transfer-import-uuid").innerText()).trim();
+            const passed = importedUuid === eventUuid;
+            const evidence = passed ? "" : await this.screenshotOnFailure(importPage, "event-uuid-qr-import");
+            return {passed, observed: `decoded import UUID matches=${passed}`, evidence};
+          } finally { await importPage.close(); }
+        });
+      }
+
+      await this.check({
+        scenario: "event-uuid", category: "event-lookup", action: "handle an unavailable occupancy UUID",
+        target: "nonexistent event", expected: "a safe direct lookup displays the explicit not-found state without stale event data",
+      }, async () => {
+        const missingPage = await this.browser.oscarPage();
+        const missingUuid = randomUUID();
+        try {
+          await this.goto(missingPage, `/event-details?eventId=${encodeURIComponent(missingUuid)}`);
+          const notFound = missingPage.getByTestId("event-lookup-not-found");
+          await notFound.waitFor({timeout: this.config.eventTimeoutMs});
+          const staleUuid = await missingPage.getByTestId("event-uuid-value").count() > 0;
+          const evidence = await this.browser.screenshot(missingPage, "event-uuid-not-found");
+          return {passed: !staleUuid, observed: `not-found state visible; stale event UUID visible=${staleUuid}`, evidence};
+        } finally { await missingPage.close(); }
+      });
+    } finally { await page.close(); }
   }
 
   private async adjudicationAndAlarmTransfer(): Promise<void> {

@@ -12,6 +12,7 @@ const baseEnvironment = {
   TEST_RPM_ID: "rpm-50",
   TEST_LANE_LABEL: "Lane50",
   RPM_LANE_MAPPING_ACK: "rpm-50:Lane50",
+  EVENT_UUID_WORKFLOW: "auto",
 };
 
 function withEnvironment(values: Record<string, string>, operation: () => void): void {
@@ -48,6 +49,18 @@ test("configuration rejects unknown scenarios and partial integer values", () =>
     process.env.EXPECTED_LANE_COUNT = "50junk";
     assert.throws(() => loadConfig([]), /whole-number integer/);
     delete process.env.EXPECTED_LANE_COUNT;
+  });
+});
+
+test("configuration accepts UUID workflow modes and the event-uuid scenario", () => {
+  withEnvironment({...baseEnvironment, EVENT_UUID_WORKFLOW: "required"}, () => {
+    const config = loadConfig(["--profile", "full", "--scenario", "event-uuid"]);
+    assert.equal(config.eventUuidWorkflow, "required");
+    assert.deepEqual([...config.scenarioFilter], ["event-uuid"]);
+  });
+
+  withEnvironment({...baseEnvironment, EVENT_UUID_WORKFLOW: "sometimes"}, () => {
+    assert.throws(() => loadConfig([]), /EVENT_UUID_WORKFLOW must be auto, required, or disabled/);
   });
 });
 

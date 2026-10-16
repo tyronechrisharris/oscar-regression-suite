@@ -25,6 +25,8 @@ is configuration-driven so later builds can be tested without changing source.
   extended-occupancy detection and recovery
 - live HLS camera playback, decoded dimensions, and advancing playback time
 - alarm ingestion and full-database event filtering
+- occupancy UUID display, search, fresh direct links, not-found handling, and
+  exact UUID preservation in printable PDFs and truncated QR exports
 - offline alarm JSON export/import and SHA-256 validation
 - full adjudication, confirmation, and audit-history display
 - site, lane, event, state-of-health, and adjudication PDF reports
@@ -105,6 +107,11 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_TEST_TARGET_ACK` | exact hostname from `OSCAR_BASE_URL` |
 | `RPM_EMULATOR_URL` | emulator HTTP origin |
 | `TEST_RPM_ID` / `TEST_LANE_LABEL` | reserved emulator RPM and Viewer lane |
+| `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
+
+Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
+the occupancy UUID workflow. The default `auto` mode records one skipped check
+instead of failing when the controls are absent from an older deployment.
 
 `OSCAR_SSH_TARGET` enables read-only Docker/host performance sampling.
 `OSCAR_SSH_IDENTITY_FILE` may point to a dedicated least-privilege key.

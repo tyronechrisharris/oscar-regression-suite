@@ -52,6 +52,8 @@ container/host fields are simply absent.
 ./scripts/run-regression.sh smoke
 ./scripts/run-regression.sh full
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication
+# Release gate for a build that claims the occupancy UUID workflow:
+EVENT_UUID_WORKFLOW=required ./scripts/run-regression.sh full --scenario event-uuid
 ```
 
 Review `summary.md`, `functional-results.csv`, `errors.csv`, and cleanup rows

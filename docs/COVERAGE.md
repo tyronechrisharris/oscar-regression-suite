@@ -22,6 +22,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | RPM connection | stop/restart appears Offline/Online | full | reserved RPM only |
 | Faults | gamma high/low, neutron high, and tamper assert and clear | full | reserved RPM only |
 | Alarms | deterministic gamma and neutron alarms reach Event Log | full | permanent event data |
+| Event identity | capture the persisted occupancy UUID; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, print-to-PDF text, and QR v1 round-trip | full | one permanent alarm event; local clipboard/artifacts |
 | Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity | full | local artifact only |
 | Adjudication | Code 9 submission, confirmation, success, audit display | full | permanent audit record |
 | Extended occupancy | duration over configured threshold faults, then clears | full | reserved RPM only |
@@ -40,7 +41,9 @@ external, or depend on nondeterministic operating-system UI:
 - external WebID services
 - a physical camera scanning a QR code; JSON/image import is the deterministic
   equivalent
-- native Share and print dialogs; the suite validates downloaded files instead
+- native Share and print dialogs; the suite validates copied link text and uses
+  Chromium print-to-PDF against the same print media rather than automating an
+  operating-system dialog
 - creating or changing operational-view metadata; a preconfigured view can be
   checked by setting `OPERATIONAL_VIEW_KEY`
 
@@ -51,7 +54,12 @@ These require a disposable deployment and a separate, explicit test plan.
 `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`,
 `status-of-health`, `lane-video`, `event-filtering`, `operational-views`,
 `reporting`, `alarm-transfer`, `rpm-connection`, `rpm-faults`, `rpm-alarms`,
-`adjudication`, `extended-occupancy`, and `adjudication-report`.
+`event-uuid`, `adjudication`, `extended-occupancy`, and `adjudication-report`.
+
+`event-uuid` is capability-gated with `EVENT_UUID_WORKFLOW`. Its default `auto`
+mode skips cleanly on older Viewer builds; use `required` for builds that claim
+the feature. The not-found check uses a newly generated identity and never
+deletes an event.
 
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.

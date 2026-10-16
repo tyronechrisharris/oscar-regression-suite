@@ -62,6 +62,7 @@ async function main(): Promise<number> {
     testLaneLabel: config.testLaneLabel,
     expectedLaneCount: config.expectedLaneCount,
     expectedCameraCount: config.expectedCameraCount,
+    eventUuidWorkflow: config.eventUuidWorkflow,
     remoteMetricsExpected: Boolean(config.oscarSshTarget),
   });
   const emulator = new RpmEmulatorClient(config.rpmEmulatorUrl);
