@@ -557,11 +557,22 @@ export class RegressionScenarios {
         target: "Event Log Advanced filters", expected: `server-side filter returns only ${this.config.testLaneLabel} rows`,
       }, async () => {
         await this.applyLaneEventFilter(page);
-        const texts = await poll(
-          () => page.locator(".MuiDataGrid-row").allInnerTexts(),
-          (values) => values.length > 0 && values.every((value) => value.includes(this.config.testLaneLabel)),
-          {timeoutMs: 30_000, intervalMs: 500, description: `filtered rows for ${this.config.testLaneLabel}`},
-        );
+        let texts: string[];
+        try {
+          texts = await poll(
+            () => page.locator(".MuiDataGrid-row").allInnerTexts(),
+            (values) => values.length > 0 && values.every((value) => value.includes(this.config.testLaneLabel)),
+            {timeoutMs: 30_000, intervalMs: 500, description: `filtered rows for ${this.config.testLaneLabel}`},
+          );
+        } catch (error) {
+          const evidence = await this.screenshotOnFailure(page, "event-filter-lane-mismatch");
+          this.reporter.error("event-filtering", "apply full-database lane filter", error, evidence);
+          return {
+            passed: false,
+            observed: `filter did not converge: ${describeError(error)}`,
+            evidence,
+          };
+        }
         return {
           passed: texts.length > 0 && texts.every((text) => text.includes(this.config.testLaneLabel)),
           observed: `${texts.length} visible rows; all match lane=${texts.every((text) => text.includes(this.config.testLaneLabel))}`,
@@ -578,8 +589,18 @@ export class RegressionScenarios {
     const boxes = dialog.getByRole("combobox");
     await boxes.nth(1).click();
     await page.getByRole("option", {name: "Lane ID", exact: true}).click();
+    await poll(
+      () => boxes.nth(1).innerText(),
+      (value) => value.trim() === "Lane ID",
+      {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "lane filter field selection"},
+    );
     await boxes.nth(3).click();
     await page.getByRole("option", {name: this.config.testLaneLabel, exact: true}).click();
+    await poll(
+      () => boxes.nth(3).innerText(),
+      (value) => value.trim() === this.config.testLaneLabel,
+      {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "lane filter value selection"},
+    );
     await dialog.getByRole("button", {name: /apply filters/i}).click();
     await dialog.waitFor({state: "hidden"});
   }
