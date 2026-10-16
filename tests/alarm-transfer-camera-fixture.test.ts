@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {createHash} from "node:crypto";
 import test from "node:test";
 import {
   createAlarmTransferCameraFixture,
@@ -10,10 +11,16 @@ test("camera fixture is a deterministic, representative version-23 OSCAR alarm Q
   const repeated = createAlarmTransferCameraFixture();
 
   assert.equal(fixture.transport, repeated.transport);
+  assert.equal(
+    createHash("sha256").update(fixture.transport, "utf8").digest("hex"),
+    "cd8cfdffb49c35bd585f95493bd085bb8f1b7580b3892cd7ce3efdaf99abba14",
+  );
   assert.equal(fixture.qrVersion, 23);
   assert.equal(fixture.qrSize, 109);
   assert.equal(fixture.transportCharacters, 1_170);
   assert.equal(fixture.transport.length, fixture.transportCharacters);
+  assert.equal(fixture.digest, "5fb60f46505448b04d997cf3f111880a4cb4fbbbe405d3628d586721a3699840");
+  assert.ok(fixture.transport.endsWith(`/${fixture.digest.toUpperCase()}`));
   assert.ok(fixture.transportCharacters <= 2_200);
   assert.equal(fixture.frameWidth, 640);
   assert.equal(fixture.frameHeight, 480);
