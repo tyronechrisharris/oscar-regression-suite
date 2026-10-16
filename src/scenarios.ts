@@ -908,20 +908,41 @@ export class RegressionScenarios {
     const page = await this.browser.oscarPage();
     try {
       await this.goto(page, "/alarm-transfer");
+      const importField = page.getByLabel("Paste OSCAR alarm QR payload", {exact: true});
+      const importUiReady = await importField.waitFor({
+        state: "visible",
+        timeout: this.config.uiTimeoutMs,
+      }).then(() => true, () => false);
+      if (!importUiReady) {
+        const evidence = await this.screenshotOnFailure(page, "alarm-transfer-camera-import-ui-not-ready");
+        this.reporter.outcome(
+          capability.scenario, capability.category, capability.action, capability.target,
+          capability.expected,
+          "Alarm Transfer import UI did not become ready before camera capability detection",
+          "incorrect", 0, evidence,
+        );
+        return;
+      }
       const startButton = page.getByRole("button", {name: /start camera scan/i});
       const imageButton = page.getByRole("button", {name: /scan qr image/i});
-      const startControlPresent = await startButton.count() > 0;
-      const imageControlPresent = await imageButton.count() > 0;
+      const [startControlPresent, imageControlPresent] = await Promise.all([
+        startButton.count().then((count) => count > 0),
+        imageButton.count().then((count) => count > 0),
+      ]);
       if (!startControlPresent || !imageControlPresent) {
         if (this.config.alarmTransferCameraWorkflow === "auto" &&
             !startControlPresent && !imageControlPresent) {
           this.skip(capability, "camera QR workflow is not present on this build (auto detection)");
         } else {
+          const observed = !startControlPresent && !imageControlPresent
+            ? "camera and QR-image scan controls are both absent"
+            : `partial camera workflow: start control=${startControlPresent}; ` +
+              `QR-image control=${imageControlPresent}`;
+          const evidence = await this.screenshotOnFailure(page, "alarm-transfer-camera-capability-missing");
           this.reporter.outcome(
             capability.scenario, capability.category, capability.action, capability.target,
             capability.expected,
-            `partial camera workflow: start control=${startControlPresent}; QR-image control=${imageControlPresent}`,
-            "incorrect", 0,
+            observed, "incorrect", 0, evidence,
           );
         }
         return;
