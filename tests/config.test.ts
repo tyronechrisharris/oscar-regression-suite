@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import {mkdtempSync, readFileSync, writeFileSync} from "node:fs";
+import {tmpdir} from "node:os";
+import {join, resolve} from "node:path";
 import test from "node:test";
 import {assertMutationAllowed, loadConfig} from "../src/config.js";
 
@@ -12,6 +15,9 @@ const baseEnvironment = {
   TEST_RPM_ID: "rpm-50",
   TEST_LANE_LABEL: "Lane50",
   RPM_LANE_MAPPING_ACK: "rpm-50:Lane50",
+  OPERATIONAL_VIEW_WORKFLOW: "auto",
+  OSCAR_LANE_CONFIG_PATH: resolve("fixtures/oscar-50-lane-config.csv"),
+  EVENT_UUID_WORKFLOW: "auto",
 };
 
 function withEnvironment(values: Record<string, string>, operation: () => void): void {
@@ -48,6 +54,69 @@ test("configuration rejects unknown scenarios and partial integer values", () =>
     process.env.EXPECTED_LANE_COUNT = "50junk";
     assert.throws(() => loadConfig([]), /whole-number integer/);
     delete process.env.EXPECTED_LANE_COUNT;
+  });
+});
+
+test("configuration accepts UUID workflow modes and the event-uuid scenario", () => {
+  withEnvironment({...baseEnvironment, EVENT_UUID_WORKFLOW: "required"}, () => {
+    const config = loadConfig(["--profile", "full", "--scenario", "event-uuid"]);
+    assert.equal(config.eventUuidWorkflow, "required");
+    assert.deepEqual([...config.scenarioFilter], ["event-uuid"]);
+  });
+
+  withEnvironment({...baseEnvironment, EVENT_UUID_WORKFLOW: "sometimes"}, () => {
+    assert.throws(() => loadConfig([]), /EVENT_UUID_WORKFLOW must be auto, required, or disabled/);
+  });
+});
+
+test("configuration loads the lane membership oracle and operational-view workflow mode", () => {
+  withEnvironment({...baseEnvironment, OPERATIONAL_VIEW_WORKFLOW: "required"}, () => {
+    const config = loadConfig(["--scenario", "operational-views"]);
+    assert.equal(config.operationalViewWorkflow, "required");
+    assert.equal(config.oscarLaneConfigPath, resolve("fixtures/oscar-50-lane-config.csv"));
+    assert.ok(config.laneConfigOracle);
+    assert.equal(config.laneConfigOracle.lanes.length, 50);
+    assert.deepEqual(config.laneConfigOracle.lanesByView.get("east-gate"),
+      Array.from({length: 10}, (_, index) => `Lane${String(index + 1).padStart(2, "0")}`));
+  });
+
+  withEnvironment({...baseEnvironment, OPERATIONAL_VIEW_WORKFLOW: "sometimes"}, () => {
+    assert.throws(() => loadConfig([]), /OPERATIONAL_VIEW_WORKFLOW must be auto, required, or disabled/);
+  });
+});
+
+test("operational-view modes default to a required gate and preserve explicit legacy behavior", () => {
+  withEnvironment({...baseEnvironment, OPERATIONAL_VIEW_WORKFLOW: " "}, () => {
+    assert.equal(loadConfig([]).operationalViewWorkflow, "required");
+  });
+
+  withEnvironment({
+    ...baseEnvironment,
+    OPERATIONAL_VIEW_WORKFLOW: "disabled",
+    OSCAR_LANE_CONFIG_PATH: resolve("fixtures/does-not-exist.csv"),
+    EXPECTED_LANE_COUNT: "10",
+  }, () => {
+    const config = loadConfig([]);
+    assert.equal(config.operationalViewWorkflow, "disabled");
+    assert.equal(config.laneConfigOracle, undefined);
+  });
+
+  const root = mkdtempSync(join(tmpdir(), "oscar-noncanonical-config-"));
+  const legacyFixture = join(root, "ten-lanes.csv");
+  const canonicalLines = readFileSync(resolve("fixtures/oscar-50-lane-config.csv"), "utf8")
+    .trimEnd().split(/\r?\n/);
+  writeFileSync(legacyFixture, `${canonicalLines.slice(0, 11).join("\n")}\n`);
+  withEnvironment({
+    ...baseEnvironment,
+    OPERATIONAL_VIEW_WORKFLOW: "auto",
+    OSCAR_LANE_CONFIG_PATH: legacyFixture,
+    EXPECTED_LANE_COUNT: "10",
+  }, () => {
+    const config = loadConfig([]);
+    assert.equal(config.operationalViewWorkflow, "auto");
+    assert.equal(config.laneConfigOracle?.lanes.length, 10);
+    assert.deepEqual([...config.laneConfigOracle?.lanesByView.keys() ?? []].sort(),
+      ["east-gate", "entrance", "exit"]);
   });
 });
 

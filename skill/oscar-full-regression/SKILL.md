@@ -56,9 +56,11 @@ Start from the deployed checkout (for example,
 skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 `scripts/run_suite.sh` from the skill directory.
 
-1. Record OSCAR_BUILD_LABEL, EMULATOR_BUILD_LABEL, the reserved RPM/lane, and
-   expected lane/camera counts.
-2. Validate suite static checks, unit tests, and dependency audit.
+1. Record OSCAR_BUILD_LABEL, EMULATOR_BUILD_LABEL, the reserved RPM/lane,
+   expected lane/camera counts, the lane-fixture path, and the operational-view
+   workflow mode.
+2. Validate suite static checks, unit tests, dependency audit, and the selected
+   lane fixture.
 3. Run ./scripts/run-regression.sh smoke.
 4. Inspect summary.md, errors.csv, failed functional rows, and screenshots. Do not
    proceed to mutation if login, target identity, emulator inventory, mapping, or
@@ -76,6 +78,54 @@ For diagnosis, pass a scenario filter such as:
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication
 
 Full-profile filters still perform mandatory setup and cleanup.
+
+For a Viewer release that claims occupancy UUID lookup and export support, set
+`EVENT_UUID_WORKFLOW=required` and include `event-uuid` (or run the unfiltered
+full profile). Leave the default `auto` only when older deployments must remain
+testable; it records the absent capability as skipped.
+
+For canonical 50-lane release regression, set both:
+
+```text
+OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv
+OPERATIONAL_VIEW_WORKFLOW=required
+```
+
+Resolve a relative fixture path from the regression-suite checkout. `required`
+must make a missing, malformed, or mismatched fixture/site assignment fail; do
+not accept an operational-view skip as a release pass. Retain `auto` only for an
+explicit legacy or noncanonical deployment, and use `disabled` only when the
+requested test scope explicitly excludes this capability.
+
+## Canonical operational-view oracle
+
+The selected fixture is the membership oracle, not merely seed data:
+
+| Lanes | Primary key | First five in block | Last five in block |
+| --- | --- | --- | --- |
+| Lane01-Lane10 | `east-gate` | `entrance` | `exit` |
+| Lane11-Lane20 | `west-gate` | `entrance` | `exit` |
+| Lane21-Lane30 | `north-gate` | `entrance` | `exit` |
+| Lane31-Lane40 | `south-gate` | `entrance` | `exit` |
+| Lane41-Lane50 | `pedestrian` | `entrance` | `exit` |
+
+Require 50 unique lanes; exactly two distinct keys per lane; 10 lanes in each
+primary view; 25 in `entrance`; 25 in `exit`; and five in every
+primary/direction intersection. Lane names must be `Lane01` through `Lane50`,
+unique IDs must be `lane-01` through `lane-50`, and each fixture cell must order
+the primary key before the direction key.
+
+Exercise all seven exact sets rather than accepting a nonzero scoped row count.
+For each key, enter on the scoped Dashboard, follow the actual Status of Health
+navigation link, prove the `view` query survives, and compare the health rows to
+the fixture-derived lane set. A malformed key, a well-formed but unassigned key,
+and duplicate `view` parameters must each fail closed with zero health rows.
+
+CSV upload does not migrate matching `UniqueID` values. If a persistent target
+already has the 50 lanes, prove its live memberships match the fixture before
+testing. A successful upload alone is insufficient; use supported Admin edits
+and global save or explicitly reprovision a disposable site when migration is
+needed. Do not delete volumes or reinitialize a target as a shortcut.
 
 ## Interruption and recovery
 
@@ -98,7 +148,8 @@ If cleanup is not proven correct:
 Read references/REPORT_INTERPRETATION.md when summarizing a run.
 
 Always report the repository commit and build labels; runner/targets/RPM/lane;
-profile and timestamps; correct/incorrect/skipped totals; failed actions;
+profile, fixture, workflow modes, and timestamps; correct/incorrect/skipped
+totals; failed actions;
 per-action fault/alarm/adjudication counts; peak and average runner/OSCAR
 CPU/memory; missing samples, OOMs, or restarts; errors and evidence; cleanup
 status; and PASS, FAIL-product, FAIL-environment, or FAIL-harness classification.

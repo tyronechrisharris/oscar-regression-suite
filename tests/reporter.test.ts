@@ -12,7 +12,11 @@ const metadata: RunMetadata = {
   browser: "test", oscarBaseUrl: "https://oscar.test", oscarBuildLabel: "test",
   rpmEmulatorUrl: "http://emulator.test", emulatorBuildLabel: "test",
   testRpmId: "rpm-50", testLaneLabel: "Lane50", expectedLaneCount: 50,
-  expectedCameraCount: 50, remoteMetricsExpected: false,
+  expectedCameraCount: 50, operationalViewWorkflow: "auto",
+  oscarLaneConfigPath: "fixtures/oscar-50-lane-config.csv",
+  oscarLaneConfigSha256: "test-sha256",
+  operationalViewLaneCounts: {"east-gate": 10, entrance: 25},
+  eventUuidWorkflow: "auto", remoteMetricsExpected: false,
 };
 
 test("reporter aggregates correct and incorrect behavior and redacts secrets", () => {
@@ -31,10 +35,16 @@ test("reporter aggregates correct and incorrect behavior and redacts secrets", (
   const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
   const errors = readFileSync(join(result.outputDir, "errors.csv"), "utf8");
   const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
+  const run = JSON.parse(readFileSync(join(result.outputDir, "run.json"), "utf8")) as {
+    environment: RunMetadata;
+  };
   assert.match(functional, /\[REDACTED\] failed/);
   assert.doesNotMatch(functional, /private-value/);
   assert.match(errors, /Basic \[REDACTED\]/);
   assert.match(summary, /1 correct, 1 incorrect/);
+  assert.equal(run.environment.operationalViewWorkflow, "auto");
+  assert.equal(run.environment.oscarLaneConfigSha256, "test-sha256");
+  assert.deepEqual(run.environment.operationalViewLaneCounts, {"east-gate": 10, entrance: 25});
 });
 
 test("reporter fails an empty run and a run with a standalone runtime error", () => {

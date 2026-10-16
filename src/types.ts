@@ -1,4 +1,8 @@
+import type {LaneConfigOracle} from "./lane-config.js";
+
 export type Profile = "smoke" | "full";
+
+export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type ResultStatus = "correct" | "incorrect" | "skipped";
 
@@ -17,7 +21,9 @@ export interface SuiteConfig {
   testLaneLabel: string;
   expectedLaneCount: number;
   expectedCameraCount: number;
-  operationalViewKey?: string;
+  operationalViewWorkflow: CapabilityMode;
+  oscarLaneConfigPath: string;
+  laneConfigOracle?: LaneConfigOracle;
   oscarSshTarget?: string;
   sshIdentityFile?: string;
   browserExecutablePath?: string;
@@ -28,6 +34,7 @@ export interface SuiteConfig {
   uiTimeoutMs: number;
   eventTimeoutMs: number;
   extendedOccupancySeconds: number;
+  eventUuidWorkflow: CapabilityMode;
   resultsRoot: string;
   scenarioFilter: Set<string>;
 }
@@ -107,6 +114,11 @@ export interface RunMetadata {
   testLaneLabel: string;
   expectedLaneCount: number;
   expectedCameraCount: number;
+  operationalViewWorkflow: CapabilityMode;
+  oscarLaneConfigPath: string;
+  oscarLaneConfigSha256?: string;
+  operationalViewLaneCounts?: Record<string, number>;
+  eventUuidWorkflow: CapabilityMode;
   reservedRpmConfigSha256?: string;
   remoteMetricsExpected: boolean;
 }

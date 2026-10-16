@@ -16,12 +16,13 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Lane detail | charts and event table render | smoke | HLS start/stop commands |
 | Video | decoded dimensions, ready state, and advancing playback time | smoke | HLS start/stop commands |
 | Events | rows load and Advanced Filter returns only the requested lane | smoke | none |
-| Operational views | invalid key fails closed; optional configured key stays scoped | smoke | none |
+| Operational views | fixture-derived exact lane sets for east/west/north/south/pedestrian/entrance/exit; Dashboard-to-Health query persistence; invalid, unassigned, and duplicate parameters fail closed | smoke | none |
 | Reports | site, one-lane lane, alarm, alarm/occupancy, and health PDFs | smoke | report bucket writes |
 | Alarm import | malformed payload is rejected visibly | smoke | none |
 | RPM connection | stop/restart appears Offline/Online | full | reserved RPM only |
 | Faults | gamma high/low, neutron high, and tamper assert and clear | full | reserved RPM only |
 | Alarms | deterministic gamma and neutron alarms reach Event Log | full | permanent event data |
+| Event identity | capture the persisted occupancy UUID; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, print-to-PDF text, and QR v1 round-trip | full | one permanent alarm event; local clipboard/artifacts |
 | Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity | full | local artifact only |
 | Adjudication | Code 9 submission, confirmation, success, audit display | full | permanent audit record |
 | Extended occupancy | duration over configured threshold faults, then clears | full | reserved RPM only |
@@ -40,9 +41,12 @@ external, or depend on nondeterministic operating-system UI:
 - external WebID services
 - a physical camera scanning a QR code; JSON/image import is the deterministic
   equivalent
-- native Share and print dialogs; the suite validates downloaded files instead
-- creating or changing operational-view metadata; a preconfigured view can be
-  checked by setting `OPERATIONAL_VIEW_KEY`
+- native Share and print dialogs; the suite validates copied link text and uses
+  Chromium print-to-PDF against the same print media rather than automating an
+  operating-system dialog
+- applying operational-view metadata inside a run; the tracked 50-lane CSV must
+  be applied while provisioning the disposable site, then the suite reads that
+  same file as its membership oracle
 
 These require a disposable deployment and a separate, explicit test plan.
 
@@ -51,7 +55,18 @@ These require a disposable deployment and a separate, explicit test plan.
 `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`,
 `status-of-health`, `lane-video`, `event-filtering`, `operational-views`,
 `reporting`, `alarm-transfer`, `rpm-connection`, `rpm-faults`, `rpm-alarms`,
-`adjudication`, `extended-occupancy`, and `adjudication-report`.
+`event-uuid`, `adjudication`, `extended-occupancy`, and `adjudication-report`.
+
+`event-uuid` is capability-gated with `EVENT_UUID_WORKFLOW`. Its default `auto`
+mode skips cleanly on older Viewer builds; use `required` for builds that claim
+the feature. The not-found check uses a newly generated identity and never
+deletes an event.
+
+`operational-views` is capability-gated with `OPERATIONAL_VIEW_WORKFLOW`. In
+`required` mode, all seven keys from `OSCAR_LANE_CONFIG_PATH` are mandatory and
+must expose exactly the fixture lanes. `auto` skips cleanly only on legacy
+Viewers without the operational-view workflow; once detected, membership and
+fail-closed checks remain gating.
 
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.

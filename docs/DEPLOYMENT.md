@@ -31,6 +31,11 @@ Copy `.env.example` to `.env`, populate it outside Git, and set mode `0600`.
 On an NVM-based noninteractive SSH session, put the desired Node binary on
 `PATH`; `scripts/run-regression.sh` also locates the newest installed NVM Node.
 
+Provision every canonical 50-lane regression build with
+`fixtures/oscar-50-lane-config.csv`. Keep `OSCAR_LANE_CONFIG_PATH` pointed to the
+same tracked file so the UI assertions are derived from the deployed source of
+truth rather than duplicated expectations.
+
 ## Strict SSH for performance data
 
 Performance sampling is optional. Before setting `OSCAR_SSH_TARGET`:
@@ -52,6 +57,11 @@ container/host fields are simply absent.
 ./scripts/run-regression.sh smoke
 ./scripts/run-regression.sh full
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication
+# Release gate for a build that claims the occupancy UUID workflow:
+EVENT_UUID_WORKFLOW=required ./scripts/run-regression.sh full --scenario event-uuid
+# Release gate for the canonical seven operational views:
+OPERATIONAL_VIEW_WORKFLOW=required OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv \
+  ./scripts/run-regression.sh smoke --scenario operational-views
 ```
 
 Review `summary.md`, `functional-results.csv`, `errors.csv`, and cleanup rows

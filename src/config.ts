@@ -1,6 +1,7 @@
 import {mkdirSync, readFileSync} from "node:fs";
 import {resolve} from "node:path";
-import type {Profile, SuiteConfig} from "./types.js";
+import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane-config.js";
+import type {CapabilityMode, Profile, SuiteConfig} from "./types.js";
 
 function loadDotEnv(path = resolve(".env")): void {
   try {
@@ -65,6 +66,15 @@ function boolean(name: string, fallback: boolean): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
+function capabilityMode(name: string, fallback: CapabilityMode): CapabilityMode {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["auto", "required", "disabled"].includes(raw)) {
+    return raw as CapabilityMode;
+  }
+  throw new Error(`${name} must be auto, required, or disabled`);
+}
+
 interface ParsedArguments {
   profile?: string;
   scenario?: string;
@@ -110,6 +120,17 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   const {value: rpmEmulatorUrl, parsed: rpmParsed} = serviceUrl("RPM_EMULATOR_URL");
   const resultsRoot = resolve(process.env.RESULTS_ROOT?.trim() || "results");
   mkdirSync(resultsRoot, {recursive: true});
+  const expectedLaneCount = integer("EXPECTED_LANE_COUNT", 50, 1);
+  const operationalViewWorkflow = capabilityMode("OPERATIONAL_VIEW_WORKFLOW", "required");
+  const oscarLaneConfigPath = resolve(
+    process.env.OSCAR_LANE_CONFIG_PATH?.trim() || "fixtures/oscar-50-lane-config.csv",
+  );
+  const laneConfigOracle = operationalViewWorkflow === "disabled"
+    ? undefined
+    : loadLaneConfigOracle(oscarLaneConfigPath);
+  if (operationalViewWorkflow === "required" && laneConfigOracle) {
+    assertCanonicalOperationalViewOracle(laneConfigOracle, expectedLaneCount);
+  }
 
   const scenarioValues = parsedArguments.scenario === undefined
     ? []
@@ -121,7 +142,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "adjudication", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
   ]);
   const unknownScenarios = scenarioValues.filter((value) => !knownScenarios.has(value));
   if (unknownScenarios.length) {
@@ -141,10 +162,11 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     rpmLaneMappingAcknowledgement: process.env.RPM_LANE_MAPPING_ACK?.trim() || "",
     testRpmId: process.env.TEST_RPM_ID?.trim() || "rpm-50",
     testLaneLabel: process.env.TEST_LANE_LABEL?.trim() || "Lane50",
-    expectedLaneCount: integer("EXPECTED_LANE_COUNT", 50, 1),
+    expectedLaneCount,
     expectedCameraCount: integer("EXPECTED_CAMERA_COUNT", 50, 0),
-    ...(process.env.OPERATIONAL_VIEW_KEY?.trim()
-      ? {operationalViewKey: process.env.OPERATIONAL_VIEW_KEY.trim()} : {}),
+    operationalViewWorkflow,
+    oscarLaneConfigPath,
+    ...(laneConfigOracle ? {laneConfigOracle} : {}),
     ...(process.env.OSCAR_SSH_TARGET?.trim()
       ? {oscarSshTarget: process.env.OSCAR_SSH_TARGET.trim()} : {}),
     ...(process.env.OSCAR_SSH_IDENTITY_FILE?.trim()
@@ -160,6 +182,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     uiTimeoutMs: integer("UI_TIMEOUT_MS", 30_000, 1_000),
     eventTimeoutMs: integer("EVENT_TIMEOUT_MS", 90_000, 10_000),
     extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
+    eventUuidWorkflow: capabilityMode("EVENT_UUID_WORKFLOW", "auto"),
     resultsRoot,
     scenarioFilter: new Set(scenarioValues),
   };

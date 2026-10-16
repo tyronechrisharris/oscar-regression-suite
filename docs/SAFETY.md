@@ -14,10 +14,21 @@ OSCAR_BASE_URL=https://test-host
 OSCAR_TEST_TARGET_ACK=test-host
 RPM_EMULATOR_TARGET_ACK=emulator-host
 RPM_LANE_MAPPING_ACK=rpm-50:Lane50
+OPERATIONAL_VIEW_WORKFLOW=required
+OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv
 ```
 
 Loopback targets are refused. This guard reduces accidental execution but is not
 a substitute for verifying the host yourself.
+
+The lane CSV is read-only during a suite run. Apply it only while provisioning
+the authorized disposable regression system. OSCAR's spreadsheet import is
+additive: rows whose `UniqueID` already exists are skipped, not updated. On a
+persistent site, a successful upload therefore does not prove that operational
+views were migrated. Verify live memberships and use supported Admin edits plus
+a global save, or explicitly reprovision a disposable site. Never delete volumes
+or reinitialize a site merely to force the fixture to apply. The browser workflow
+uses the file solely as its exact membership oracle.
 
 Only one full run may use a given `TEST_RPM_ID`. The runner uses a local lock,
 but that cannot detect a run launched from a different machine. Coordinate
