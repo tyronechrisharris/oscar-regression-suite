@@ -399,7 +399,10 @@ export class RegressionScenarios {
         const uniqueLaneIds = new Set(laneIds);
         const numberedLane = this.config.testLaneLabel.match(/^(.*?)(\d+)$/);
         const expectedLaneIds = numberedLane && Number(numberedLane[2]) === this.config.expectedLaneCount
-          ? Array.from({length: this.config.expectedLaneCount}, (_, index) => `${numberedLane[1]}${index + 1}`)
+          ? Array.from(
+            {length: this.config.expectedLaneCount},
+            (_, index) => `${numberedLane[1]}${String(index + 1).padStart(numberedLane[2]?.length ?? 1, "0")}`,
+          )
           : [];
         const missing = expectedLaneIds.filter((laneId) => !uniqueLaneIds.has(laneId));
         const unexpected = expectedLaneIds.length
