@@ -1160,6 +1160,8 @@ export class RegressionScenarios {
         };
       });
       if (!eventUuid) return;
+      const eventNodeId = new URL(page.url()).searchParams.get("nodeId");
+      if (!eventNodeId) return;
 
       const origin = new URL(this.config.oscarBaseUrl).origin;
       await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {origin});
@@ -1187,7 +1189,7 @@ export class RegressionScenarios {
             try {
               const url = new URL(value);
               return url.origin === origin && normalizePathname(url.pathname) === "/event-details" &&
-                url.searchParams.get("eventId") === eventUuid && Boolean(url.searchParams.get("nodeId"));
+                url.searchParams.get("eventId") === eventUuid && url.searchParams.get("nodeId") === eventNodeId;
             } catch { return false; }
           },
           {timeoutMs: 5_000, intervalMs: 100, description: "copied direct event link"},
@@ -1195,8 +1197,8 @@ export class RegressionScenarios {
         const url = new URL(copied);
         return {
           passed: url.origin === origin && normalizePathname(url.pathname) === "/event-details" &&
-            url.searchParams.get("eventId") === eventUuid && Boolean(url.searchParams.get("nodeId")),
-          observed: `${url.pathname}; eventId matches=${url.searchParams.get("eventId") === eventUuid}; nodeId present=${Boolean(url.searchParams.get("nodeId"))}`,
+            url.searchParams.get("eventId") === eventUuid && url.searchParams.get("nodeId") === eventNodeId,
+          observed: `${url.pathname}; eventId matches=${url.searchParams.get("eventId") === eventUuid}; nodeId matches=${url.searchParams.get("nodeId") === eventNodeId}`,
           value: copied,
         };
       });
@@ -1231,7 +1233,7 @@ export class RegressionScenarios {
           const navigation = searchPage.waitForURL(
             (url) => normalizePathname(url.pathname) === "/event-details" &&
               url.searchParams.get("eventId") === eventUuid &&
-              Boolean(url.searchParams.get("nodeId")),
+              url.searchParams.get("nodeId") === eventNodeId,
             {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
           );
           await searchPage.getByTestId("event-uuid-search-submit").click();
@@ -1240,9 +1242,9 @@ export class RegressionScenarios {
           await value.waitFor({timeout: this.config.eventTimeoutMs});
           const resolved = (await value.innerText()).trim();
           const url = new URL(searchPage.url());
-          const passed = resolved === eventUuid && Boolean(url.searchParams.get("nodeId"));
+          const passed = resolved === eventUuid && url.searchParams.get("nodeId") === eventNodeId;
           const evidence = passed ? "" : await this.screenshotOnFailure(searchPage, "event-uuid-search");
-          return {passed, observed: `resolved UUID matches=${resolved === eventUuid}; nodeId present=${Boolean(url.searchParams.get("nodeId"))}`, evidence};
+          return {passed, observed: `resolved UUID matches=${resolved === eventUuid}; nodeId matches=${url.searchParams.get("nodeId") === eventNodeId}`, evidence};
         } finally { await searchPage.close(); }
       });
 
