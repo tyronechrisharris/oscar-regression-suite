@@ -1,0 +1,4 @@
+interface:
+  display_name: "OSCAR Full Regression"
+  short_description: "Run safe, complete OSCAR release regression tests."
+  default_prompt: "Use $oscar-full-regression to deploy or run the OSCAR regression suite against an authorized test system, restore emulator state, and summarize the CSV and narrative reports."

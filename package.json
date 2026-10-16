@@ -1,0 +1,36 @@
+{
+  "name": "oscar-regression-suite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end regression, fault-injection, workflow, and performance validation for OSCAR test deployments.",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tyronechrisharris/oscar-regression-suite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tyronechrisharris/oscar-regression-suite/issues"
+  },
+  "homepage": "https://github.com/tyronechrisharris/oscar-regression-suite#readme",
+  "type": "module",
+  "engines": {
+    "node": ">=20.16.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/**/*.test.ts",
+    "test:smoke": "tsx src/cli.ts --profile smoke",
+    "test:full": "tsx src/cli.ts --profile full",
+    "install:browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "pdf-parse": "^2.4.5",
+    "playwright": "^1.55.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
