@@ -75,6 +75,7 @@ async function main(): Promise<number> {
       ),
     } : {}),
     eventUuidWorkflow: config.eventUuidWorkflow,
+    alarmTransferCameraWorkflow: config.alarmTransferCameraWorkflow,
     remoteMetricsExpected: Boolean(config.oscarSshTarget),
   });
   const emulator = new RpmEmulatorClient(config.rpmEmulatorUrl);

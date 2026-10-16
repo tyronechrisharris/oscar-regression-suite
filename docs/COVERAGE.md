@@ -19,11 +19,12 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Operational views | fixture-derived exact lane sets for east/west/north/south/pedestrian/entrance/exit; Dashboard-to-Health query persistence; invalid, unassigned, and duplicate parameters fail closed | smoke | none |
 | Reports | site, one-lane lane, alarm, alarm/occupancy, and health PDFs | smoke | report bucket writes |
 | Alarm import | malformed payload is rejected visibly | smoke | none |
+| Alarm camera import | deterministic Chromium 640x480 stream starts; preview and contained scan overlay are visible and non-zero; visible status says `Scanning`; active camera reports the deterministic identity and 640 × 480; dense QR v23/1,170-character transport decodes with valid integrity and UUID; all tracks stop; denied permission is reported and retry succeeds | both | local generated media only |
 | RPM connection | stop/restart appears Offline/Online | full | reserved RPM only |
 | Faults | gamma high/low, neutron high, and tamper assert and clear | full | reserved RPM only |
 | Alarms | deterministic gamma and neutron alarms reach Event Log | full | permanent event data |
 | Event identity | capture the persisted occupancy UUID; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, print-to-PDF text, and QR v1 round-trip | full | one permanent alarm event; local clipboard/artifacts |
-| Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity | full | local artifact only |
+| Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity; actual exported QR PNG uploads and imports successfully | full | local artifacts only |
 | Adjudication | Code 9 submission, confirmation, success, audit display | full | permanent audit record |
 | Extended occupancy | duration over configured threshold faults, then clears | full | reserved RPM only |
 | Adjudication report | one-lane PDF is generated and validated | full | report bucket write |
@@ -39,8 +40,10 @@ external, or depend on nondeterministic operating-system UI:
 - “select all filtered” bulk adjudication outside an isolated synthetic fixture;
   it can permanently adjudicate unseen historical pages
 - external WebID services
-- a physical camera scanning a QR code; JSON/image import is the deterministic
-  equivalent
+- physical camera hardware, lighting/focus behavior, and the native
+  operating-system camera permission prompt; the suite instead gates the web
+  scanner with a deterministic generated Chromium media stream and exercises
+  denied-permission feedback inside the browser fixture
 - native Share and print dialogs; the suite validates copied link text and uses
   Chromium print-to-PDF against the same print media rather than automating an
   operating-system dialog
@@ -54,13 +57,29 @@ These require a disposable deployment and a separate, explicit test plan.
 
 `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`,
 `status-of-health`, `lane-video`, `event-filtering`, `operational-views`,
-`reporting`, `alarm-transfer`, `rpm-connection`, `rpm-faults`, `rpm-alarms`,
-`event-uuid`, `adjudication`, `extended-occupancy`, and `adjudication-report`.
+`reporting`, `alarm-transfer`, `alarm-transfer-camera`, `rpm-connection`,
+`rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `extended-occupancy`,
+and `adjudication-report`.
 
 `event-uuid` is capability-gated with `EVENT_UUID_WORKFLOW`. Its default `auto`
 mode skips cleanly on older Viewer builds; use `required` for builds that claim
 the feature. The not-found check uses a newly generated identity and never
 deletes an event.
+
+`alarm-transfer-camera` is capability-gated with
+`ALARM_TRANSFER_CAMERA_WORKFLOW`. Its default `auto` mode skips cleanly on older
+Viewers without camera controls; use `required` for builds that claim the
+scanner. The fixture is a 640x480 Chromium media stream containing a
+module-aligned QR version 23 symbol (109 modules plus a four-module quiet zone,
+rendered at three pixels per module) for a 1,170-character OSCAR alarm transport.
+The density intentionally detects scanners that crop to the former centered
+320-pixel region and requires the repaired scanner's roughly 420-pixel native
+square. The scenario verifies a visible non-zero preview, a non-zero scanner
+overlay fully contained within that preview, a visible `Scanning` status, the
+deterministic active-camera identity at 640 × 480, successful integrity and
+UUID import, stopped tracks, and denied-permission feedback with a successful retry.
+The full-profile alarm transfer also uploads the actual QR PNG exported by the
+Viewer rather than reconstructing an equivalent image.
 
 `operational-views` is capability-gated with `OPERATIONAL_VIEW_WORKFLOW`. In
 `required` mode, all seven keys from `OSCAR_LANE_CONFIG_PATH` are mandatory and

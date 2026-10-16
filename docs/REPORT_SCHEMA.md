@@ -57,9 +57,10 @@ otherwise passed.
 
 `summary.md` is the operator-facing concise report. `run.json` contains schema
 version, status, timestamps, duration, counts, and canonical file names for
-downstream automation. Its run metadata records `eventUuidWorkflow` so reviewers
-can distinguish an auto-detected legacy skip from a required UUID release gate.
-It also records `operationalViewWorkflow` and the resolved
+downstream automation. Its run metadata records `eventUuidWorkflow` and
+`alarmTransferCameraWorkflow` so reviewers can distinguish auto-detected legacy
+skips from required UUID and deterministic camera-scanning release gates. It
+also records `operationalViewWorkflow` and the resolved
 `oscarLaneConfigPath`. When that workflow is enabled, it records
 `oscarLaneConfigSha256` and `operationalViewLaneCounts`, identifying and
 fingerprinting the exact membership oracle used by scoped view checks.

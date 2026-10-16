@@ -35,6 +35,7 @@ export interface SuiteConfig {
   eventTimeoutMs: number;
   extendedOccupancySeconds: number;
   eventUuidWorkflow: CapabilityMode;
+  alarmTransferCameraWorkflow: CapabilityMode;
   resultsRoot: string;
   scenarioFilter: Set<string>;
 }
@@ -119,6 +120,7 @@ export interface RunMetadata {
   oscarLaneConfigSha256?: string;
   operationalViewLaneCounts?: Record<string, number>;
   eventUuidWorkflow: CapabilityMode;
+  alarmTransferCameraWorkflow: CapabilityMode;
   reservedRpmConfigSha256?: string;
   remoteMetricsExpected: boolean;
 }

@@ -18,6 +18,7 @@ const baseEnvironment = {
   OPERATIONAL_VIEW_WORKFLOW: "auto",
   OSCAR_LANE_CONFIG_PATH: resolve("fixtures/oscar-50-lane-config.csv"),
   EVENT_UUID_WORKFLOW: "auto",
+  ALARM_TRANSFER_CAMERA_WORKFLOW: "auto",
 };
 
 function withEnvironment(values: Record<string, string>, operation: () => void): void {
@@ -66,6 +67,23 @@ test("configuration accepts UUID workflow modes and the event-uuid scenario", ()
 
   withEnvironment({...baseEnvironment, EVENT_UUID_WORKFLOW: "sometimes"}, () => {
     assert.throws(() => loadConfig([]), /EVENT_UUID_WORKFLOW must be auto, required, or disabled/);
+  });
+});
+
+test("configuration accepts camera workflow modes and the alarm-transfer-camera scenario", () => {
+  for (const mode of ["auto", "required", "disabled"] as const) {
+    withEnvironment({...baseEnvironment, ALARM_TRANSFER_CAMERA_WORKFLOW: mode}, () => {
+      const config = loadConfig(["--scenario", "alarm-transfer-camera"]);
+      assert.equal(config.alarmTransferCameraWorkflow, mode);
+      assert.deepEqual([...config.scenarioFilter], ["alarm-transfer-camera"]);
+    });
+  }
+
+  withEnvironment({...baseEnvironment, ALARM_TRANSFER_CAMERA_WORKFLOW: "sometimes"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /ALARM_TRANSFER_CAMERA_WORKFLOW must be auto, required, or disabled/,
+    );
   });
 });
 

@@ -57,8 +57,8 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 `scripts/run_suite.sh` from the skill directory.
 
 1. Record OSCAR_BUILD_LABEL, EMULATOR_BUILD_LABEL, the reserved RPM/lane,
-   expected lane/camera counts, the lane-fixture path, and the operational-view
-   workflow mode.
+   expected lane/camera counts, the lane-fixture path, and the operational-view,
+   event-UUID, and alarm-transfer-camera workflow modes.
 2. Validate suite static checks, unit tests, dependency audit, and the selected
    lane fixture.
 3. Run ./scripts/run-regression.sh smoke.
@@ -83,6 +83,16 @@ For a Viewer release that claims occupancy UUID lookup and export support, set
 `EVENT_UUID_WORKFLOW=required` and include `event-uuid` (or run the unfiltered
 full profile). Leave the default `auto` only when older deployments must remain
 testable; it records the absent capability as skipped.
+
+For a Viewer release that claims Alarm Transfer camera scanning, set
+`ALARM_TRANSFER_CAMERA_WORKFLOW=required` and include `alarm-transfer-camera`
+(or run the unfiltered profile). The harness uses a deterministic Chromium
+640x480 stream carrying its generated dense QR v23/1,170-character OSCAR alarm
+fixture. Require camera startup, a visible non-zero preview, a non-zero scan
+overlay contained within the preview, a visible `Scanning` status, the
+deterministic active-camera identity at 640 × 480, integrity and UUID import,
+complete track cleanup, and denied-permission feedback plus a successful retry. This does not
+validate physical camera hardware or the native OS prompt.
 
 For canonical 50-lane release regression, set both:
 
@@ -156,6 +166,6 @@ status; and PASS, FAIL-product, FAIL-environment, or FAIL-harness classification
 
 Do not call the suite exhaustive beyond the checkout's `docs/COVERAGE.md`.
 Native OS dialogs,
-destructive Admin changes, broad bulk adjudication, external WebID, physical QR,
-HA/failover, soak/load, permissions matrices, and cross-browser/accessibility are
-explicit exclusions.
+destructive Admin changes, broad bulk adjudication, external WebID, physical QR
+hardware, HA/failover, soak/load, permissions matrices, and
+cross-browser/accessibility are explicit exclusions.

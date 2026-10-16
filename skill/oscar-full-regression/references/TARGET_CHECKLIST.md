@@ -16,6 +16,8 @@
 - expected lane/camera counts match the deployment
 - OSCAR_LANE_CONFIG_PATH resolves to the reviewed canonical fixture
 - OPERATIONAL_VIEW_WORKFLOW is `required` for canonical 50-lane release regression
+- ALARM_TRANSFER_CAMERA_WORKFLOW is `required` when camera scanning is part of
+  the Viewer release contract
 - build labels identify both OSCAR and emulator revisions
 
 ## Runner

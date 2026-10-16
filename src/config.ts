@@ -141,7 +141,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   const knownScenarios = new Set([
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "lane-video", "event-filtering", "operational-views",
-    "reporting", "alarm-transfer", "rpm-connection", "rpm-faults", "rpm-alarms",
+    "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
     "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
   ]);
   const unknownScenarios = scenarioValues.filter((value) => !knownScenarios.has(value));
@@ -183,6 +183,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     eventTimeoutMs: integer("EVENT_TIMEOUT_MS", 90_000, 10_000),
     extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
     eventUuidWorkflow: capabilityMode("EVENT_UUID_WORKFLOW", "auto"),
+    alarmTransferCameraWorkflow: capabilityMode("ALARM_TRANSFER_CAMERA_WORKFLOW", "auto"),
     resultsRoot,
     scenarioFilter: new Set(scenarioValues),
   };

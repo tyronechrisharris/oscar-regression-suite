@@ -31,6 +31,11 @@ interface ReportCase {
   eventType?: "ALARMS" | "ALARMS_OCCUPANCIES" | "SOH";
 }
 
+interface ExportedAlarmArtifacts {
+  alarmFile: string;
+  qrImage: string;
+}
+
 function isVisible(locator: Locator): Promise<boolean> {
   return locator.isVisible().catch(() => false);
 }
@@ -166,6 +171,7 @@ export class RegressionScenarios {
       {reportType: "LANE"},
     ]));
     await this.scenario("alarm-transfer", () => this.alarmTransferValidation());
+    await this.scenario("alarm-transfer-camera", () => this.alarmTransferCamera());
   }
 
   async runFull(): Promise<void> {
@@ -884,6 +890,250 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
+  private async alarmTransferCamera(): Promise<void> {
+    const capability: CheckMetadata = {
+      scenario: "alarm-transfer-camera",
+      category: "alarm-transfer",
+      action: "detect camera QR workflow",
+      target: "Alarm Transfer",
+      expected: "camera and QR-image scan controls are available",
+    };
+    if (this.config.alarmTransferCameraWorkflow === "disabled") {
+      this.skip(capability, "ALARM_TRANSFER_CAMERA_WORKFLOW=disabled");
+      return;
+    }
+
+    const fixture = this.browser.alarmTransferCameraFixture();
+    if (!fixture) throw new Error("Deterministic Alarm Transfer camera fixture was not installed");
+    const page = await this.browser.oscarPage();
+    try {
+      await this.goto(page, "/alarm-transfer");
+      const startButton = page.getByRole("button", {name: /start camera scan/i});
+      const imageButton = page.getByRole("button", {name: /scan qr image/i});
+      const startControlPresent = await startButton.count() > 0;
+      const imageControlPresent = await imageButton.count() > 0;
+      if (!startControlPresent || !imageControlPresent) {
+        if (this.config.alarmTransferCameraWorkflow === "auto" &&
+            !startControlPresent && !imageControlPresent) {
+          this.skip(capability, "camera QR workflow is not present on this build (auto detection)");
+        } else {
+          this.reporter.outcome(
+            capability.scenario, capability.category, capability.action, capability.target,
+            capability.expected,
+            `partial camera workflow: start control=${startControlPresent}; QR-image control=${imageControlPresent}`,
+            "incorrect", 0,
+          );
+        }
+        return;
+      }
+      // Fail closed before any scanner click so a broken init script can never
+      // fall through to a runner's physical camera.
+      await this.browser.assertAlarmTransferCameraFacade(page);
+      this.reporter.outcome(
+        capability.scenario, capability.category, capability.action, capability.target,
+        capability.expected,
+        `controls detected; fixture QR version=${fixture.qrVersion}; transport=${fixture.transportCharacters} characters; ` +
+          `symbol=${fixture.symbolPixels}px at ${fixture.pixelsPerModule}px/module`,
+        "correct", 0,
+      );
+
+      const cameraStarted = await this.check({
+        scenario: "alarm-transfer-camera", category: "camera", action: "start deterministic camera preview",
+        target: "Alarm Transfer camera",
+        expected: "camera starts with a visible, non-zero preview and a contained non-zero scan overlay",
+      }, async () => {
+        await startButton.click();
+        await page.getByRole("button", {name: /stop camera scan/i}).waitFor({timeout: this.config.uiTimeoutMs});
+        const preview = page.getByTestId("alarm-qr-camera-preview");
+        const video = page.getByTestId("alarm-qr-camera-video");
+        const overlay = preview.locator(".scan-region-highlight").first();
+        const status = page.getByTestId("alarm-qr-camera-status");
+        const activeCamera = page.getByTestId("alarm-qr-active-camera");
+        await preview.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+        await overlay.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+        await page.waitForFunction(() => {
+          const element = document.querySelector('[data-testid="alarm-qr-camera-video"]') as
+            HTMLVideoElement | null;
+          return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
+        }, undefined, {timeout: this.config.uiTimeoutMs});
+        const dimensions = await video.evaluate((element: HTMLVideoElement) => ({
+          readyState: element.readyState,
+          videoWidth: element.videoWidth,
+          videoHeight: element.videoHeight,
+          renderedWidth: element.getBoundingClientRect().width,
+          renderedHeight: element.getBoundingClientRect().height,
+        }));
+        const previewBox = await preview.boundingBox();
+        const overlayBox = await overlay.boundingBox();
+        const visibleContentHeight = Math.min(
+          dimensions.renderedHeight,
+          dimensions.renderedWidth * dimensions.videoHeight / dimensions.videoWidth,
+        );
+        const overlayRatio = overlayBox && visibleContentHeight > 0
+          ? overlayBox.height / visibleContentHeight
+          : 0;
+        const tolerance = 2;
+        const overlayContained = Boolean(previewBox && overlayBox && overlayBox.width > 0 && overlayBox.height > 0 &&
+          overlayBox.x >= previewBox.x - tolerance && overlayBox.y >= previewBox.y - tolerance &&
+          overlayBox.x + overlayBox.width <= previewBox.x + previewBox.width + tolerance &&
+          overlayBox.y + overlayBox.height <= previewBox.y + previewBox.height + tolerance);
+        const overlayCoverage = overlayRatio > 0.8 && overlayRatio <= 1.01;
+        const statusText = await poll(
+          () => status.innerText().then((value) => value.trim()).catch(() => ""),
+          (value) => /\bScanning\b/.test(value),
+          {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "visible camera Scanning status"},
+        );
+        const activeCameraText = await poll(
+          () => activeCamera.innerText().catch(() => ""),
+          (value) => /OSCAR deterministic QR camera/i.test(value) && /640\s*[×x]\s*480/.test(value),
+          {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "active camera identity and resolution"},
+        );
+        const statusScanning = await status.isVisible() && /\bScanning\b/.test(statusText);
+        const activeCameraVisible = await activeCamera.isVisible() &&
+          /OSCAR deterministic QR camera/i.test(activeCameraText) && /640\s*[×x]\s*480/.test(activeCameraText);
+        const state = await this.browser.alarmTransferCameraState(page);
+        const visible = await video.isVisible();
+        const passed = visible && dimensions.readyState >= 2 && dimensions.videoWidth > 0 &&
+          dimensions.videoHeight > 0 && dimensions.renderedWidth > 0 && dimensions.renderedHeight > 0 &&
+          overlayContained && overlayCoverage && statusScanning && activeCameraVisible &&
+          state.requestCount > 0 && state.activeTrackCount > 0 && state.previewFrameRendered;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "alarm-transfer-camera-preview");
+        return {
+          passed,
+          observed: `visible=${visible}; video=${dimensions.videoWidth}x${dimensions.videoHeight}; ` +
+            `rendered=${Math.round(dimensions.renderedWidth)}x${Math.round(dimensions.renderedHeight)}; ` +
+            `overlay=${overlayBox ? `${Math.round(overlayBox.width)}x${Math.round(overlayBox.height)}` : "missing"}; ` +
+            `overlay/content ratio=${overlayRatio.toFixed(3)}; overlay contained=${overlayContained}; ` +
+            `status=${JSON.stringify(statusText)}; active camera=${JSON.stringify(activeCameraText)}; ` +
+            `active tracks=${state.activeTrackCount}`,
+          value: passed ? true : undefined,
+          evidence,
+        };
+      });
+      if (!cameraStarted) return;
+
+      await this.browser.renderAlarmTransferCameraQr(page);
+      const decoded = await this.check({
+        scenario: "alarm-transfer-camera", category: "alarm-transfer", action: "decode dense camera QR",
+        target: fixture.observationId,
+        expected: "the version-23 camera QR passes integrity validation and preserves its occupancy UUID",
+      }, async () => {
+        await page.getByText("The alarm data passed its SHA-256 integrity check.", {exact: true})
+          .waitFor({timeout: this.config.eventTimeoutMs});
+        const body = await page.locator("body").innerText();
+        const uuid = page.getByTestId("alarm-transfer-import-uuid");
+        const displayedUuid = await uuid.count() ? (await uuid.innerText()).trim() : "";
+        const integrityVisible = body.includes("The alarm data passed its SHA-256 integrity check.");
+        const uuidMatches = displayedUuid
+          ? displayedUuid === fixture.observationId
+          : body.includes(fixture.observationId);
+        const identityVisible = body.includes(fixture.occupancyId) && body.includes(fixture.laneId);
+        const state = await this.browser.alarmTransferCameraState(page);
+        const passed = integrityVisible && uuidMatches && identityVisible && state.qrFrameRendered &&
+          state.requestedFrameCount > 0;
+        const evidence = await this.browser.screenshot(page, "alarm-transfer-camera-decoded");
+        return {
+          passed,
+          observed: `QR version=${fixture.qrVersion}; transport=${fixture.transportCharacters} characters; ` +
+            `symbol=${fixture.symbolPixels}px; integrity=${integrityVisible}; UUID matches=${uuidMatches}; ` +
+            `fixture identity=${identityVisible}; requested QR frames=${state.requestedFrameCount}`,
+          value: passed ? true : undefined,
+          evidence,
+        };
+      });
+      if (!decoded) return;
+
+      await this.check({
+        scenario: "alarm-transfer-camera", category: "camera", action: "release camera after decode",
+        target: "Alarm Transfer camera track",
+        expected: "successful decode stops every created camera track",
+      }, async () => {
+        const state = await poll(
+          () => this.browser.alarmTransferCameraState(page),
+          (value) => value.createdTrackCount > 0 && value.activeTrackCount === 0 &&
+            value.stoppedTrackCount === value.createdTrackCount,
+          {timeoutMs: 10_000, intervalMs: 100, description: "Alarm Transfer camera tracks to stop"},
+        );
+        const passed = state.activeTrackCount === 0 && state.createdTrackCount === state.stoppedTrackCount;
+        return {
+          passed,
+          observed: `created=${state.createdTrackCount}; stopped=${state.stoppedTrackCount}; active=${state.activeTrackCount}`,
+        };
+      });
+
+      await this.check({
+        scenario: "alarm-transfer-camera", category: "error-handling",
+        action: "report denied camera permission and retry",
+        target: "Alarm Transfer camera",
+        expected: "denied permission is shown, retry starts a visible preview, and stopping releases every track",
+      }, async () => {
+        await page.getByRole("button", {name: /scan another alarm/i}).click();
+        await startButton.waitFor({timeout: this.config.uiTimeoutMs});
+        await this.browser.rejectAlarmTransferCameraRequests(page);
+        const deniedPermission = await page.evaluate(async () =>
+          (await navigator.permissions.query({name: "camera" as PermissionName})).state);
+        await startButton.click();
+        const alerts = await poll(
+          () => page.getByRole("alert").allInnerTexts(),
+          (values) => values.some((value) =>
+            /camera permission was denied/i.test(value) && /browser settings/i.test(value)),
+          {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "actionable camera permission alert"},
+        );
+        const deniedState = await this.browser.alarmTransferCameraState(page);
+        const errorText = alerts.find((value) =>
+          /camera permission was denied/i.test(value) && /browser settings/i.test(value)) ?? "";
+        const deniedCleanly = deniedPermission === "denied" && Boolean(errorText) &&
+          deniedState.activeTrackCount === 0;
+
+        await this.browser.allowAlarmTransferCameraRequests(page);
+        const grantedPermission = await page.evaluate(async () =>
+          (await navigator.permissions.query({name: "camera" as PermissionName})).state);
+        await startButton.click();
+        const stopButton = page.getByRole("button", {name: /stop camera scan/i});
+        await stopButton.waitFor({timeout: this.config.uiTimeoutMs});
+        const video = page.getByTestId("alarm-qr-camera-video");
+        await page.waitForFunction(() => {
+          const element = document.querySelector('[data-testid="alarm-qr-camera-video"]') as
+            HTMLVideoElement | null;
+          return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
+        }, undefined, {timeout: this.config.uiTimeoutMs});
+        const retryPreview = await video.evaluate((element: HTMLVideoElement) => ({
+          width: element.videoWidth,
+          height: element.videoHeight,
+          renderedWidth: element.getBoundingClientRect().width,
+          renderedHeight: element.getBoundingClientRect().height,
+        }));
+        const retryState = await this.browser.alarmTransferCameraState(page);
+        const retryStarted = await video.isVisible() && retryPreview.width > 0 && retryPreview.height > 0 &&
+          retryPreview.renderedWidth > 0 && retryPreview.renderedHeight > 0 && retryState.activeTrackCount > 0;
+
+        await stopButton.click();
+        const finalState = await poll(
+          () => this.browser.alarmTransferCameraState(page),
+          (value) => value.createdTrackCount > 0 && value.activeTrackCount === 0 &&
+            value.stoppedTrackCount === value.createdTrackCount,
+          {timeoutMs: 10_000, intervalMs: 100, description: "retried camera tracks to stop"},
+        );
+        const cleanedUp = finalState.activeTrackCount === 0 &&
+          finalState.stoppedTrackCount === finalState.createdTrackCount;
+        const passed = deniedCleanly && grantedPermission === "granted" && retryStarted && cleanedUp;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "alarm-transfer-camera-error");
+        return {
+          passed,
+          observed: `permission state=${deniedPermission}; feedback=${Boolean(errorText)}; ` +
+            `rejected requests=${deniedState.rejectedRequestCount}; retry permission=${grantedPermission}; ` +
+            `retry preview=${retryPreview.width}x${retryPreview.height}; ` +
+            `created=${finalState.createdTrackCount}; stopped=${finalState.stoppedTrackCount}; active=${finalState.activeTrackCount}`,
+          evidence,
+        };
+      });
+    } finally {
+      const stop = page.getByRole("button", {name: /stop camera scan/i});
+      if (await stop.isVisible().catch(() => false)) await stop.click().catch(() => undefined);
+      await page.close();
+    }
+  }
+
   private async prepareReservedLane(): Promise<void> {
     await this.scenario("reserved-lane-setup", async () => {
       const rpm = await this.emulator.get(this.config.testRpmId);
@@ -1171,7 +1421,7 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
-  private async exportSelectedAlarm(page: Page, expectedEventUuid?: string): Promise<string> {
+  private async exportSelectedAlarm(page: Page, expectedEventUuid?: string): Promise<ExportedAlarmArtifacts> {
     const exportButton = page.getByRole("button", {name: /export alarm qr/i});
     if (expectedEventUuid && !await exportButton.isEnabled()) {
       throw new Error("Alarm QR export is disabled even though the occupancy UUID is resolved");
@@ -1185,14 +1435,31 @@ export class RegressionScenarios {
         throw new Error(`Alarm QR dialog UUID mismatch: expected ${expectedEventUuid}; got ${displayedUuid}`);
       }
     }
+    const qrButton = dialog.getByRole("button", {name: /download qr image/i});
+    await qrButton.waitFor({timeout: 60_000});
+    await poll(
+      () => qrButton.isEnabled(),
+      (enabled) => enabled,
+      {timeoutMs: 60_000, intervalMs: 100, description: "QR image download to become available"},
+    );
+    const qrDownloadPromise = page.waitForEvent("download");
+    await qrButton.click();
+    const qrDownload = await qrDownloadPromise;
+    const qrSuggested = safeName(qrDownload.suggestedFilename()) || "alarm-qr.png";
+    const qrImage = join(
+      this.reporter.downloadDir,
+      qrSuggested.endsWith(".png") ? qrSuggested : `${qrSuggested}.png`,
+    );
+    await qrDownload.saveAs(qrImage);
+
     const downloadPromise = page.waitForEvent("download");
     await dialog.getByRole("button", {name: /download alarm file/i}).click();
     const download = await downloadPromise;
     const suggested = safeName(download.suggestedFilename()) || "alarm.json";
-    const path = join(this.reporter.downloadDir, suggested.endsWith(".json") ? suggested : `${suggested}.json`);
-    await download.saveAs(path);
+    const alarmFile = join(this.reporter.downloadDir, suggested.endsWith(".json") ? suggested : `${suggested}.json`);
+    await download.saveAs(alarmFile);
     await dialog.getByRole("button", {name: /close/i}).click();
-    return path;
+    return {alarmFile, qrImage};
   }
 
   private async eventUuidWorkflow(): Promise<void> {
@@ -1380,8 +1647,8 @@ export class RegressionScenarios {
         scenario: "event-uuid", category: "alarm-transfer", action: "include occupancy UUID in truncated QR export",
         target: eventUuid, expected: "QR v1 transport document contains the same UUID in payload.event.observationId",
       }, async () => {
-        const path = await this.exportSelectedAlarm(page, eventUuid);
-        const bytes = readFileSync(path);
+        const artifacts = await this.exportSelectedAlarm(page, eventUuid);
+        const bytes = readFileSync(artifacts.alarmFile);
         const parsed = JSON.parse(bytes.toString("utf8")) as {
           transport?: string;
           payload?: {schema?: string; version?: number; event?: {observationId?: string}};
@@ -1392,8 +1659,8 @@ export class RegressionScenarios {
         return {
           passed,
           observed: `${bytes.length} bytes; schema/version/UUID/transport valid=${passed}`,
-          value: path,
-          evidence: join("downloads", basename(path)),
+          value: artifacts.alarmFile,
+          evidence: join("downloads", basename(artifacts.alarmFile)),
         };
       });
 
@@ -1448,12 +1715,14 @@ export class RegressionScenarios {
       ]);
       await page.getByRole("heading", {name: "Event Details"}).waitFor();
 
-      const alarmFile = await this.check({
+      const alarmArtifacts = await this.check({
         scenario: "adjudication", category: "alarm-transfer", action: "export selected alarm",
-        target: this.config.testLaneLabel, expected: "Viewer downloads a non-empty OSCAR offline alarm JSON file",
+        target: this.config.testLaneLabel,
+        expected: "Viewer downloads a valid OSCAR offline alarm JSON file and its rendered QR PNG",
       }, async () => {
-        const path = await this.exportSelectedAlarm(page);
-        const bytes = readFileSync(path);
+        const artifacts = await this.exportSelectedAlarm(page);
+        const bytes = readFileSync(artifacts.alarmFile);
+        const qrBytes = readFileSync(artifacts.qrImage);
         const parsed = JSON.parse(bytes.toString("utf8")) as {
           transport?: string;
           integrity?: {algorithm?: string; digest?: string};
@@ -1461,25 +1730,30 @@ export class RegressionScenarios {
             schema?: string;
             version?: number;
             source?: {laneId?: string};
-            event?: {occupancyId?: string};
+            event?: {occupancyId?: string; observationId?: string};
           };
         };
+        const observationId = parsed.payload?.event?.observationId ?? "";
+        const exportedOccupancyId = parsed.payload?.event?.occupancyId ?? "";
         const schemaValid = parsed.payload?.schema === "org.oscar.alarm-transfer" &&
           parsed.payload.version === 1 &&
           parsed.payload.source?.laneId === this.config.testLaneLabel &&
-          parsed.payload.event?.occupancyId === String(occupancyCount) &&
+          exportedOccupancyId === String(occupancyCount) &&
+          observationId.length > 0 && observationId.length <= 128 &&
           parsed.integrity?.algorithm === "SHA-256" &&
           /^[a-f0-9]{64}$/i.test(parsed.integrity.digest ?? "") &&
           parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
+        const pngValid = qrBytes.length > 100 &&
+          qrBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
         return {
-          passed: bytes.length > 100 && schemaValid,
-          observed: `${bytes.length} bytes; schema/lane/occupancy/integrity valid=${schemaValid}`,
-          value: path,
-          evidence: join("downloads", basename(path)),
+          passed: bytes.length > 100 && schemaValid && pngValid,
+          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; schema/lane/occupancy/integrity valid=${schemaValid}; PNG valid=${pngValid}`,
+          value: {...artifacts, observationId, occupancyId: exportedOccupancyId},
+          evidence: join("downloads", basename(artifacts.qrImage)),
         };
       });
 
-      if (alarmFile) {
+      if (alarmArtifacts) {
         await this.check({
           scenario: "adjudication", category: "alarm-transfer", action: "import and validate selected alarm",
           target: "Alarm Transfer", expected: "exported file imports offline and integrity is verified",
@@ -1487,15 +1761,47 @@ export class RegressionScenarios {
           const importPage = await this.browser.oscarPage();
           try {
             await this.goto(importPage, "/alarm-transfer");
-            await importPage.locator('input[type="file"][accept*="json"]').setInputFiles(alarmFile);
+            await importPage.locator('input[type="file"][accept*="json"]').setInputFiles(alarmArtifacts.alarmFile);
             await importPage.getByText("The alarm data passed its SHA-256 integrity check.", {exact: true})
               .waitFor({timeout: 30_000});
             const body = await importPage.locator("body").innerText();
-            const passed = body.includes(this.config.testLaneLabel) &&
+            const importedUuid = (await importPage.getByTestId("alarm-transfer-import-uuid").innerText()).trim();
+            const passed = importedUuid === alarmArtifacts.observationId &&
+              body.includes(this.config.testLaneLabel) &&
               body.includes("The alarm data passed its SHA-256 integrity check.");
             const evidence = await this.browser.screenshot(importPage, "alarm-transfer-imported");
-            return {passed, observed: `lane present=${body.includes(this.config.testLaneLabel)}`, evidence};
+            return {
+              passed,
+              observed: `UUID matches=${importedUuid === alarmArtifacts.observationId}; ` +
+                `lane present=${body.includes(this.config.testLaneLabel)}`,
+              evidence,
+            };
           } finally { await importPage.close(); }
+        });
+
+        await this.check({
+          scenario: "adjudication", category: "alarm-transfer", action: "decode exported alarm QR image",
+          target: "Alarm Transfer",
+          expected: "the Viewer decodes its own exported QR PNG and verifies the same alarm identity",
+        }, async () => {
+          const imagePage = await this.browser.oscarPage();
+          try {
+            await this.goto(imagePage, "/alarm-transfer");
+            await imagePage.locator('input[type="file"][accept*="image"]').setInputFiles(alarmArtifacts.qrImage);
+            await imagePage.getByText("The alarm data passed its SHA-256 integrity check.", {exact: true})
+              .waitFor({timeout: this.config.eventTimeoutMs});
+            const body = await imagePage.locator("body").innerText();
+            const importedUuid = (await imagePage.getByTestId("alarm-transfer-import-uuid").innerText()).trim();
+            const lanePresent = body.includes(this.config.testLaneLabel);
+            const uuidMatches = importedUuid === alarmArtifacts.observationId;
+            const passed = lanePresent && uuidMatches;
+            const evidence = await this.browser.screenshot(imagePage, "alarm-transfer-qr-image-imported");
+            return {
+              passed,
+              observed: `lane present=${lanePresent}; UUID matches=${uuidMatches}`,
+              evidence,
+            };
+          } finally { await imagePage.close(); }
         });
       }
 

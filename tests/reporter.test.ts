@@ -16,7 +16,8 @@ const metadata: RunMetadata = {
   oscarLaneConfigPath: "fixtures/oscar-50-lane-config.csv",
   oscarLaneConfigSha256: "test-sha256",
   operationalViewLaneCounts: {"east-gate": 10, entrance: 25},
-  eventUuidWorkflow: "auto", remoteMetricsExpected: false,
+  eventUuidWorkflow: "auto", alarmTransferCameraWorkflow: "required",
+  remoteMetricsExpected: false,
 };
 
 test("reporter aggregates correct and incorrect behavior and redacts secrets", () => {
@@ -43,6 +44,7 @@ test("reporter aggregates correct and incorrect behavior and redacts secrets", (
   assert.match(errors, /Basic \[REDACTED\]/);
   assert.match(summary, /1 correct, 1 incorrect/);
   assert.equal(run.environment.operationalViewWorkflow, "auto");
+  assert.equal(run.environment.alarmTransferCameraWorkflow, "required");
   assert.equal(run.environment.oscarLaneConfigSha256, "test-sha256");
   assert.deepEqual(run.environment.operationalViewLaneCounts, {"east-gate": 10, entrance: 25});
 });

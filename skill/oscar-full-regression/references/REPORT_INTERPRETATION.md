@@ -32,6 +32,13 @@ duplicate-parameter rejection.
 `run.json` must identify the workflow mode, resolved fixture path, fixture
 SHA-256, and expected per-key lane counts.
 
+When `ALARM_TRANSFER_CAMERA_WORKFLOW=required`, a missing camera control or any
+failed preview/scan-overlay containment, QR integrity/UUID import, track-cleanup,
+denied-permission feedback, or retry check prevents PASS. `run.json` must
+identify the workflow mode; the functional rows should identify QR version 23
+and the 1,170-character fixture transport used by the deterministic 640x480
+Chromium stream.
+
 ## Performance
 
 Docker CPU may exceed 100% because 100% represents one logical CPU. Compare the

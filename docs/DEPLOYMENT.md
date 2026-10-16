@@ -59,6 +59,9 @@ container/host fields are simply absent.
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication
 # Release gate for a build that claims the occupancy UUID workflow:
 EVENT_UUID_WORKFLOW=required ./scripts/run-regression.sh full --scenario event-uuid
+# Release gate for deterministic Alarm Transfer camera scanning:
+ALARM_TRANSFER_CAMERA_WORKFLOW=required \
+  ./scripts/run-regression.sh smoke --scenario alarm-transfer-camera
 # Release gate for the canonical seven operational views:
 OPERATIONAL_VIEW_WORKFLOW=required OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv \
   ./scripts/run-regression.sh smoke --scenario operational-views

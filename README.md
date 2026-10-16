@@ -28,6 +28,8 @@ is configuration-driven so later builds can be tested without changing source.
 - occupancy UUID display, search, fresh direct links, not-found handling, and
   exact UUID preservation in printable PDFs and truncated QR exports
 - offline alarm JSON export/import and SHA-256 validation
+- deterministic Alarm Transfer camera scanning, lifecycle cleanup, permission
+  failure/retry, and exported QR PNG image import
 - full adjudication, confirmation, and audit-history display
 - site, lane, event, state-of-health, and adjudication PDF reports
 - exact membership for all five location and both direction operational views,
@@ -111,10 +113,23 @@ Start from [.env.example](.env.example). Required values are:
 | `OPERATIONAL_VIEW_WORKFLOW` | `required` (default) for the seven-view release gate, `auto` for explicit legacy detection, or `disabled` |
 | `OSCAR_LANE_CONFIG_PATH` | current-schema lane CSV used both to provision the test site and as the membership oracle |
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
+| `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
 
 Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
 the occupancy UUID workflow. The default `auto` mode records one skipped check
 instead of failing when the controls are absent from an older deployment.
+
+Set `ALARM_TRANSFER_CAMERA_WORKFLOW=required` when the Alarm Transfer camera
+scanner is part of the release contract. The scenario feeds Chromium a
+deterministic 640x480 media stream containing a module-aligned, dense QR version
+23 symbol for a 1,170-character valid OSCAR alarm transport. It gates camera
+startup, a visible non-zero preview, a non-zero scan overlay contained by that
+preview, a visible `Scanning` status, the deterministic active-camera identity
+at 640 × 480, integrity and UUID import, complete media-track cleanup, and
+visible denied-permission feedback followed by a successful retry. `auto` skips only
+when the camera controls are absent; `disabled` always skips this workflow. This
+is browser-level scanner coverage, not a physical camera or native
+operating-system permission-dialog test.
 
 The canonical future-build fixture is
 [`fixtures/oscar-50-lane-config.csv`](fixtures/oscar-50-lane-config.csv). It uses
@@ -145,7 +160,7 @@ Each run creates `results/<UTC timestamp>-<runner>/` containing:
 - `summary.md` — concise narrative PASS/FAIL report
 - `run.json` — stable run metadata
 - `evidence/` — screenshots and the reserved-RPM recovery snapshot
-- `downloads/` — generated PDFs and exported offline alarm files
+- `downloads/` — generated PDFs and exported offline alarm JSON/QR image files
 
 The process exits `0` only when every evaluated check is correct. See
 [docs/REPORT_SCHEMA.md](docs/REPORT_SCHEMA.md) for column definitions and CPU
