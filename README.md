@@ -30,7 +30,8 @@ is configuration-driven so later builds can be tested without changing source.
 - offline alarm JSON export/import and SHA-256 validation
 - full adjudication, confirmation, and audit-history display
 - site, lane, event, state-of-health, and adjudication PDF reports
-- invalid operational-view and alarm-transfer inputs failing closed
+- exact membership for all five location and both direction operational views,
+  Health-navigation query persistence, and malformed/unassigned inputs failing closed
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
 
@@ -107,11 +108,26 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_TEST_TARGET_ACK` | exact hostname from `OSCAR_BASE_URL` |
 | `RPM_EMULATOR_URL` | emulator HTTP origin |
 | `TEST_RPM_ID` / `TEST_LANE_LABEL` | reserved emulator RPM and Viewer lane |
+| `OPERATIONAL_VIEW_WORKFLOW` | `required` (default) for the seven-view release gate, `auto` for explicit legacy detection, or `disabled` |
+| `OSCAR_LANE_CONFIG_PATH` | current-schema lane CSV used both to provision the test site and as the membership oracle |
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
 
 Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
 the occupancy UUID workflow. The default `auto` mode records one skipped check
 instead of failing when the controls are absent from an older deployment.
+
+The canonical future-build fixture is
+[`fixtures/oscar-50-lane-config.csv`](fixtures/oscar-50-lane-config.csv). It uses
+the current 20-column schema and assigns ten lanes apiece to `east-gate`,
+`west-gate`, `north-gate`, `south-gate`, and `pedestrian`. The first five lanes
+in each block also belong to `entrance`; the last five belong to `exit`. Apply
+this file when provisioning the 50-lane regression site and keep
+`OSCAR_LANE_CONFIG_PATH` pointed at that same file. Set
+`OPERATIONAL_VIEW_WORKFLOW=required` for 4.0.0-and-newer release gates. Required
+mode treats any mismatch in all seven exact lane sets—or failure to preserve the
+view query through the real Status of Health navigation link—as a release failure.
+The explicit `auto` mode remains compatible with older Viewers by recording a
+skip only when the workflow itself is absent.
 
 `OSCAR_SSH_TARGET` enables read-only Docker/host performance sampling.
 `OSCAR_SSH_IDENTITY_FILE` may point to a dedicated least-privilege key.

@@ -24,6 +24,14 @@ scenario:... for workflows, and action:<scenario>/<action> for exact outcomes
 such as tamper resolution. Skipped rows are excluded from accuracy and must not be
 reported as passing.
 
+When `OPERATIONAL_VIEW_WORKFLOW=required`, any skipped operational-view action,
+fixture parse/count/membership mismatch, scoped navigation leak, or nonempty
+fail-closed result prevents PASS. Confirm the evidence includes all seven exact
+fixture-derived view memberships plus malformed-key, unassigned-valid-key, and
+duplicate-parameter rejection.
+`run.json` must identify the workflow mode, resolved fixture path, fixture
+SHA-256, and expected per-key lane counts.
+
 ## Performance
 
 Docker CPU may exceed 100% because 100% represents one logical CPU. Compare the

@@ -7,6 +7,7 @@ import {join} from "node:path";
 import {BrowserHarness} from "./browser.js";
 import {assertMutationAllowed, loadConfig} from "./config.js";
 import {RpmEmulatorClient} from "./emulator.js";
+import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {RunReporter} from "./reporter.js";
 import {RegressionScenarios} from "./scenarios.js";
@@ -62,6 +63,17 @@ async function main(): Promise<number> {
     testLaneLabel: config.testLaneLabel,
     expectedLaneCount: config.expectedLaneCount,
     expectedCameraCount: config.expectedCameraCount,
+    operationalViewWorkflow: config.operationalViewWorkflow,
+    oscarLaneConfigPath: config.oscarLaneConfigPath,
+    ...(config.laneConfigOracle ? {
+      oscarLaneConfigSha256: config.laneConfigOracle.sha256,
+      operationalViewLaneCounts: Object.fromEntries(
+        (config.operationalViewWorkflow === "required"
+          ? REQUIRED_OPERATIONAL_VIEW_KEYS
+          : [...config.laneConfigOracle.lanesByView.keys()].sort())
+          .map((key) => [key, config.laneConfigOracle?.lanesByView.get(key)?.length ?? 0]),
+      ),
+    } : {}),
     eventUuidWorkflow: config.eventUuidWorkflow,
     remoteMetricsExpected: Boolean(config.oscarSshTarget),
   });

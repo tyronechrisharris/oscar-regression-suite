@@ -5,6 +5,7 @@ import type {Locator, Page} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {RpmEmulatorClient} from "./emulator.js";
+import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {RunReporter} from "./reporter.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
@@ -607,46 +608,149 @@ export class RegressionScenarios {
   }
 
   private async operationalViews(): Promise<void> {
+    const workflowMetadata: CheckMetadata = {
+      scenario: "operational-views", category: "scope", action: "detect operational-view workflow",
+      target: this.config.oscarLaneConfigPath,
+      expected: "Viewer supports fail-closed operational-view scoping",
+    };
+    if (this.config.operationalViewWorkflow === "disabled") {
+      this.skip(workflowMetadata, "OPERATIONAL_VIEW_WORKFLOW is disabled");
+      return;
+    }
+    const oracle = this.config.laneConfigOracle;
+    if (!oracle) {
+      this.reporter.outcome(
+        workflowMetadata.scenario, workflowMetadata.category, workflowMetadata.action,
+        workflowMetadata.target, workflowMetadata.expected,
+        "lane membership oracle is unavailable", "incorrect", 0,
+      );
+      return;
+    }
+    const configuredViewKeys = this.config.operationalViewWorkflow === "required"
+      ? [...REQUIRED_OPERATIONAL_VIEW_KEYS]
+      : [...oracle.lanesByView.keys()].sort();
+
     const page = await this.browser.oscarPage();
     try {
-      const invalidKey = `invalid-${this.reporter.runId.slice(-12).toLowerCase().replaceAll(/[^a-z0-9-]/g, "")}`;
+      const firstKey = configuredViewKeys[0] ?? "east-gate";
+      await this.goto(page, `/?view=${firstKey}`);
+      const capabilityAvailable = await page.getByText(`View: ${firstKey}`, {exact: true})
+        .waitFor({timeout: this.config.uiTimeoutMs})
+        .then(() => true, () => false);
+      if (!capabilityAvailable) {
+        if (this.config.operationalViewWorkflow === "auto") {
+          this.skip(workflowMetadata, "operational-view workflow is not present on this build (auto detection)");
+        } else {
+          this.reporter.outcome(
+            workflowMetadata.scenario, workflowMetadata.category, workflowMetadata.action,
+            workflowMetadata.target, workflowMetadata.expected,
+            "operational-view chip did not appear", "incorrect", 0,
+          );
+        }
+        return;
+      }
+      if (!configuredViewKeys.length) {
+        this.reporter.outcome(
+          workflowMetadata.scenario, workflowMetadata.category, workflowMetadata.action,
+          workflowMetadata.target, workflowMetadata.expected,
+          "lane membership oracle contains no operational-view assignments", "incorrect", 0,
+        );
+        return;
+      }
+      this.reporter.outcome(
+        workflowMetadata.scenario, workflowMetadata.category, workflowMetadata.action,
+        workflowMetadata.target, workflowMetadata.expected,
+        "operational-view chip is available", "correct", 0,
+      );
+
+      const invalidKey = `unassigned-${randomUUID().slice(0, 12)}`;
       await this.check({
         scenario: "operational-views", category: "scope", action: "reject an unassigned operational view",
         target: invalidKey, expected: "Viewer fails closed and loads no lane data for an unassigned view key",
       }, async () => {
-        await this.goto(page, `/?view=${encodeURIComponent(invalidKey)}`);
+        await this.goto(page, `/health?view=${encodeURIComponent(invalidKey)}`);
         const empty = page.getByText(new RegExp(`No lanes are assigned to operational view.*${invalidKey}`, "i"));
         await empty.waitFor({timeout: this.config.uiTimeoutMs});
-        const laneCards = await page.getByText("Lane Status", {exact: true})
-          .locator("xpath=ancestor::*[contains(@class,'MuiStack-root')][1]")
-          .locator(".MuiPaper-root").count().catch(() => 0);
-        return {passed: laneCards === 0, observed: `empty-view warning visible; lane cards=${laneCards}`};
+        const rows = await page.locator('[data-testid^="health-lane-"]').count();
+        return {passed: rows === 0, observed: `empty-view warning visible; health rows=${rows}`};
       });
 
-      if (!this.config.operationalViewKey) {
-        this.skip({
-          scenario: "operational-views", category: "scope", action: "validate configured operational view",
-          target: "OPERATIONAL_VIEW_KEY", expected: "configured view scopes lanes and persists across navigation",
-        }, "OPERATIONAL_VIEW_KEY is not configured on this test site");
-        return;
+      for (const [action, search] of [
+        ["reject an invalid operational-view key", "?view=North_Gate"],
+        ["reject duplicate operational-view parameters", "?view=east-gate&view=west-gate"],
+      ] as const) {
+        await this.check({
+          scenario: "operational-views", category: "scope", action,
+          target: search, expected: "malformed view selection fails closed with no loaded lane data",
+        }, async () => {
+          await this.goto(page, `/health${search}`);
+          await page.getByText("This operational-view URL is invalid. No lanes have been loaded.", {exact: true})
+            .waitFor({timeout: this.config.uiTimeoutMs});
+          const rows = await page.locator('[data-testid^="health-lane-"]').count();
+          return {passed: rows === 0, observed: `invalid-view warning visible; health rows=${rows}`};
+        });
       }
 
-      const key = this.config.operationalViewKey;
-      await this.check({
-        scenario: "operational-views", category: "scope", action: "scope configured operational view",
-        target: key, expected: "view chip is visible, at least one lane loads, and navigation retains the key",
-      }, async () => {
-        await this.goto(page, `/?view=${encodeURIComponent(key)}`);
-        await page.getByText(`View: ${key}`, {exact: true}).waitFor();
-        const cards = page.getByText("Lane Status", {exact: true})
-          .locator("xpath=ancestor::*[contains(@class,'MuiStack-root')][1]")
-          .locator(".MuiPaper-root");
-        await cards.first().waitFor();
-        await this.goto(page, `/health?view=${encodeURIComponent(key)}`);
-        await page.getByText(`View: ${key}`, {exact: true}).waitFor();
-        const rows = await page.locator("tbody tr").count();
-        return {passed: rows > 0 && rows < this.config.expectedLaneCount, observed: `${rows} scoped health rows`};
-      });
+      for (const key of configuredViewKeys) {
+        const fixtureLaneNames = oracle.lanesByView.get(key) ?? [];
+        const expectedLaneNames = [...fixtureLaneNames].sort();
+        await this.check({
+          scenario: "operational-views", category: "scope", action: `scope ${key} operational view`,
+          target: key,
+          expected: `Status of Health navigation retains view=${key} and lists exactly ${expectedLaneNames.join(";")}`,
+        }, async () => {
+          await this.goto(page, `/?view=${encodeURIComponent(key)}`);
+          await page.getByText(`View: ${key}`, {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          const healthLink = page.locator(`a[href="/health/?view=${encodeURIComponent(key)}"]`).first();
+          await healthLink.waitFor({timeout: this.config.uiTimeoutMs});
+          const href = await healthLink.getAttribute("href");
+          await Promise.all([
+            page.waitForURL((url) =>
+              normalizePathname(url.pathname) === "/health" &&
+              url.searchParams.getAll("view").length === 1 &&
+              url.searchParams.get("view") === key,
+            {timeout: this.config.uiTimeoutMs}),
+            healthLink.click(),
+          ]);
+          await page.getByRole("heading", {name: "Status of Health", exact: true})
+            .waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByText(`View: ${key}`, {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          const rows = page.locator('[data-testid^="health-lane-"]');
+          const readLaneNames = async () => (await rows.evaluateAll((elements) => elements
+            .map((element) => element.getAttribute("data-testid")?.replace(/^health-lane-/, "") ?? "")
+            .filter(Boolean))).sort();
+          let actualLaneNames: string[] = [];
+          try {
+            actualLaneNames = await poll(
+              readLaneNames,
+              (value) => value.length === expectedLaneNames.length &&
+                value.every((laneName, index) => laneName === expectedLaneNames[index]),
+              {
+                timeoutMs: this.config.uiTimeoutMs,
+                intervalMs: 250,
+                description: `exact ${key} Status of Health lane membership`,
+              },
+            );
+          } catch {
+            actualLaneNames = await readLaneNames();
+            const evidence = await this.screenshotOnFailure(page, `operational-view-${safeName(key)}-membership`);
+            return {
+              passed: false,
+              observed: `nav href=${href}; lanes=${actualLaneNames.join(";") || "none"}`,
+              evidence,
+            };
+          }
+          const current = new URL(page.url());
+          const queryPersisted = current.searchParams.getAll("view").length === 1 &&
+            current.searchParams.get("view") === key;
+          return {
+            passed: href === `/health/?view=${encodeURIComponent(key)}` && queryPersisted,
+            observed: `nav href=${href}; query persisted=${queryPersisted}; exact lanes=${actualLaneNames.length}`,
+          };
+        });
+      }
     } finally { await page.close(); }
   }
 

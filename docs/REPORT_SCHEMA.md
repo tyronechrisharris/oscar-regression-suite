@@ -59,6 +59,10 @@ otherwise passed.
 version, status, timestamps, duration, counts, and canonical file names for
 downstream automation. Its run metadata records `eventUuidWorkflow` so reviewers
 can distinguish an auto-detected legacy skip from a required UUID release gate.
+It also records `operationalViewWorkflow` and the resolved
+`oscarLaneConfigPath`. When that workflow is enabled, it records
+`oscarLaneConfigSha256` and `operationalViewLaneCounts`, identifying and
+fingerprinting the exact membership oracle used by scoped view checks.
 
 CPU and memory peaks are observational unless an external release policy applies
 budgets. Missing requested remote metrics, container OOM kills, and restart-count

@@ -16,7 +16,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Lane detail | charts and event table render | smoke | HLS start/stop commands |
 | Video | decoded dimensions, ready state, and advancing playback time | smoke | HLS start/stop commands |
 | Events | rows load and Advanced Filter returns only the requested lane | smoke | none |
-| Operational views | invalid key fails closed; optional configured key stays scoped | smoke | none |
+| Operational views | fixture-derived exact lane sets for east/west/north/south/pedestrian/entrance/exit; Dashboard-to-Health query persistence; invalid, unassigned, and duplicate parameters fail closed | smoke | none |
 | Reports | site, one-lane lane, alarm, alarm/occupancy, and health PDFs | smoke | report bucket writes |
 | Alarm import | malformed payload is rejected visibly | smoke | none |
 | RPM connection | stop/restart appears Offline/Online | full | reserved RPM only |
@@ -44,8 +44,9 @@ external, or depend on nondeterministic operating-system UI:
 - native Share and print dialogs; the suite validates copied link text and uses
   Chromium print-to-PDF against the same print media rather than automating an
   operating-system dialog
-- creating or changing operational-view metadata; a preconfigured view can be
-  checked by setting `OPERATIONAL_VIEW_KEY`
+- applying operational-view metadata inside a run; the tracked 50-lane CSV must
+  be applied while provisioning the disposable site, then the suite reads that
+  same file as its membership oracle
 
 These require a disposable deployment and a separate, explicit test plan.
 
@@ -60,6 +61,12 @@ These require a disposable deployment and a separate, explicit test plan.
 mode skips cleanly on older Viewer builds; use `required` for builds that claim
 the feature. The not-found check uses a newly generated identity and never
 deletes an event.
+
+`operational-views` is capability-gated with `OPERATIONAL_VIEW_WORKFLOW`. In
+`required` mode, all seven keys from `OSCAR_LANE_CONFIG_PATH` are mandatory and
+must expose exactly the fixture lanes. `auto` skips cleanly only on legacy
+Viewers without the operational-view workflow; once detected, membership and
+fail-closed checks remain gating.
 
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.
