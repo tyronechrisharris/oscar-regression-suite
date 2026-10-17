@@ -46,6 +46,16 @@ checks use browser-only response fixtures; they do not disconnect cameras or
 modify SensorHub data. Preserve the evidence screenshot and do not weaken the
 batch or accessibility assertions to accommodate a failing build.
 
+## Viewer navigation reports `net::ERR_TOO_MANY_RETRIES`
+
+The suite treats this exact Chromium connection-pool error as a bounded
+transport transient. It records the first failure as a warning, requires both
+the gateway `/healthz` endpoint and the authenticated `/session` endpoint to
+pass, waits one second, and retries the same idempotent navigation once. A
+failed probe, any other network error, or a second failure remains a failed
+functional check. Inspect the warning together with gateway status codes and
+the OSCAR host/container samples; do not add broad or repeated retries.
+
 ## Reserved RPM did not restore
 
 Stop further full runs and follow the manual recovery procedure in

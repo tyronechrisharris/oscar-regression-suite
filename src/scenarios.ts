@@ -13,6 +13,7 @@ import {
 import {RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
+import {navigateWithBoundedRetry} from "./navigation.js";
 import {RunReporter} from "./reporter.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
@@ -72,6 +73,7 @@ export class RegressionScenarios {
   private originalRpmStatus: RpmStatus | null | undefined;
   private reservedLanePrepared = false;
   private stopRequested: () => boolean = () => false;
+  private activeScenario = "navigation";
 
   constructor(
     private readonly config: SuiteConfig,
@@ -140,6 +142,7 @@ export class RegressionScenarios {
     if (!force && !this.selected(name)) return;
     if (this.stopRequested()) return;
     process.stdout.write(`[scenario] ${name} started\n`);
+    this.activeScenario = name;
     this.browser.setScenario(name);
     this.metrics.setPhase(name);
     try {
@@ -210,8 +213,45 @@ export class RegressionScenarios {
   }
 
   private async goto(page: Page, path: string): Promise<number> {
-    const response = await page.goto(this.viewerUrl(path), {waitUntil: "domcontentloaded"});
-    return response?.status() ?? 0;
+    const url = this.viewerUrl(path);
+    return navigateWithBoundedRetry({
+      navigate: async () => {
+        const response = await page.goto(url, {waitUntil: "domcontentloaded"});
+        return response?.status() ?? 0;
+      },
+      verifyTarget: async () => {
+        const request = page.context().request;
+        const healthResponse = await request.get(this.viewerUrl("/healthz"));
+        try {
+          if (healthResponse.status() !== 200) {
+            throw new Error(`Viewer health probe returned HTTP ${healthResponse.status()}`);
+          }
+        } finally {
+          await healthResponse.dispose();
+        }
+
+        const sessionResponse = await request.get(this.viewerUrl("/session"));
+        try {
+          if (!sessionResponse.ok()) {
+            throw new Error(`Authenticated Viewer session probe returned HTTP ${sessionResponse.status()}`);
+          }
+          const session = await sessionResponse.json() as {username?: unknown};
+          if (session.username !== this.config.oscarUsername) {
+            throw new Error("Authenticated Viewer session probe returned the wrong user");
+          }
+        } finally {
+          await sessionResponse.dispose();
+        }
+      },
+      onFirstFailure: (error) => this.reporter.error(
+        this.activeScenario,
+        "viewer-navigation-retry",
+        `GET ${url}: ${describeError(error)}; target probes must pass before one bounded retry`,
+        "",
+        "warning",
+      ),
+      wait: sleep,
+    });
   }
 
   private async screenshotOnFailure(page: Page, name: string): Promise<string> {
@@ -314,6 +354,43 @@ export class RegressionScenarios {
           !/internal server error|sign in to continue/i.test(body);
         return {passed, observed: `HTTP ${status}; session user=${sessionUsername}; title=${await page.title()}`};
       } finally { await page.close(); }
+    });
+
+    await this.check({
+      scenario: "preflight", category: "performance", action: "verify Viewer browser cache policy",
+      target: "/_next/static and /sw.js",
+      expected: "hashed Viewer assets are privately immutable and the service worker is revalidated",
+    }, async () => {
+      const page = await this.browser.oscarPage();
+      try {
+        await this.goto(page, "/");
+        const scriptPath = await page.locator('script[src^="/_next/static/"]').first().getAttribute("src");
+        if (!scriptPath) throw new Error("Viewer page did not expose a hashed static script");
+
+        const request = page.context().request;
+        const [assetResponse, serviceWorkerResponse] = await Promise.all([
+          request.get(this.viewerUrl(scriptPath)),
+          request.get(this.viewerUrl("/sw.js")),
+        ]);
+        try {
+          const assetCache = assetResponse.headers()["cache-control"] ?? "";
+          const serviceWorkerCache = serviceWorkerResponse.headers()["cache-control"] ?? "";
+          const assetPolicyValid = /(?:^|,)\s*private\b/i.test(assetCache) &&
+            /(?:^|,)\s*max-age=31536000\b/i.test(assetCache) &&
+            /(?:^|,)\s*immutable\b/i.test(assetCache);
+          const serviceWorkerPolicyValid = /(?:^|,)\s*no-cache\b/i.test(serviceWorkerCache);
+          return {
+            passed: assetResponse.ok() && serviceWorkerResponse.ok() &&
+              assetPolicyValid && serviceWorkerPolicyValid,
+            observed: `asset HTTP ${assetResponse.status()} Cache-Control=${assetCache || "missing"}; ` +
+              `sw.js HTTP ${serviceWorkerResponse.status()} Cache-Control=${serviceWorkerCache || "missing"}`,
+          };
+        } finally {
+          await Promise.all([assetResponse.dispose(), serviceWorkerResponse.dispose()]);
+        }
+      } finally {
+        await page.close();
+      }
     });
 
     await this.check({

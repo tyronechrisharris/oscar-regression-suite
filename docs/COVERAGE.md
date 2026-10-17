@@ -6,6 +6,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Area | Assertion | Profile | Mutation |
 | --- | --- | --- | --- |
 | Authentication | login/session identity and protected Viewer access | smoke | session only |
+| Gateway caching | hashed Viewer bundles return private one-year immutable caching while `/sw.js` requires revalidation | smoke | none |
 | Navigation | dashboard, events, health, reports, transfer, map, national, servers | smoke | none |
 | Map | interactive map has a non-zero rendered area | smoke | none |
 | National | statistics command returns HTTP success and local-node row renders | smoke | statistics command/bucket data |

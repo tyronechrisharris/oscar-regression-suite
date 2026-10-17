@@ -20,6 +20,7 @@ source.
 ## What it validates
 
 - authenticated Viewer access, navigation, map, national statistics, and servers
+- browser-cache policy for immutable hashed Viewer bundles and revalidated service-worker code
 - SensorHub Admin visibility
 - every configured lane and camera on Status of Health
 - compact Dashboard health indicators for every lane, with independent RPM and
