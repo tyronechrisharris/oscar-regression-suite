@@ -51,6 +51,14 @@ Performance sampling is optional. Before setting `OSCAR_SSH_TARGET`:
 If SSH sampling is not configured, functional tests and runner metrics still run;
 container/host fields are simply absent.
 
+For OSCAR 3.9.2 storage validation, use an isolated checkout or release directory
+and a fresh disposable database. Pin the same SSH host key, configure
+passwordless noninteractive sudo only for the authorized test account, set
+`OSCAR_BUILD_LABEL` to the exact 3.9.2 artifact and component SHAs, and apply the
+variables described in [STORAGE_REGRESSION.md](STORAGE_REGRESSION.md). The
+canonical 50-lane operational-view fixture remains mandatory. Do not deploy or
+reconfigure OSCAR as part of updating this suite checkout.
+
 ## Run
 
 ```bash
@@ -67,6 +75,10 @@ ALARM_TRANSFER_CAMERA_WORKFLOW=required \
 # Release gate for the canonical seven operational views:
 OPERATIONAL_VIEW_WORKFLOW=required OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv \
   ./scripts/run-regression.sh smoke --scenario operational-views
+# Read-only OSCAR 3.9.2 storage gate after the rotation/media fixture soak:
+STORAGE_WORKFLOW=required ./scripts/run-regression.sh smoke --scenario storage-health
+# Separately acknowledged disposable lifecycle (never production):
+STORAGE_WORKFLOW=required ./scripts/run-regression.sh full --scenario storage-lifecycle
 ```
 
 Review `summary.md`, `functional-results.csv`, `errors.csv`, and cleanup rows

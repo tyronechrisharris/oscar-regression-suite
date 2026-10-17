@@ -24,6 +24,16 @@ import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {navigateWithBoundedRetry} from "./navigation.js";
 import {RunReporter} from "./reporter.js";
+import {StorageProbeClient} from "./storage-probe.js";
+import {
+  assessArchiveHealth,
+  assessJpeg,
+  assessRetainedMediaResponse,
+  assessStoragePlatform,
+  encodeOshBigId,
+  parseCollectionIds,
+  storageMetricFromProbe,
+} from "./storage-oracles.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
 
@@ -286,6 +296,7 @@ export class RegressionScenarios {
     ]));
     await this.scenario("alarm-transfer", () => this.alarmTransferValidation());
     await this.scenario("alarm-transfer-camera", () => this.alarmTransferCamera());
+    await this.scenario("storage-health", () => this.storageHealth());
   }
 
   async runFull(): Promise<void> {
@@ -302,6 +313,7 @@ export class RegressionScenarios {
     } finally {
       await this.restoreReservedLane();
     }
+    await this.scenario("storage-lifecycle", () => this.storageLifecycle());
   }
 
   async emergencyCleanup(): Promise<void> {
@@ -2812,6 +2824,239 @@ export class RegressionScenarios {
         };
       });
     } finally { await page.close(); }
+  }
+
+  private storageUnavailable(scenario: string): boolean {
+    if (this.config.storageWorkflow === "disabled") {
+      this.skip({scenario, category: "storage", action: "exercise OSCAR 3.9.2 storage", target: this.config.targetHost,
+        expected: "storage workflow is enabled"}, "STORAGE_WORKFLOW=disabled");
+      return true;
+    }
+    if (!this.config.oscarSshTarget || !this.config.oscarReleaseDirectory) {
+      const metadata = {scenario, category: "storage", action: "connect guarded storage probe",
+        target: this.config.targetHost, expected: "OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR identify the disposable deployment"};
+      if (this.config.storageWorkflow === "auto") this.skip(metadata, "storage target configuration is unavailable");
+      else this.reporter.outcome(metadata.scenario, metadata.category, metadata.action, metadata.target,
+        metadata.expected, "required storage target configuration is missing", "incorrect", 0);
+      return true;
+    }
+    return false;
+  }
+
+  private async storageHealth(): Promise<void> {
+    if (this.storageUnavailable("storage-health")) return;
+    const probe = new StorageProbeClient(this.config, this.reporter.runId);
+    try {
+      const platform = await this.check({
+        scenario: "storage-health", category: "storage-platform", action: "verify PostgreSQL and storage controls",
+        target: this.config.targetHost,
+        expected: "the 3.9.2 storage profile has checksums, pg_stat_statements, schema v4, checksum marker, batched inserts, and daily journal enabled",
+      }, async () => {
+        const value = assessStoragePlatform(await probe.runJson("platform"));
+        const passed = value.dataChecksums === "on" && value.pgStatStatementsInstalled &&
+          value.pgStatStatementsPreloaded && value.schemaVersion >= 4 && value.archiveMarkerPresent &&
+          value.batchRewriteConfigured && value.dailyJournalConfigured;
+        return {passed, value, observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "cold-archive", action: "verify archive catalog and object checksums",
+        target: this.config.targetHost,
+        expected: "archive catalog has no failed jobs, parity failures, incomplete objects, or checksum errors",
+      }, async () => {
+        const value = assessArchiveHealth(await probe.runJson("archive-health"));
+        return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
+          value.incompleteActiveObjects === 0 && value.checksumVerificationPassed,
+        observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "daily-file", action: "verify durable journal publications",
+        target: "dailyfiles", expected: "published CSV files have matching manifests and no partial artifacts",
+      }, async () => {
+        const value = await probe.runJson<{publications: number; manifests: number; validatedManifests: number;
+          partialFiles: number; manifestFailures: number}>("journal-status");
+        const published = value.publications > 0 && value.publications === value.manifests;
+        return {passed: published && value.validatedManifests === value.manifests &&
+          value.partialFiles === 0 && value.manifestFailures === 0,
+          observed: JSON.stringify(value)};
+      });
+
+      const snapshot = await probe.runJson<unknown>("snapshot");
+      this.reporter.storageMetric(storageMetricFromProbe("storage-health", snapshot));
+
+      const eventId = this.config.storageRetainedEventId;
+      if (!eventId) {
+        const metadata = {scenario: "storage-health", category: "retained-media", action: "verify exact-five JPEG API and gallery",
+          target: "retained media", expected: "a known retained alarm event is configured"};
+        if (this.config.storageWorkflow === "required") {
+          this.reporter.outcome(metadata.scenario, metadata.category, metadata.action, metadata.target,
+            metadata.expected, "STORAGE_RETAINED_EVENT_ID is missing", "incorrect", 0);
+        } else this.skip(metadata, "no retained-media fixture event configured");
+      } else {
+        const page = await this.browser.oscarPage();
+        try {
+          await this.check({scenario: "storage-health", category: "retained-media",
+            action: "verify exact-five retained JPEG API", target: eventId,
+            expected: "each retained camera has exactly five canonical, hash-valid JPEG frames"}, async () => {
+            const response = await page.context().request.get(this.viewerUrl(
+              `/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`));
+            if (!response.ok()) throw new Error(`retained-media API returned HTTP ${response.status()}`);
+            const assessment = assessRetainedMediaResponse(await response.json(), eventId);
+            let valid = 0;
+            for (const asset of assessment.assets) {
+              const image = await page.context().request.get(this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`));
+              const bytes = Buffer.from(await image.body());
+              if (image.ok() && assessJpeg(bytes, asset.bytes, asset.sha256)) valid++;
+              await image.dispose();
+            }
+            return {passed: valid === assessment.frameCount,
+              observed: `${assessment.mediaSetCount} camera set(s), ${assessment.frameCount} frames, ${valid} valid JPEGs`};
+          });
+          await this.check({scenario: "storage-health", category: "viewer", action: "render retained-media gallery",
+            target: eventId, expected: "Event Details renders a five-frame gallery per retained camera"}, async () => {
+            const node = this.config.storageEventNodeId ? `&nodeId=${encodeURIComponent(this.config.storageEventNodeId)}` : "";
+            await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}${node}`);
+            await page.getByTestId("retained-media-gallery").waitFor({timeout: this.config.eventTimeoutMs});
+            const cameras = await page.getByTestId("retained-media-camera").count();
+            const thumbnails = await page.getByTestId("retained-media-thumbnail").count();
+            return {passed: cameras > 0 && thumbnails === cameras * 5,
+              observed: `${cameras} camera group(s), ${thumbnails} thumbnails`,
+              evidence: await this.browser.screenshot(page, "retained-media-five-frame-gallery")};
+          });
+        } finally { await page.close(); }
+      }
+
+      const legacyId = this.config.storageLegacyEventId;
+      if (legacyId) {
+        const page = await this.browser.oscarPage();
+        try {
+          await this.check({scenario: "storage-health", category: "viewer", action: "use legacy video fallback",
+            target: legacyId, expected: "a 404 retained-media response falls back to the legacy video player"}, async () => {
+            const api = await page.context().request.get(this.viewerUrl(
+              `/sensorhub/buckets/videos/media/${encodeURIComponent(legacyId)}`));
+            const apiMissing = api.status() === 404;
+            await api.dispose();
+            const node = this.config.storageEventNodeId ? `&nodeId=${encodeURIComponent(this.config.storageEventNodeId)}` : "";
+            await this.goto(page, `/event-details?eventId=${encodeURIComponent(legacyId)}${node}`);
+            const video = page.locator("video").first();
+            await video.waitFor({timeout: this.config.eventTimeoutMs});
+            return {passed: apiMissing && await video.isVisible() &&
+              await page.getByTestId("retained-media-gallery").count() === 0,
+            observed: `API 404=${apiMissing}; legacy video visible=${await video.isVisible()}`};
+          });
+        } finally { await page.close(); }
+      }
+      if (platform?.deleteHotAfterArchive === true && this.config.profile === "smoke") {
+        this.reporter.error("storage-health", "configuration",
+          "deleteHotAfterArchive is enabled on a smoke-only target; require a successful lifecycle/restore qualification before production rollout",
+          "", "warning");
+      }
+    } finally { await probe.cleanup(); }
+  }
+
+  private async storageLifecycle(): Promise<void> {
+    if (this.storageUnavailable("storage-lifecycle")) return;
+    const probe = new StorageProbeClient(this.config, this.reporter.runId);
+    const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
+    let fixtureCreated = false;
+    let apiPage: Page | undefined;
+    try {
+      const platform = assessStoragePlatform(await probe.runJson("platform"));
+      await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
+        target: this.config.targetHost,
+        expected: "archive deletion is enabled with a one-day rollback grace only on this disposable test deployment"}, async () => ({
+          passed: platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
+            platform.archiveIntervalMinutes === 1,
+          observed: JSON.stringify(platform),
+        }));
+      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
+      const fixture = await probe.runJson<{coldId: number; hotId: number; datastreamId: number;
+        coldTime: string; hotTime: string}>("fixture-create", [fixtureRun, String(this.config.storageHotRetentionDays)]);
+      fixtureCreated = true;
+      const archived = await poll(
+        () => probe.runJson<{generationId: string | null; generationState: string | null;
+          parityVerified: boolean; generationRows: number}>(
+          "fixture-status", [fixtureRun]),
+        value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
+          value.parityVerified && value.generationRows === 1),
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
+          description: "synthetic cold observation to enter a parity-verified archive generation"},
+      );
+      await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
+        target: String(fixture.coldId), expected: "the cold fixture is in an ACTIVE parity-verified generation"}, async () => ({
+          passed: Boolean(archived.generationId && archived.parityVerified), observed: JSON.stringify(archived),
+        }));
+      await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
+        target: archived.generationId ?? "fixture generation",
+        expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
+        const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
+        return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
+          value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
+      });
+
+      apiPage = await this.browser.oscarPage();
+      const request = apiPage.context().request;
+      const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
+      const hotPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.hotId));
+      const streamPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.datastreamId));
+      await probe.runJson("fixture-accelerate", [fixtureRun]);
+      const sealed = await poll(
+        () => probe.runJson<{generationState: string | null; coldHotPresent: boolean; hotPresent: boolean}>(
+          "fixture-status", [fixtureRun]),
+        value => value.generationState === "SEALED" && !value.coldHotPresent && value.hotPresent,
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
+          description: "parity-verified fixture generation to seal and delete only its cold hot-store row"},
+      );
+      await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query cold event by ID",
+        target: coldPublicId, expected: "the cold observation remains queryable after its PostgreSQL row is removed"}, async () => {
+        const response = await request.get(this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(coldPublicId)}`));
+        return {passed: sealed.generationState === "SEALED" && response.ok(),
+          observed: `generation=${sealed.generationState}; hot row=${sealed.coldHotPresent}; HTTP ${response.status()}`};
+      });
+      await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query mixed hot/cold range",
+        target: streamPublicId, expected: "one bounded query returns both the cold and hot fixture IDs"}, async () => {
+        const start = new Date(Date.parse(fixture.coldTime) - 60_000).toISOString();
+        const end = new Date(Date.parse(fixture.hotTime) + 60_000).toISOString();
+        const response = await request.get(this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`));
+        if (!response.ok()) return {passed: false, observed: `HTTP ${response.status()}`};
+        const ids = parseCollectionIds(await response.json());
+        return {passed: ids.includes(coldPublicId) && ids.includes(hotPublicId),
+          observed: `${ids.length} IDs; cold=${ids.includes(coldPublicId)}; hot=${ids.includes(hotPublicId)}`};
+      });
+      await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
+        target: archived.generationId ?? "fixture generation",
+        expected: "hold create/list/release works; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
+        const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
+        const passed = ["holdCreated", "holdListed", "holdReleased", "wrongTokenRejected", "purged",
+          "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
+          .every(key => value[key] === true);
+        return {passed, observed: JSON.stringify(value)};
+      });
+      await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
+        target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
+        const value = await probe.runJson<{healthy: boolean; partialFiles: number; recoveryErrors: number}>("journal-restart");
+        return {passed: value.healthy && value.partialFiles === 0 && value.recoveryErrors === 0,
+          observed: JSON.stringify(value)};
+      });
+      if (this.config.storageBackupWorkflow !== "disabled") {
+        await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
+          target: this.config.targetHost,
+          expected: "backup is created, verified, cataloged, and retention-limited without attempting restore"}, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("backup-check");
+          return {passed: value.automaticVerification === true && value.verifiedEpoch === true &&
+            value.retentionRespected === true && value.restoreAttempted === false, observed: JSON.stringify(value)};
+        });
+      }
+      await apiPage.close();
+      apiPage = undefined;
+      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-after", await probe.runJson("snapshot")));
+    } finally {
+      if (apiPage) await apiPage.close().catch(() => undefined);
+      if (fixtureCreated) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
+        this.reporter.error("storage-lifecycle", "fixture-cleanup", error));
+      await probe.cleanup();
+    }
   }
 
   private async extendedOccupancy(): Promise<void> {

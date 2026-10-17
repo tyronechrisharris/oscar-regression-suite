@@ -19,6 +19,9 @@
 - ALARM_TRANSFER_CAMERA_WORKFLOW is `required` when camera scanning is part of
   the Viewer release contract
 - build labels identify both OSCAR and emulator revisions
+- OSCAR 3.9.2 storage release gates identify the absolute release directory,
+  use a disposable database and dedicated storage paths, and set the exact
+  `<host>:<release-dir>:DISPOSABLE-STORAGE` acknowledgement
 
 ## Runner
 
@@ -56,3 +59,6 @@
 - reserved RPM exists, is running, and has an OSCAR client
 - Viewer health row maps the acknowledged lane to RPM/camera telemetry
 - no second runner/operator is controlling that RPM
+- storage lifecycle uses one-minute archive cadence/one-day grace only on the
+  disposable target; an overnight rotation produced daily CSV/manifest pairs;
+  retained and legacy media event IDs were reviewed; backup capacity is adequate

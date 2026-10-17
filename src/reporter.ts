@@ -8,6 +8,7 @@ import type {
   MetricSample,
   RunMetadata,
   ResultStatus,
+  StorageMetricSample,
 } from "./types.js";
 
 const FUNCTIONAL_COLUMNS: readonly (keyof FunctionalResult)[] = [
@@ -26,6 +27,15 @@ const AGGREGATE_COLUMNS: readonly (keyof AggregateRow)[] = [
   "runId", "section", "group", "total", "correct", "incorrect", "skipped",
   "accuracyPercent", "peakCpuPercent", "peakMemoryBytes", "averageCpuPercent",
   "averageMemoryBytes",
+];
+const STORAGE_METRIC_COLUMNS: readonly (keyof StorageMetricSample)[] = [
+  "runId", "timestamp", "phase", "databaseSizeBytes", "observationTableBytes",
+  "observationIndexBytes", "walBytes", "tempBytes", "tuplesInserted", "tuplesUpdated",
+  "tuplesDeleted", "transactionCommits", "transactionRollbacks", "observationInsertCalls",
+  "observationInsertRows", "observationRowsPerCall", "activeArchiveGenerations",
+  "sealedArchiveGenerations", "archiveRows", "archiveBytes", "failedArchiveJobs",
+  "failedParityReceipts", "activeHolds", "verifiedBackups", "journalBytes",
+  "dailyFileBytes", "retainedMediaBytes", "backupBytes", "note",
 ];
 
 function mean(values: number[]): number | null {
@@ -50,6 +60,7 @@ export class RunReporter {
   readonly functional: FunctionalResult[] = [];
   readonly errors: ErrorRecord[] = [];
   readonly metrics: MetricSample[] = [];
+  readonly storageMetrics: StorageMetricSample[] = [];
   readonly outputDir: string;
   readonly evidenceDir: string;
   readonly downloadDir: string;
@@ -126,6 +137,10 @@ export class RunReporter {
 
   metric(sample: Omit<MetricSample, "runId" | "timestamp">): void {
     this.metrics.push({runId: this.runId, timestamp: new Date().toISOString(), ...sample});
+  }
+
+  storageMetric(sample: Omit<StorageMetricSample, "runId" | "timestamp">): void {
+    this.storageMetrics.push({runId: this.runId, timestamp: new Date().toISOString(), ...sample});
   }
 
   aggregate(): AggregateRow[] {
@@ -219,6 +234,10 @@ export class RunReporter {
     writeFileSync(join(this.outputDir, "functional-results.csv"), toCsv(this.functional, FUNCTIONAL_COLUMNS));
     writeFileSync(join(this.outputDir, "errors.csv"), toCsv(this.errors, ERROR_COLUMNS));
     writeFileSync(join(this.outputDir, "performance.csv"), toCsv(this.metrics, METRIC_COLUMNS));
+    writeFileSync(
+      join(this.outputDir, "storage-performance.csv"),
+      toCsv(this.storageMetrics, STORAGE_METRIC_COLUMNS),
+    );
     writeFileSync(join(this.outputDir, "summary.csv"), toCsv(aggregate, AGGREGATE_COLUMNS));
 
     const overall = aggregate.find((row) => row.section === "correctness" && row.group === "all");
@@ -259,6 +278,7 @@ export class RunReporter {
       "",
       "- `functional-results.csv`: one row per expected OSCAR behavior.",
       "- `performance.csv`: timestamped runner, host, and container CPU/memory samples.",
+      "- `storage-performance.csv`: PostgreSQL, archive, journal, media, backup, and batch counters.",
       "- `summary.csv`: correctness counts and aggregate resource measurements.",
       "- `errors.csv`: browser, API, cleanup, and sampling errors.",
       "- `evidence/`: screenshots and supporting artifacts.",
@@ -267,7 +287,7 @@ export class RunReporter {
     ].join("\n");
     writeFileSync(join(this.outputDir, "summary.md"), narrative);
     writeFileSync(join(this.outputDir, "run.json"), `${JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId: this.runId,
       status,
       startedAt: startedAt.toISOString(),
@@ -278,6 +298,7 @@ export class RunReporter {
       files: {
         functional: "functional-results.csv",
         performance: "performance.csv",
+        storagePerformance: "storage-performance.csv",
         summary: "summary.csv",
         errors: "errors.csv",
         narrative: "summary.md",

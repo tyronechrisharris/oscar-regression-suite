@@ -17,6 +17,7 @@ const metadata: RunMetadata = {
   oscarLaneConfigSha256: "test-sha256",
   operationalViewLaneCounts: {"east-gate": 10, entrance: 25},
   eventUuidWorkflow: "auto", alarmTransferCameraWorkflow: "required",
+  storageWorkflow: "auto", storageExpectedRelease: "3.9.2", storageBackupWorkflow: "auto",
   remoteMetricsExpected: false,
 };
 
@@ -31,6 +32,13 @@ test("reporter aggregates correct and incorrect behavior and redacts secrets", (
     memoryUsedBytes: 100, memoryLimitBytes: 1_000, memoryPercent: 10, pids: 10,
     restartCount: 0, oomKilled: false, load1m: 1, hostMemoryAvailableBytes: 1_000, note: "",
   });
+  reporter.storageMetric({phase: "after-batch", databaseSizeBytes: 100, observationTableBytes: 50,
+    observationIndexBytes: 25, walBytes: 10, tempBytes: 0, tuplesInserted: 10, tuplesUpdated: 0,
+    tuplesDeleted: 0, transactionCommits: 2, transactionRollbacks: 0, observationInsertCalls: 1,
+    observationInsertRows: 10, observationRowsPerCall: 10, activeArchiveGenerations: 1,
+    sealedArchiveGenerations: 0, archiveRows: 5, archiveBytes: 20, failedArchiveJobs: 0,
+    failedParityReceipts: 0, activeHolds: 0, verifiedBackups: 1, journalBytes: 10,
+    dailyFileBytes: 10, retainedMediaBytes: 10, backupBytes: 10, note: ""});
   const result = reporter.finalize(new Date(Date.now() - 1_000));
   assert.equal(result.exitCode, 1);
   const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
@@ -47,6 +55,7 @@ test("reporter aggregates correct and incorrect behavior and redacts secrets", (
   assert.equal(run.environment.alarmTransferCameraWorkflow, "required");
   assert.equal(run.environment.oscarLaneConfigSha256, "test-sha256");
   assert.deepEqual(run.environment.operationalViewLaneCounts, {"east-gate": 10, entrance: 25});
+  assert.match(readFileSync(join(result.outputDir, "storage-performance.csv"), "utf8"), /after-batch/);
 });
 
 test("reporter fails an empty run and a run with a standalone runtime error", () => {

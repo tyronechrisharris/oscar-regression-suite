@@ -75,6 +75,18 @@ function capabilityMode(name: string, fallback: CapabilityMode): CapabilityMode 
   throw new Error(`${name} must be auto, required, or disabled`);
 }
 
+function remoteAbsolutePath(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  if (!value.startsWith("/") || value.includes("\0") || /[\r\n]/.test(value)) {
+    throw new Error(`${name} must be an absolute remote POSIX path without control characters`);
+  }
+  if (value.split("/").includes("..")) {
+    throw new Error(`${name} must not contain parent-directory segments`);
+  }
+  return value.replace(/\/+$/, "") || "/";
+}
+
 interface ParsedArguments {
   profile?: string;
   scenario?: string;
@@ -143,11 +155,13 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
     "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
+    "storage-health", "storage-lifecycle",
   ]);
   const unknownScenarios = scenarioValues.filter((value) => !knownScenarios.has(value));
   if (unknownScenarios.length) {
     throw new Error(`Unknown --scenario value(s): ${unknownScenarios.join(", ")}`);
   }
+  const oscarReleaseDirectory = remoteAbsolutePath("OSCAR_RELEASE_DIR");
 
   return {
     profile,
@@ -184,6 +198,21 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
     eventUuidWorkflow: capabilityMode("EVENT_UUID_WORKFLOW", "auto"),
     alarmTransferCameraWorkflow: capabilityMode("ALARM_TRANSFER_CAMERA_WORKFLOW", "auto"),
+    storageWorkflow: capabilityMode("STORAGE_WORKFLOW", "auto"),
+    storageExpectedRelease: "3.9.2",
+    storageBackupWorkflow: capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto"),
+    storageTargetAcknowledgement: process.env.OSCAR_STORAGE_TARGET_ACK?.trim() || "",
+    ...(oscarReleaseDirectory ? {oscarReleaseDirectory} : {}),
+    ...(process.env.STORAGE_RETAINED_EVENT_ID?.trim()
+      ? {storageRetainedEventId: process.env.STORAGE_RETAINED_EVENT_ID.trim()} : {}),
+    ...(process.env.STORAGE_LEGACY_EVENT_ID?.trim()
+      ? {storageLegacyEventId: process.env.STORAGE_LEGACY_EVENT_ID.trim()} : {}),
+    ...(process.env.STORAGE_EVENT_NODE_ID?.trim()
+      ? {storageEventNodeId: process.env.STORAGE_EVENT_NODE_ID.trim()} : {}),
+    storageDatabaseScope: integer("STORAGE_DATABASE_SCOPE", 4, 0),
+    storageHotRetentionDays: integer("STORAGE_HOT_RETENTION_DAYS", 30, 1),
+    storageArchiveTimeoutMs: integer("STORAGE_ARCHIVE_TIMEOUT_MS", 300_000, 60_000),
+    storageProbeTimeoutMs: integer("STORAGE_PROBE_TIMEOUT_MS", 1_800_000, 60_000),
     resultsRoot,
     scenarioFilter: new Set(scenarioValues),
   };
@@ -207,5 +236,22 @@ export function assertMutationAllowed(config: SuiteConfig): void {
     throw new Error(
       `Full regression refused: RPM_LANE_MAPPING_ACK must exactly equal ${expectedMapping}`,
     );
+  }
+
+  const storageSelected = config.storageWorkflow !== "disabled" &&
+    (config.scenarioFilter.size === 0 || config.scenarioFilter.has("storage-lifecycle"));
+  if (storageSelected) {
+    if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
+      throw new Error(
+        "Full storage regression refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required",
+      );
+    }
+    const acknowledgement =
+      `${config.targetHost}:${config.oscarReleaseDirectory}:DISPOSABLE-STORAGE`;
+    if (config.storageTargetAcknowledgement !== acknowledgement) {
+      throw new Error(
+        `Full storage regression refused: OSCAR_STORAGE_TARGET_ACK must exactly equal ${acknowledgement}`,
+      );
+    }
   }
 }

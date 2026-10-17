@@ -47,7 +47,7 @@ async function main(): Promise<number> {
   const config = loadConfig();
   assertMutationAllowed(config);
   const reporter = new RunReporter(runIdentifier(), config.resultsRoot, [config.oscarPassword], {
-    suiteVersion: "1.0.0",
+    suiteVersion: "1.1.0",
     suiteGitCommit: gitCommit(),
     profile: config.profile,
     scenarioFilter: [...config.scenarioFilter].sort(),
@@ -76,6 +76,17 @@ async function main(): Promise<number> {
     } : {}),
     eventUuidWorkflow: config.eventUuidWorkflow,
     alarmTransferCameraWorkflow: config.alarmTransferCameraWorkflow,
+    storageWorkflow: config.storageWorkflow,
+    storageExpectedRelease: config.storageExpectedRelease,
+    storageBackupWorkflow: config.storageBackupWorkflow,
+    ...(config.oscarReleaseDirectory
+      ? {oscarReleaseDirectory: config.oscarReleaseDirectory} : {}),
+    ...(config.storageRetainedEventId
+      ? {storageRetainedEventId: config.storageRetainedEventId} : {}),
+    ...(config.storageLegacyEventId
+      ? {storageLegacyEventId: config.storageLegacyEventId} : {}),
+    ...(config.storageEventNodeId
+      ? {storageEventNodeId: config.storageEventNodeId} : {}),
     remoteMetricsExpected: Boolean(config.oscarSshTarget),
   });
   const emulator = new RpmEmulatorClient(config.rpmEmulatorUrl);

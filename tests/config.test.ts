@@ -94,6 +94,28 @@ test("configuration accepts the dashboard-health scenario", () => {
   });
 });
 
+test("full storage lifecycle requires an exact disposable-storage acknowledgement", () => {
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "required", OSCAR_SSH_TARGET: "tester@192.0.2.10",
+    OSCAR_RELEASE_DIR: "/opt/oscar-test", OSCAR_STORAGE_TARGET_ACK: "192.0.2.10:/opt/oscar-test:DISPOSABLE-STORAGE"}, () => {
+    const config = loadConfig(["--profile", "full", "--scenario", "storage-lifecycle"]);
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+    assert.throws(() => assertMutationAllowed({...config, storageTargetAcknowledgement: "wrong"}),
+      /OSCAR_STORAGE_TARGET_ACK/);
+  });
+});
+
+test("storage paths, modes, and numeric bounds fail closed", () => {
+  withEnvironment({...baseEnvironment, OSCAR_RELEASE_DIR: "relative/release"}, () => {
+    assert.throws(() => loadConfig(["--scenario", "storage-health"]), /absolute remote POSIX path/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "maybe"}, () => {
+    assert.throws(() => loadConfig([]), /STORAGE_WORKFLOW must be auto, required, or disabled/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_HOT_RETENTION_DAYS: "0"}, () => {
+    assert.throws(() => loadConfig([]), /STORAGE_HOT_RETENTION_DAYS must be an integer >= 1/);
+  });
+});
+
 test("configuration loads the lane membership oracle and operational-view workflow mode", () => {
   withEnvironment({...baseEnvironment, OPERATIONAL_VIEW_WORKFLOW: "required"}, () => {
     const config = loadConfig(["--scenario", "operational-views"]);

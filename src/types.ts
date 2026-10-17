@@ -36,6 +36,18 @@ export interface SuiteConfig {
   extendedOccupancySeconds: number;
   eventUuidWorkflow: CapabilityMode;
   alarmTransferCameraWorkflow: CapabilityMode;
+  storageWorkflow: CapabilityMode;
+  storageExpectedRelease: "3.9.2";
+  storageBackupWorkflow: CapabilityMode;
+  storageTargetAcknowledgement: string;
+  oscarReleaseDirectory?: string;
+  storageRetainedEventId?: string;
+  storageLegacyEventId?: string;
+  storageEventNodeId?: string;
+  storageDatabaseScope: number;
+  storageHotRetentionDays: number;
+  storageArchiveTimeoutMs: number;
+  storageProbeTimeoutMs: number;
   resultsRoot: string;
   scenarioFilter: Set<string>;
 }
@@ -83,6 +95,39 @@ export interface MetricSample {
   note: string;
 }
 
+/** Point-in-time PostgreSQL and durable-storage counters captured by the 3.9.2 probe. */
+export interface StorageMetricSample {
+  runId: string;
+  timestamp: string;
+  phase: string;
+  databaseSizeBytes: number | null;
+  observationTableBytes: number | null;
+  observationIndexBytes: number | null;
+  walBytes: number | null;
+  tempBytes: number | null;
+  tuplesInserted: number | null;
+  tuplesUpdated: number | null;
+  tuplesDeleted: number | null;
+  transactionCommits: number | null;
+  transactionRollbacks: number | null;
+  observationInsertCalls: number | null;
+  observationInsertRows: number | null;
+  observationRowsPerCall: number | null;
+  activeArchiveGenerations: number | null;
+  sealedArchiveGenerations: number | null;
+  archiveRows: number | null;
+  archiveBytes: number | null;
+  failedArchiveJobs: number | null;
+  failedParityReceipts: number | null;
+  activeHolds: number | null;
+  verifiedBackups: number | null;
+  journalBytes: number | null;
+  dailyFileBytes: number | null;
+  retainedMediaBytes: number | null;
+  backupBytes: number | null;
+  note: string;
+}
+
 export interface AggregateRow {
   runId: string;
   section: "correctness" | "performance";
@@ -121,6 +166,13 @@ export interface RunMetadata {
   operationalViewLaneCounts?: Record<string, number>;
   eventUuidWorkflow: CapabilityMode;
   alarmTransferCameraWorkflow: CapabilityMode;
+  storageWorkflow: CapabilityMode;
+  storageExpectedRelease: "3.9.2";
+  storageBackupWorkflow: CapabilityMode;
+  oscarReleaseDirectory?: string;
+  storageRetainedEventId?: string;
+  storageLegacyEventId?: string;
+  storageEventNodeId?: string;
   reservedRpmConfigSha256?: string;
   remoteMetricsExpected: boolean;
 }

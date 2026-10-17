@@ -22,6 +22,20 @@ OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv
 Loopback targets are refused. This guard reduces accidental execution but is not
 a substitute for verifying the host yourself.
 
+The OSCAR 3.9.2 `storage-lifecycle` path has a separate interlock:
+
+```text
+OSCAR_RELEASE_DIR=/absolute/disposable/release
+OSCAR_STORAGE_TARGET_ACK=test-host:/absolute/disposable/release:DISPOSABLE-STORAGE
+```
+
+It copies two existing test observations into uniquely registered fixture rows.
+Cold deletion is refused unless the dry-run plan contains exactly the one
+registered fixture generation. Backup creation/verification may prune older
+verified backups according to the target's configured count; restore is never
+attempted. Do not enable this path on production or a target containing data
+that must be preserved.
+
 The lane CSV is read-only during a suite run. Apply it only while provisioning
 the authorized disposable regression system. OSCAR's spreadsheet import is
 additive: rows whose `UniqueID` already exists are skipped, not updated. On a
@@ -75,6 +89,8 @@ coordinates, identifiers, and camera mappings.
 - `.env`, private keys, and result bundles are ignored by Git.
 - keep `.env` mode `0600` on a shared runner
 - use a dedicated least-privilege SSH key for performance sampling
+- storage probing additionally requires narrowly authorized passwordless sudo
+  for the disposable OSCAR release; do not grant it on a production host
 - pin host keys and keep `StrictHostKeyChecking=yes`; never bypass it
 - metrics SSH performs only `docker stats`, `docker inspect`, and reads
   `/proc/loadavg` and `/proc/meminfo`

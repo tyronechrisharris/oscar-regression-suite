@@ -24,6 +24,10 @@ checks. Preserve its evidence and restore the reserved RPM even when a test fail
   trusted path before adding keys. Never bypass host-key checks.
 - Do not run destructive SensorHub Admin actions, broad bulk adjudication, or
   physical-device tests.
+- Treat `storage-lifecycle` as a second mutation boundary: require the exact
+  disposable-storage acknowledgement, a fresh 3.9.2 test database, and the
+  probe's one-generation purge guard. Never run it on production/physical lanes
+  and never add a restore step to the ordinary regression run.
 - Keep result bundles private; they may contain operational and vehicle data.
 
 Read references/TARGET_CHECKLIST.md before deploying to a new runner or target.
@@ -76,6 +80,15 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 8. If OSCAR is wrong and the user requested fixes, repair the correct product
    repository, rebuild/redeploy, and repeat from smoke. Never weaken an assertion
    merely to obtain a pass.
+
+For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
+`STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
+rotation and with retained/legacy media fixture IDs, then run the full
+`storage-lifecycle` only on its separately acknowledged disposable database.
+Require exact-five hash-valid JPEGs, gallery/fallback behavior, journal restart
+recovery, archive parity/export and mixed-tier queries, hold/dry-run/token
+safety, verified backup retention, checksums/pg_stat, and storage/resource
+metrics. Restore testing remains a coordinated isolated drill.
 
 The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
 they do not disconnect cameras or mutate SensorHub. The full profile separately

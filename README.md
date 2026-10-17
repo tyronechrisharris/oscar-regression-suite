@@ -46,6 +46,11 @@ source.
   Health-navigation query persistence, and malformed/unassigned inputs failing closed
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
+- OSCAR 3.9.2 exact-five retained JPEG API/gallery and legacy-video fallback;
+  durable daily-file publications and restart recovery; archive catalog,
+  checksum, parity, portable export, hot/cold query, hold, tokenized purge, and
+  coordinated-backup controls; PostgreSQL checksums, `pg_stat_statements`, and
+  observation batch/resource counters
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.
@@ -130,6 +135,9 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_LANE_CONFIG_PATH` | current-schema lane CSV used both to provision the test site and as the membership oracle |
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
 | `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
+| `STORAGE_WORKFLOW` | `auto`, `required`, or `disabled` for the OSCAR 3.9.2 storage profile |
+| `OSCAR_RELEASE_DIR` | absolute release path on the disposable OSCAR SSH target |
+| `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>:<release-dir>:DISPOSABLE-STORAGE` lifecycle interlock |
 
 Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
 the occupancy UUID workflow. The default `auto` mode records one skipped check
@@ -167,6 +175,15 @@ skip only when the workflow itself is absent.
 `OSCAR_SSH_IDENTITY_FILE` may point to a dedicated least-privilege key.
 `BROWSER_EXECUTABLE_PATH` can select a preinstalled Chrome binary on a runner.
 
+Storage smoke checks are read-only except for normal Viewer authentication. The
+full `storage-lifecycle` scenario uses a separately acknowledged disposable
+3.9.2 database, registers two synthetic copied observations, and refuses any
+cold purge whose plan includes data outside its unique fixture generation. It
+does not restore a backup. Daily-file publication verification requires an
+overnight/rotation-soak fixture; backup verification can be disabled separately
+with `STORAGE_BACKUP_WORKFLOW=disabled`. See
+[docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md).
+
 ## Results
 
 Each run creates `results/<UTC timestamp>-<runner>/` containing:
@@ -174,6 +191,8 @@ Each run creates `results/<UTC timestamp>-<runner>/` containing:
 - `functional-results.csv` — one row per expected behavior, including correct,
   incorrect, and skipped counts
 - `performance.csv` — time-series resource samples by phase and target
+- `storage-performance.csv` — PostgreSQL/WAL/batch, archive, journal, media,
+  and backup point-in-time counters
 - `summary.csv` — correctness and resource aggregates
 - `errors.csv` — browser, network, API, cleanup, and sampling errors
 - `summary.md` — concise narrative PASS/FAIL report

@@ -68,3 +68,17 @@ fingerprinting the exact membership oracle used by scoped view checks.
 CPU and memory peaks are observational unless an external release policy applies
 budgets. Missing requested remote metrics, container OOM kills, and restart-count
 increases are gating correctness checks.
+
+## `storage-performance.csv`
+
+Each row is a point-in-time storage snapshot keyed by `runId`, `timestamp`, and
+`phase`. Database/table/index/WAL/temp sizes are bytes. Tuple and transaction
+counters come from PostgreSQL statistics. `observationInsertCalls`,
+`observationInsertRows`, and `observationRowsPerCall` expose whether batched
+ingest remains effective. Archive generation/row/byte, failure, parity, hold,
+verified-backup, journal, daily-file, retained-media, and backup-size fields
+support like-for-like release comparisons; an empty cell means unavailable.
+
+`run.json` schema version 2 records `storageWorkflow`,
+`storageBackupWorkflow`, release-directory identity, and retained/legacy media
+fixture identities. It never records the storage acknowledgement or secrets.
