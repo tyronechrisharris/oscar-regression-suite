@@ -61,7 +61,10 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    event-UUID, and alarm-transfer-camera workflow modes.
 2. Validate suite static checks, unit tests, dependency audit, and the selected
    lane fixture.
-3. Run ./scripts/run-regression.sh smoke.
+3. Run ./scripts/run-regression.sh smoke. Require the `dashboard-health`
+   baseline: complete lane/RPM/per-camera inventory, live Online resolution,
+   accessible browser-fixture Offline/Unknown states, keyboard lane navigation,
+   and shared latest-observation batches bounded to 50 streams and two in flight.
 4. Inspect summary.md, errors.csv, failed functional rows, and screenshots. Do not
    proceed to mutation if login, target identity, emulator inventory, mapping, or
    connectivity is uncertain.
@@ -73,6 +76,12 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 8. If OSCAR is wrong and the user requested fixes, repair the correct product
    repository, rebuild/redeploy, and repeat from smoke. Never weaken an assertion
    merely to obtain a pass.
+
+The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
+they do not disconnect cameras or mutate SensorHub. The full profile separately
+requires real Dashboard transitions during reserved-RPM stop/restart, fault
+injection/clear, in-place tamper clear, and extended occupancy. Do not describe
+this as live camera disconnect/reconnect coverage.
 
 For diagnosis, pass a scenario filter such as:
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication

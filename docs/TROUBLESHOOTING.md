@@ -31,6 +31,21 @@ Preserve `health-unresolved-connections.png`, confirm camera observations are
 being published for the lane, and compare the camera system/datastream identity
 with the Viewer health query. Do not weaken the assertion to hide `Waiting`.
 
+## Dashboard health scenario fails
+
+Use the failing row and screenshot to distinguish inventory/state failures from
+the request-bound check. Inventory failures usually mean the Viewer lane map or
+camera-system identity no longer matches the configured site. Live connection
+failures mean at least one latest connection observation did not resolve
+Online; compare that component with Status of Health before retrying.
+
+The performance row requires latest-observation batches of no more than 50
+streams and no more than two requests in flight. A failure here indicates a
+Dashboard query regression, not a host CPU threshold. Offline and Unknown UI
+checks use browser-only response fixtures; they do not disconnect cameras or
+modify SensorHub data. Preserve the evidence screenshot and do not weaken the
+batch or accessibility assertions to accommodate a failing build.
+
 ## Reserved RPM did not restore
 
 Stop further full runs and follow the manual recovery procedure in

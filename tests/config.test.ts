@@ -87,6 +87,13 @@ test("configuration accepts camera workflow modes and the alarm-transfer-camera 
   });
 });
 
+test("configuration accepts the dashboard-health scenario", () => {
+  withEnvironment(baseEnvironment, () => {
+    const config = loadConfig(["--scenario", "dashboard-health"]);
+    assert.deepEqual([...config.scenarioFilter], ["dashboard-health"]);
+  });
+});
+
 test("configuration loads the lane membership oracle and operational-view workflow mode", () => {
   withEnvironment({...baseEnvironment, OPERATIONAL_VIEW_WORKFLOW: "required"}, () => {
     const config = loadConfig(["--scenario", "operational-views"]);

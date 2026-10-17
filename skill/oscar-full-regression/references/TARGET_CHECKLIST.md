@@ -50,6 +50,9 @@
 - the `view` query persists, and malformed, well-formed-but-unassigned, and
   duplicate `view` parameters each fail closed with zero health rows
 - no required operational-view result is skipped
+- Dashboard smoke coverage proves the expected card/RPM/per-camera inventory,
+  live Online states, accessible Offline/Unknown fixtures, keyboard lane
+  navigation, and health-request batch/concurrency bounds
 - reserved RPM exists, is running, and has an OSCAR client
 - Viewer health row maps the acknowledged lane to RPM/camera telemetry
 - no second runner/operator is controlling that RPM

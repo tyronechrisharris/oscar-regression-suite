@@ -1,9 +1,15 @@
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
-import type {Locator, Page} from "playwright";
+import type {Locator, Page, Request} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
+import {
+  connectionDataStreamIds,
+  forceConnectionObservationsOffline,
+  forceSingleConnectionObservationOffline,
+  parseHealthObservationBatch,
+} from "./dashboard-health.js";
 import {RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
@@ -35,6 +41,26 @@ interface ExportedAlarmArtifacts {
   alarmFile: string;
   qrImage: string;
 }
+
+type DashboardConnectionKind = "rpm" | "camera";
+type DashboardConnectionState = "online" | "offline" | "unknown";
+type DashboardFaultKind = "gamma-high" | "gamma-low" | "neutron-high" | "tamper" | "extended-occupancy";
+
+const DASHBOARD_FAULT_KINDS: DashboardFaultKind[] = [
+  "gamma-high",
+  "gamma-low",
+  "neutron-high",
+  "tamper",
+  "extended-occupancy",
+];
+
+const DASHBOARD_FAULT_LABELS: Record<DashboardFaultKind, string> = {
+  "gamma-high": "Gamma high",
+  "gamma-low": "Gamma low",
+  "neutron-high": "Neutron high",
+  tamper: "Tamper",
+  "extended-occupancy": "Extended occupancy",
+};
 
 function isVisible(locator: Locator): Promise<boolean> {
   return locator.isVisible().catch(() => false);
@@ -145,6 +171,44 @@ export class RegressionScenarios {
     return page.getByTestId(`health-lane-${this.config.testLaneLabel}`);
   }
 
+  private dashboardCard(page: Page): Locator {
+    return page.getByTestId(`lane-health-card-${this.config.testLaneLabel}`);
+  }
+
+  private dashboardConnection(page: Page, kind: DashboardConnectionKind): Locator {
+    return page.getByTestId(`lane-health-${this.config.testLaneLabel}-${kind}`);
+  }
+
+  private dashboardFault(page: Page, kind: DashboardFaultKind): Locator {
+    return page.getByTestId(`lane-health-${this.config.testLaneLabel}-${kind}`);
+  }
+
+  private async dashboardCameraConnectionTarget(
+    page: Page,
+    requestedHealthStreamIds: ReadonlySet<string>,
+  ): Promise<{componentId: string; streamId: string}> {
+    const camera = this.dashboardConnection(page, "camera").first();
+    const componentId = await camera.getAttribute("data-component-id");
+    if (!componentId) {
+      throw new Error(`${this.config.testLaneLabel} has no camera component identity`);
+    }
+
+    const response = await page.context().request.get(this.viewerUrl(
+      `/sensorhub/api/systems/${encodeURIComponent(componentId)}/datastreams?validTime=latest&limit=100`,
+    ));
+    if (!response.ok()) {
+      throw new Error(`Camera datastream discovery returned HTTP ${response.status()}`);
+    }
+    const candidates = connectionDataStreamIds(await response.json())
+      .filter((streamId) => requestedHealthStreamIds.has(streamId));
+    if (candidates.length !== 1) {
+      throw new Error(
+        `Expected exactly one requested connection datastream for the selected camera; found ${candidates.length}`,
+      );
+    }
+    return {componentId, streamId: candidates[0] ?? ""};
+  }
+
   private async goto(page: Page, path: string): Promise<number> {
     const response = await page.goto(this.viewerUrl(path), {waitUntil: "domcontentloaded"});
     return response?.status() ?? 0;
@@ -160,6 +224,7 @@ export class RegressionScenarios {
     await this.scenario("map-national-servers", () => this.mapNationalServers());
     await this.scenario("sensorhub-admin", () => this.sensorHubAdmin());
     await this.scenario("status-of-health", () => this.statusOfHealthBaseline());
+    await this.scenario("dashboard-health", () => this.dashboardHealthBaseline());
     await this.scenario("lane-video", () => this.laneVideo());
     await this.scenario("event-filtering", () => this.eventFiltering());
     await this.scenario("operational-views", () => this.operationalViews());
@@ -493,6 +558,401 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
+  private async openDashboard(page: Page): Promise<Locator> {
+    await this.goto(page, "/");
+    const card = this.dashboardCard(page);
+    await card.waitFor({timeout: this.config.uiTimeoutMs});
+    return card;
+  }
+
+  private async waitDashboardConnectionState(
+    page: Page,
+    kind: DashboardConnectionKind,
+    state: DashboardConnectionState,
+    timeoutMs = 60_000,
+  ): Promise<number> {
+    await this.openDashboard(page);
+    const indicators = this.dashboardConnection(page, kind);
+    return poll(
+      async () => {
+        const count = await indicators.count();
+        const states = await Promise.all(Array.from(
+          {length: count},
+          (_, index) => indicators.nth(index).getAttribute("data-state"),
+        ));
+        return {count, states};
+      },
+      (value) => value.count > 0 && value.states.every((valueState) => valueState === state),
+      {
+        timeoutMs,
+        intervalMs: 1_000,
+        description: `${this.config.testLaneLabel} dashboard ${kind} indicators to become ${state}`,
+      },
+    ).then((value) => value.count);
+  }
+
+  private async waitDashboardFaultState(
+    page: Page,
+    kind: DashboardFaultKind,
+    state: "active" | "unknown" | "clear",
+    timeoutMs = 60_000,
+  ): Promise<number> {
+    await this.openDashboard(page);
+    const indicator = this.dashboardFault(page, kind);
+    if (state === "clear") {
+      await poll(
+        () => this.dashboardConnection(page, "rpm").first().getAttribute("data-state"),
+        (connectionState) => connectionState === "online" || connectionState === "offline",
+        {
+          timeoutMs,
+          intervalMs: 1_000,
+          description: `${this.config.testLaneLabel} dashboard snapshot to resolve before checking ${kind} clear`,
+        },
+      );
+      return poll(
+        () => indicator.count(),
+        (count) => count === 0,
+        {
+          timeoutMs,
+          intervalMs: 1_000,
+          description: `${this.config.testLaneLabel} dashboard ${kind} indicator to clear`,
+        },
+      );
+    }
+
+    return poll(
+      async () => ({count: await indicator.count(), state: await indicator.first().getAttribute("data-state").catch(() => null)}),
+      (value) => value.count > 0 && value.state === state,
+      {
+        timeoutMs,
+        intervalMs: 1_000,
+        description: `${this.config.testLaneLabel} dashboard ${kind} indicator to become ${state}`,
+      },
+    ).then((value) => value.count);
+  }
+
+  private async dashboardHealthBaseline(): Promise<void> {
+    const page = await this.browser.oscarPage();
+    const healthRoutePattern = /\/observations\/?(?:\?|$)/;
+    let fixtureMode: "live" | "mixed" | "offline" | "unknown" = "live";
+    let forcedConnectionObservations = 0;
+    let mixedTargetStreamId = "";
+    let mixedConnectionObservations = 0;
+    let mixedOfflineObservations = 0;
+    let unknownHealthResponses = 0;
+    const unknownHealthStreamIds = new Set<string>();
+    let probeEnabled = true;
+    let currentHealthRequests = 0;
+    let peakHealthRequests = 0;
+    const trackedRequests = new Set<Request>();
+    const batches: Array<{streamIds: string[]; limit: number | null}> = [];
+
+    const requestStarted = (request: Request) => {
+      if (!probeEnabled) return;
+      const batch = parseHealthObservationBatch(request.url());
+      if (!batch) return;
+      trackedRequests.add(request);
+      batches.push(batch);
+      currentHealthRequests++;
+      peakHealthRequests = Math.max(peakHealthRequests, currentHealthRequests);
+    };
+    const requestSettled = (request: Request) => {
+      if (!trackedRequests.delete(request)) return;
+      currentHealthRequests = Math.max(0, currentHealthRequests - 1);
+    };
+
+    page.on("request", requestStarted);
+    page.on("requestfinished", requestSettled);
+    page.on("requestfailed", requestSettled);
+    await page.route(healthRoutePattern, async (route) => {
+      const batch = parseHealthObservationBatch(route.request().url());
+      if (!batch || fixtureMode === "live") {
+        await route.continue();
+        return;
+      }
+      if (fixtureMode === "unknown") {
+        unknownHealthResponses++;
+        batch.streamIds.forEach((streamId) => unknownHealthStreamIds.add(streamId));
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({items: []}),
+        });
+        return;
+      }
+
+      const response = await route.fetch();
+      const payload: unknown = await response.json();
+      if (fixtureMode === "mixed") {
+        const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
+        mixedConnectionObservations += summary.matched;
+        mixedOfflineObservations += summary.offlineMatched;
+      } else {
+        forcedConnectionObservations += forceConnectionObservationsOffline(payload);
+      }
+      await route.fulfill({response, json: payload});
+    });
+
+    try {
+      const card = await this.openDashboard(page);
+      await this.check({
+        scenario: "dashboard-health", category: "dashboard-health", action: "enumerate compact lane health indicators",
+        target: "Dashboard Lane Status", expected: `${this.config.expectedLaneCount} cards, one RPM per lane, and ${this.config.expectedCameraCount} independently identified cameras`,
+      }, async () => {
+        const cards = page.locator('[data-testid^="lane-health-card-"]');
+        const rpms = page.locator('[data-testid^="lane-health-"][data-testid$="-rpm"]');
+        const cameras = page.locator('[data-testid^="lane-health-"][data-testid$="-camera"]');
+        const [cardCount, rpmCount, cameraCount, cameraIds, perCard] = await Promise.all([
+          cards.count(),
+          rpms.count(),
+          cameras.count(),
+          cameras.evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-component-id") ?? "")),
+          cards.evaluateAll((nodes) => nodes.map((node) => ({
+            lane: (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+            rpms: node.querySelectorAll('[data-testid$="-rpm"]').length,
+            cameras: node.querySelectorAll('[data-testid$="-camera"]').length,
+          }))),
+        ]);
+        const uniqueCameraIds = new Set(cameraIds.filter(Boolean));
+        const invalidRpmMappings = perCard.filter((lane) => lane.rpms !== 1);
+        const requireOneCameraPerLane = this.config.expectedCameraCount === this.config.expectedLaneCount;
+        const invalidCameraMappings = requireOneCameraPerLane
+          ? perCard.filter((lane) => lane.cameras !== 1)
+          : [];
+        const passed = cardCount === this.config.expectedLaneCount &&
+          rpmCount === this.config.expectedLaneCount &&
+          cameraCount === this.config.expectedCameraCount &&
+          uniqueCameraIds.size === cameraCount &&
+          invalidRpmMappings.length === 0 && invalidCameraMappings.length === 0;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-inventory");
+        return {
+          passed,
+          observed: `cards=${cardCount}; RPMs=${rpmCount}; cameras=${cameraCount}; unique camera IDs=${uniqueCameraIds.size}; invalid RPM mappings=${invalidRpmMappings.map((lane) => `${lane.lane}:${lane.rpms}`).join("|") || "none"}; invalid canonical camera mappings=${invalidCameraMappings.map((lane) => `${lane.lane}:${lane.cameras}`).join("|") || "none"}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "dashboard-health", category: "dashboard-health", action: "resolve dashboard connection indicators",
+        target: "Dashboard Lane Status", expected: "every RPM and configured camera indicator resolves independently to Online",
+      }, async () => {
+        const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-rpm"], [data-testid^="lane-health-"][data-testid$="-camera"]');
+        const expected = this.config.expectedLaneCount + this.config.expectedCameraCount;
+        const states = await poll(
+          () => indicators.evaluateAll((nodes) => nodes.map((node) => ({
+            state: node.getAttribute("data-state"),
+            label: node.getAttribute("aria-label") ?? "",
+          }))),
+          (values) => values.length === expected && values.every(({state, label}) =>
+            state === "online" && /online/i.test(label)),
+          {timeoutMs: 45_000, intervalMs: 1_000, description: "dashboard RPM and camera indicators to resolve online"},
+        ).catch(() => indicators.evaluateAll((nodes) => nodes.map((node) => ({
+          state: node.getAttribute("data-state"),
+          label: node.getAttribute("aria-label") ?? "",
+        }))));
+        const online = states.filter(({state}) => state === "online").length;
+        const passed = states.length === expected && online === expected &&
+          states.every(({label}) => /online/i.test(label));
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-live-connections");
+        return {passed, observed: `${online}/${expected} Online with accessible labels`, evidence};
+      });
+
+      await poll(
+        async () => trackedRequests.size,
+        (count) => batches.length > 0 && count === 0,
+        {timeoutMs: 15_000, intervalMs: 100, description: "initial dashboard health batches to settle"},
+      );
+      probeEnabled = false;
+      await this.check({
+        scenario: "dashboard-health", category: "performance", action: "bound shared dashboard health polling",
+        target: "latest observation requests", expected: "shared batches contain at most 50 streams with at most two requests in flight and do not fan out one REST request per lane",
+      }, async () => {
+        const uniqueBatches = new Map(batches.map((batch) => [batch.streamIds.join(","), batch]));
+        const values = [...uniqueBatches.values()];
+        const validSizes = values.every((batch) => batch.streamIds.length > 0 &&
+          batch.streamIds.length <= 50 && batch.limit === batch.streamIds.length);
+        const shared = this.config.expectedLaneCount <= 1 ||
+          (values.length < this.config.expectedLaneCount && values.some((batch) => batch.streamIds.length > 1));
+        const passed = values.length > 0 && validSizes && peakHealthRequests <= 2 && shared;
+        return {
+          passed,
+          observed: `${values.length} unique batches; sizes=${values.map((batch) => batch.streamIds.length).join("|")}; peak in flight=${peakHealthRequests}; lane count=${this.config.expectedLaneCount}`,
+        };
+      });
+
+      const requestedHealthStreamIds = new Set(batches.flatMap((batch) => batch.streamIds));
+      const mixedTarget = await this.dashboardCameraConnectionTarget(page, requestedHealthStreamIds);
+      mixedTargetStreamId = mixedTarget.streamId;
+      mixedConnectionObservations = 0;
+      mixedOfflineObservations = 0;
+      fixtureMode = "mixed";
+      await page.reload({waitUntil: "domcontentloaded"});
+      await card.waitFor({timeout: this.config.uiTimeoutMs});
+      await this.check({
+        scenario: "dashboard-health", category: "dashboard-health", action: "render one camera Offline independently",
+        target: this.config.testLaneLabel,
+        expected: "exactly the selected camera is Offline while every RPM and every other camera remain Online",
+      }, async () => {
+        const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-rpm"], [data-testid^="lane-health-"][data-testid$="-camera"]');
+        const expected = this.config.expectedLaneCount + this.config.expectedCameraCount;
+        const states = await poll(
+          () => indicators.evaluateAll((nodes) => nodes.map((node) => ({
+            kind: node.getAttribute("data-testid")?.endsWith("-camera") ? "camera" : "rpm",
+            componentId: node.getAttribute("data-component-id") ?? "",
+            state: node.getAttribute("data-state"),
+            label: node.getAttribute("aria-label") ?? "",
+          }))),
+          (values) => {
+            const offline = values.filter(({state}) => state === "offline");
+            return values.length === expected && offline.length === 1 &&
+              offline[0]?.kind === "camera" &&
+              offline[0]?.componentId === mixedTarget.componentId &&
+              values.filter(({componentId}) => componentId !== mixedTarget.componentId)
+                .every(({state}) => state === "online");
+          },
+          {timeoutMs: 45_000, intervalMs: 1_000, description: "one selected camera to render Offline independently"},
+        );
+        const offline = states.filter(({state}) => state === "offline");
+        const labelsCorrect = states.every(({state, label}) =>
+          state === "offline" ? /offline/i.test(label) : /online/i.test(label));
+        const passed = mixedConnectionObservations >= expected && mixedOfflineObservations >= 1 &&
+          offline.length === 1 && offline[0]?.kind === "camera" &&
+          offline[0]?.componentId === mixedTarget.componentId && labelsCorrect;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-one-camera-offline");
+        return {
+          passed,
+          observed: `connections=${states.length}/${expected}; Offline cameras=${offline.length}; selected camera Offline=${offline[0]?.componentId === mixedTarget.componentId}; rewritten=${mixedConnectionObservations}; target rewrites=${mixedOfflineObservations}; accessible labels=${labelsCorrect}`,
+          evidence,
+        };
+      });
+
+      fixtureMode = "offline";
+      forcedConnectionObservations = 0;
+      await page.reload({waitUntil: "domcontentloaded"});
+      await card.waitFor({timeout: this.config.uiTimeoutMs});
+      await this.check({
+        scenario: "dashboard-health", category: "dashboard-health", action: "render independent Offline connection states",
+        target: "Dashboard Lane Status", expected: "browser fixture drives every RPM and camera indicator to an accessible Offline state",
+      }, async () => {
+        const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-rpm"], [data-testid^="lane-health-"][data-testid$="-camera"]');
+        const expected = this.config.expectedLaneCount + this.config.expectedCameraCount;
+        const states = await poll(
+          () => indicators.evaluateAll((nodes) => nodes.map((node) => ({
+            state: node.getAttribute("data-state"),
+            label: node.getAttribute("aria-label") ?? "",
+          }))),
+          (values) => values.length === expected && values.every(({state}) => state === "offline"),
+          {timeoutMs: 45_000, intervalMs: 1_000, description: "dashboard connection indicators to render fixture Offline"},
+        );
+        const passed = forcedConnectionObservations >= expected &&
+          states.every(({state, label}) => state === "offline" && /offline/i.test(label));
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-offline-fixture");
+        return {
+          passed,
+          observed: `${states.length}/${expected} Offline; rewritten connection observations=${forcedConnectionObservations}`,
+          evidence,
+        };
+      });
+
+      fixtureMode = "unknown";
+      unknownHealthResponses = 0;
+      unknownHealthStreamIds.clear();
+      await this.check({
+        scenario: "dashboard-health", category: "dashboard-health", action: "render unknown connection and fault states",
+        target: this.config.testLaneLabel, expected: "a completed missing-observation reconciliation changes RPM, every camera, and all five fault indicators to their exact accessible Unknown states",
+      }, async () => {
+        const connections = this.dashboardCard(page).locator('[data-testid$="-rpm"], [data-testid$="-camera"]');
+        const state = await poll(async () => ({
+          connections: await connections.evaluateAll((nodes) => nodes.map((node) => ({
+            state: node.getAttribute("data-state"), label: node.getAttribute("aria-label") ?? "",
+          }))),
+          faults: await Promise.all(DASHBOARD_FAULT_KINDS.map(async (kind) => {
+            const indicator = this.dashboardFault(page, kind);
+            return {
+              kind,
+              count: await indicator.count(),
+              state: await indicator.first().getAttribute("data-state").catch(() => null),
+              label: await indicator.first().getAttribute("aria-label").catch(() => null) ?? "",
+            };
+          })),
+          responses: unknownHealthResponses,
+          allRequestedStreamsCompleted: requestedHealthStreamIds.size > 0 &&
+            [...requestedHealthStreamIds].every((streamId) => unknownHealthStreamIds.has(streamId)),
+        }), (value) => value.responses > 0 && value.allRequestedStreamsCompleted &&
+          value.connections.length > 0 &&
+          value.connections.every(({state: itemState}) => itemState === "unknown") &&
+          value.faults.every((fault) => fault.count === 1 && fault.state === "unknown"), {
+          timeoutMs: 45_000,
+          intervalMs: 1_000,
+          description: `${this.config.testLaneLabel} dashboard indicators to transition to Unknown after a completed empty reconciliation`,
+        });
+        const connectionLabelsCorrect = state.connections.every(({label}) => /unknown/i.test(label));
+        const faultLabelsCorrect = state.faults.every(({kind, label}) =>
+          label === `${DASHBOARD_FAULT_LABELS[kind]}: Unknown`);
+        const passed = state.responses > 0 && state.allRequestedStreamsCompleted &&
+          connectionLabelsCorrect && faultLabelsCorrect;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-unknown-fixture");
+        return {
+          passed,
+          observed: `connections=${state.connections.length}; faults=${state.faults.length}; empty responses=${state.responses}; all requested streams completed=${state.allRequestedStreamsCompleted}; exact accessible labels=${connectionLabelsCorrect && faultLabelsCorrect}`,
+          evidence,
+        };
+      });
+
+      fixtureMode = "live";
+      await page.reload({waitUntil: "domcontentloaded"});
+      await card.waitFor({timeout: this.config.uiTimeoutMs});
+      await this.check({
+        scenario: "dashboard-health", category: "dashboard-health", action: "recover live dashboard health after fixtures",
+        target: "Dashboard Lane Status", expected: "every RPM and camera returns Online and all five reserved-lane fault indicators resolve Clear",
+      }, async () => {
+        const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-rpm"], [data-testid^="lane-health-"][data-testid$="-camera"]');
+        const expected = this.config.expectedLaneCount + this.config.expectedCameraCount;
+        const recovered = await poll(async () => ({
+          connections: await indicators.evaluateAll((nodes) => nodes.map((node) => ({
+            state: node.getAttribute("data-state"), label: node.getAttribute("aria-label") ?? "",
+          }))),
+          faultCounts: await Promise.all(DASHBOARD_FAULT_KINDS.map((kind) => this.dashboardFault(page, kind).count())),
+        }), (value) => value.connections.length === expected &&
+          value.connections.every(({state, label}) => state === "online" && /online/i.test(label)) &&
+          value.faultCounts.every((count) => count === 0), {
+          timeoutMs: 45_000,
+          intervalMs: 1_000,
+          description: "dashboard live connection and clear fault state to recover after fixtures",
+        });
+        const passed = recovered.connections.length === expected &&
+          recovered.connections.every(({state, label}) => state === "online" && /online/i.test(label)) &&
+          recovered.faultCounts.every((count) => count === 0);
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-live-recovery");
+        return {
+          passed,
+          observed: `Online connections=${recovered.connections.length}/${expected}; reserved-lane remaining fault indicators=${recovered.faultCounts.reduce((sum, count) => sum + count, 0)}`,
+          evidence,
+        };
+      });
+      await this.check({
+        scenario: "dashboard-health", category: "navigation", action: "open lane details from compact health card",
+        target: this.config.testLaneLabel, expected: "keyboard activation of the lane health card opens that lane's detail page",
+      }, async () => {
+        const link = this.dashboardCard(page).getByRole("link");
+        await link.focus();
+        await page.keyboard.press("Enter");
+        await page.waitForURL(/\/lane-view(?:\?|$)/, {timeout: this.config.uiTimeoutMs});
+        const heading = await page.getByText(`Lane ID: ${this.config.testLaneLabel}`, {exact: true})
+          .isVisible().catch(() => false);
+        const evidence = heading ? "" : await this.screenshotOnFailure(page, "dashboard-health-lane-navigation");
+        return {passed: heading, observed: `URL=${page.url()}; expected lane heading visible=${heading}`, evidence};
+      });
+    } finally {
+      probeEnabled = false;
+      page.off("request", requestStarted);
+      page.off("requestfinished", requestSettled);
+      page.off("requestfailed", requestSettled);
+      await page.unroute(healthRoutePattern).catch(() => undefined);
+      await page.close();
+    }
+  }
+
   private async laneVideo(): Promise<void> {
     const page = await this.browser.oscarPage();
     try {
@@ -699,14 +1159,60 @@ export class RegressionScenarios {
 
       for (const key of configuredViewKeys) {
         const fixtureLaneNames = oracle.lanesByView.get(key) ?? [];
-        const expectedLaneNames = [...fixtureLaneNames].sort();
+        const expectedLaneNames = [...fixtureLaneNames].sort((a, b) => a.localeCompare(b));
         await this.check({
           scenario: "operational-views", category: "scope", action: `scope ${key} operational view`,
           target: key,
-          expected: `Status of Health navigation retains view=${key} and lists exactly ${expectedLaneNames.join(";")}`,
+          expected: `Dashboard cards and Status of Health retain view=${key} and list exactly ${expectedLaneNames.join(";")}`,
         }, async () => {
           await this.goto(page, `/?view=${encodeURIComponent(key)}`);
           await page.getByText(`View: ${key}`, {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          const dashboardCards = page.locator('[data-testid^="lane-health-card-"]');
+          const readDashboardCards = async () => (await dashboardCards.evaluateAll((elements) => elements.map((element) => ({
+            laneName: (element.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+            rpmCount: element.querySelectorAll('[data-testid$="-rpm"]').length,
+            cameraCount: element.querySelectorAll('[data-testid$="-camera"]').length,
+            cameraIds: [...element.querySelectorAll('[data-testid$="-camera"]')]
+              .map((camera) => camera.getAttribute("data-component-id") ?? "")
+              .filter(Boolean),
+          })))).sort((a, b) => a.laneName.localeCompare(b.laneName));
+          const requireOneCameraPerLane = this.config.expectedCameraCount === this.config.expectedLaneCount;
+          let dashboardState: Array<{
+            laneName: string;
+            rpmCount: number;
+            cameraCount: number;
+            cameraIds: string[];
+          }>;
+          try {
+            dashboardState = await poll(
+              readDashboardCards,
+              (value) => {
+                const laneNames = value.map(({laneName}) => laneName);
+                const cameraIds = value.flatMap(({cameraIds}) => cameraIds);
+                const renderedCameraCount = value.reduce((sum, {cameraCount}) => sum + cameraCount, 0);
+                return laneNames.length === expectedLaneNames.length &&
+                  laneNames.every((laneName, index) => laneName === expectedLaneNames[index]) &&
+                  value.every(({rpmCount}) => rpmCount === 1) &&
+                  (!requireOneCameraPerLane || value.every(({cameraCount}) => cameraCount === 1)) &&
+                  cameraIds.length === renderedCameraCount &&
+                  new Set(cameraIds).size === cameraIds.length;
+              },
+              {
+                timeoutMs: this.config.uiTimeoutMs,
+                intervalMs: 250,
+                description: `exact ${key} Dashboard lane and component membership`,
+              },
+            );
+          } catch {
+            dashboardState = await readDashboardCards();
+            const evidence = await this.screenshotOnFailure(page, `operational-view-${safeName(key)}-dashboard-membership`);
+            return {
+              passed: false,
+              observed: `Dashboard lanes=${dashboardState.map(({laneName}) => laneName).join(";") || "none"}; RPM mappings=${dashboardState.map(({laneName, rpmCount}) => `${laneName}:${rpmCount}`).join("|") || "none"}; camera mappings=${dashboardState.map(({laneName, cameraCount}) => `${laneName}:${cameraCount}`).join("|") || "none"}`,
+              evidence,
+            };
+          }
 
           const healthLink = page.locator(`a[href="/health/?view=${encodeURIComponent(key)}"]`).first();
           await healthLink.waitFor({timeout: this.config.uiTimeoutMs});
@@ -753,7 +1259,7 @@ export class RegressionScenarios {
             current.searchParams.get("view") === key;
           return {
             passed: href === `/health/?view=${encodeURIComponent(key)}` && queryPersisted,
-            observed: `nav href=${href}; query persisted=${queryPersisted}; exact lanes=${actualLaneNames.length}`,
+            observed: `Dashboard exact lanes=${dashboardState.length}; one RPM per lane=true; canonical one camera per lane=${requireOneCameraPerLane}; nav href=${href}; query persisted=${queryPersisted}; Health exact lanes=${actualLaneNames.length}`,
           };
         });
       }
@@ -1271,6 +1777,20 @@ export class RegressionScenarios {
         const text = await this.waitHealthText(page, "Offline", 60_000);
         return {passed: /RPM.*Offline/i.test(text), observed: text};
       });
+      await this.check({
+        scenario: "rpm-connection", category: "dashboard-health", action: "show disconnected RPM independently on dashboard",
+        target: this.config.testLaneLabel, expected: "dashboard RPM icon is Offline while every camera icon remains Online",
+      }, async () => {
+        const rpmCount = await this.waitDashboardConnectionState(page, "rpm", "offline", 60_000);
+        const cameraCount = await this.waitDashboardConnectionState(page, "camera", "online", 60_000);
+        const passed = rpmCount === 1 && cameraCount > 0;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-rpm-offline");
+        return {
+          passed,
+          observed: `RPM Offline indicators=${rpmCount}; camera Online indicators=${cameraCount}`,
+          evidence,
+        };
+      });
     } finally {
       if (stopped) {
         await this.emulator.start(this.config.testRpmId).catch(() => undefined);
@@ -1284,6 +1804,20 @@ export class RegressionScenarios {
       const text = await this.waitHealthText(page, "Online", 60_000);
       return {passed: /RPM.*Online/i.test(text), observed: text};
     });
+    await this.check({
+      scenario: "rpm-connection", category: "dashboard-health", action: "show reconnected RPM on dashboard",
+      target: this.config.testLaneLabel, expected: "dashboard RPM and every camera icon are Online after reconnection",
+    }, async () => {
+      const rpmCount = await this.waitDashboardConnectionState(page, "rpm", "online", 60_000);
+      const cameraCount = await this.waitDashboardConnectionState(page, "camera", "online", 60_000);
+      const passed = rpmCount === 1 && cameraCount > 0;
+      const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-rpm-reconnected");
+      return {
+        passed,
+        observed: `RPM Online indicators=${rpmCount}; camera Online indicators=${cameraCount}`,
+        evidence,
+      };
+    });
     await page.close();
   }
 
@@ -1294,7 +1828,12 @@ export class RegressionScenarios {
     return status.tamper_fault;
   }
 
-  private async faultViaApi(page: Page, type: "gh" | "gl" | "nh", label: string): Promise<void> {
+  private async faultViaApi(
+    page: Page,
+    type: "gh" | "gl" | "nh",
+    label: string,
+    dashboardKind: "gamma-high" | "gamma-low" | "neutron-high",
+  ): Promise<void> {
     try {
       await this.emulator.waitForIdle(this.config.testRpmId);
       await this.emulator.fault(this.config.testRpmId, type, true);
@@ -1307,6 +1846,17 @@ export class RegressionScenarios {
         const text = await this.waitHealthText(page, `${label}: Fault`);
         return {passed: text.includes(`${label}: Fault`), observed: `${label}: Fault visible`};
       });
+      await this.check({
+        scenario: "rpm-faults", category: "dashboard-health", action: `show ${label} on dashboard`,
+        target: this.config.testLaneLabel, expected: `${label} compact indicator is Active with an accessible fault label`,
+      }, async () => {
+        const count = await this.waitDashboardFaultState(page, dashboardKind, "active");
+        const indicator = this.dashboardFault(page, dashboardKind);
+        const labelText = await indicator.first().getAttribute("aria-label") ?? "";
+        const passed = count === 1 && labelText === `${label}: Fault`;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, `dashboard-${dashboardKind}-active`);
+        return {passed, observed: `active indicators=${count}; aria-label=${labelText}`, evidence};
+      });
     } finally {
       await this.emulator.fault(this.config.testRpmId, type, false).catch((error) => this.reporter.error("rpm-faults", `clear-${type}`, error));
     }
@@ -1318,6 +1868,13 @@ export class RegressionScenarios {
     }, async () => {
       const text = await this.waitHealthText(page, `${label}: Clear`);
       return {passed: text.includes(`${label}: Clear`), observed: `${label}: Clear visible`};
+    });
+    await this.check({
+      scenario: "rpm-faults", category: "dashboard-health", action: `clear ${label} from dashboard`,
+      target: this.config.testLaneLabel, expected: `${label} compact indicator disappears after the fault clears`,
+    }, async () => {
+      const count = await this.waitDashboardFaultState(page, dashboardKind, "clear");
+      return {passed: count === 0, observed: `remaining indicators=${count}`};
     });
   }
 
@@ -1348,8 +1905,54 @@ export class RegressionScenarios {
         const text = await this.waitHealthText(page, "Tamper: Fault");
         return {passed: text.includes("Tamper: Fault"), observed: "Tamper: Fault visible"};
       });
-      await tamper.click();
-      await this.emulator.waitForStatus(this.config.testRpmId, (status) => !status.tamper_fault, "tamper to clear through emulator GUI");
+      await this.check({
+        scenario: "rpm-faults", category: "dashboard-health", action: "show Tamper on dashboard",
+        target: this.config.testLaneLabel, expected: "Tamper compact indicator is Active and exposes the lane-specific clear control",
+      }, async () => {
+        const count = await this.waitDashboardFaultState(page, "tamper", "active");
+        const indicatorLabel = await this.dashboardFault(page, "tamper").getAttribute("aria-label") ?? "";
+        const clearButton = this.dashboardCard(page).getByRole("button", {name: /clear tamper/i});
+        const buttonVisible = await clearButton.isVisible().catch(() => false);
+        const passed = count === 1 && indicatorLabel === "Tamper: Fault" && buttonVisible;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-tamper-active");
+        return {
+          passed,
+          observed: `active indicators=${count}; aria-label=${indicatorLabel}; clear control visible=${buttonVisible}`,
+          evidence,
+        };
+      });
+      await this.check({
+        scenario: "rpm-faults", category: "dashboard-health", action: "clear Tamper without opening lane details",
+        target: this.config.testLaneLabel, expected: "clear-tamper opens its confirmation in place, sends the clear command, and removes the Tamper indicator without navigating",
+      }, async () => {
+        const originalPath = normalizePathname(new URL(page.url()).pathname);
+        const clearButton = this.dashboardCard(page).getByRole("button", {name: /clear tamper/i});
+        await clearButton.click();
+        const dialog = page.getByRole("dialog");
+        await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+        const pathAfterOpen = normalizePathname(new URL(page.url()).pathname);
+        await dialog.getByRole("button", {name: /clear tamper/i}).click();
+        await this.emulator.waitForStatus(
+          this.config.testRpmId,
+          (status) => !status.tamper_fault,
+          "tamper to clear through OSCAR dashboard",
+          60_000,
+        );
+        await poll(
+          () => this.dashboardFault(page, "tamper").count(),
+          (count) => count === 0,
+          {timeoutMs: 60_000, intervalMs: 1_000, description: "dashboard Tamper indicator to clear after command"},
+        );
+        const finalPath = normalizePathname(new URL(page.url()).pathname);
+        const stayedOnDashboard = originalPath === "/" && pathAfterOpen === "/" && finalPath === "/";
+        const passed = stayedOnDashboard;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-tamper-clear-isolation");
+        return {
+          passed,
+          observed: `paths=${originalPath}|${pathAfterOpen}|${finalPath}; Tamper active=false`,
+          evidence,
+        };
+      });
     } finally {
       await this.emulator.fault(this.config.testRpmId, "tamper", false).catch(() => undefined);
       await emulatorPage.close();
@@ -1361,14 +1964,21 @@ export class RegressionScenarios {
       const text = await this.waitHealthText(page, "Tamper: Clear");
       return {passed: text.includes("Tamper: Clear"), observed: "Tamper: Clear visible"};
     });
+    await this.check({
+      scenario: "rpm-faults", category: "dashboard-health", action: "keep cleared Tamper hidden on dashboard",
+      target: this.config.testLaneLabel, expected: "Tamper compact indicator remains absent after a fresh health snapshot",
+    }, async () => {
+      const count = await this.waitDashboardFaultState(page, "tamper", "clear");
+      return {passed: count === 0, observed: `remaining indicators=${count}`};
+    });
   }
 
   private async faults(): Promise<void> {
     const page = await this.browser.oscarPage();
     try {
-      await this.faultViaApi(page, "gh", "Gamma high");
-      await this.faultViaApi(page, "gl", "Gamma low");
-      await this.faultViaApi(page, "nh", "Neutron high");
+      await this.faultViaApi(page, "gh", "Gamma high", "gamma-high");
+      await this.faultViaApi(page, "gl", "Gamma low", "gamma-low");
+      await this.faultViaApi(page, "nh", "Neutron high", "neutron-high");
       await this.tamperViaEmulatorGui(page);
     } finally {
       await this.emulator.clearFaults(this.config.testRpmId).catch((error) => this.reporter.error("rpm-faults", "final-clear", error));
@@ -1880,6 +2490,21 @@ export class RegressionScenarios {
         const text = await this.waitHealthText(page, "Extended occupancy: Fault", (this.config.extendedOccupancySeconds + 35) * 1_000);
         return {passed: text.includes("Extended occupancy: Fault"), observed: "Extended occupancy: Fault visible"};
       });
+      await this.check({
+        scenario: "extended-occupancy", category: "dashboard-health", action: "show extended occupancy on dashboard",
+        target: this.config.testLaneLabel, expected: "extended-occupancy compact indicator becomes Active after the configured one-minute threshold",
+      }, async () => {
+        const count = await this.waitDashboardFaultState(
+          page,
+          "extended-occupancy",
+          "active",
+          (this.config.extendedOccupancySeconds + 35) * 1_000,
+        );
+        const label = await this.dashboardFault(page, "extended-occupancy").getAttribute("aria-label") ?? "";
+        const passed = count === 1 && label === "Extended occupancy: Fault";
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-extended-occupancy-active");
+        return {passed, observed: `active indicators=${count}; aria-label=${label}`, evidence};
+      });
     } finally {
       await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch((error) => this.reporter.error("extended-occupancy", "restore-quiet-config", error));
     }
@@ -1889,6 +2514,13 @@ export class RegressionScenarios {
     }, async () => {
       const text = await this.waitHealthText(page, "Extended occupancy: Clear", 60_000);
       return {passed: text.includes("Extended occupancy: Clear"), observed: "Extended occupancy: Clear visible"};
+    });
+    await this.check({
+      scenario: "extended-occupancy", category: "dashboard-health", action: "clear extended occupancy from dashboard",
+      target: this.config.testLaneLabel, expected: "extended-occupancy compact indicator disappears after occupancy ends",
+    }, async () => {
+      const count = await this.waitDashboardFaultState(page, "extended-occupancy", "clear", 60_000);
+      return {passed: count === 0, observed: `remaining indicators=${count}`};
     });
     await page.close();
   }

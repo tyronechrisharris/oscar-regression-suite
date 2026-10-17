@@ -5,8 +5,9 @@ real OSCAR Viewer, SensorHub Admin UI, and RPM emulator; injects controlled
 faults and alarms; validates adjudication and reporting; and emits machine-readable
 correctness and performance results.
 
-The harness was developed against OSCAR 3.9.1 and the 50-lane emulator site. It
-is configuration-driven so later builds can be tested without changing source.
+The harness was first validated against OSCAR 3.9.1 and the 50-lane emulator
+site. It is configuration-driven so later builds can be tested without changing
+source.
 
 > **Test environments only.** The `full` profile stops and restarts the reserved
 > RPM, temporarily replaces its configuration, forces connection and fault
@@ -21,6 +22,10 @@ is configuration-driven so later builds can be tested without changing source.
 - authenticated Viewer access, navigation, map, national statistics, and servers
 - SensorHub Admin visibility
 - every configured lane and camera on Status of Health
+- compact Dashboard health indicators for every lane, with independent RPM and
+  per-camera connectivity; gamma-high/low, neutron-high, tamper, and extended-
+  occupancy states; operational-view membership; keyboard navigation; and
+  bounded shared health requests
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
   extended-occupancy detection and recovery
 - live HLS camera playback, decoded dimensions, and advancing playback time
@@ -39,6 +44,11 @@ is configuration-driven so later builds can be tested without changing source.
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.
+
+The smoke profile requires live Online observations for every configured RPM
+and camera. Its deterministic camera Offline and Unknown checks intercept only
+browser responses and do not disconnect live cameras. The full profile performs
+the real reserved-RPM disconnect/reconnect and supported fault transitions.
 
 ## Safety model
 
@@ -84,7 +94,7 @@ does post the national-statistics command and create report bucket files):
 npm run test:smoke
 ```
 
-Then run the complete fault-injection profile on an acknowledged test target:
+Then run the configured full profile on an acknowledged test target:
 
 ```bash
 npm run test:full
@@ -94,6 +104,7 @@ Run one or more named scenarios with a comma-separated filter:
 
 ```bash
 npm run test:full -- --scenario rpm-faults,adjudication
+npm run test:smoke -- --scenario dashboard-health
 ```
 
 The reserved lane is still isolated and restored when a full-profile scenario

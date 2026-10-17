@@ -140,7 +140,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   }
   const knownScenarios = new Set([
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
-    "status-of-health", "lane-video", "event-filtering", "operational-views",
+    "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
     "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
   ]);
