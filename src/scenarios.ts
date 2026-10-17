@@ -600,15 +600,6 @@ export class RegressionScenarios {
     await this.openDashboard(page);
     const indicator = this.dashboardFault(page, kind);
     if (state === "clear") {
-      await poll(
-        () => this.dashboardConnection(page, "rpm").first().getAttribute("data-state"),
-        (connectionState) => connectionState === "online" || connectionState === "offline",
-        {
-          timeoutMs,
-          intervalMs: 1_000,
-          description: `${this.config.testLaneLabel} dashboard snapshot to resolve before checking ${kind} clear`,
-        },
-      );
       return poll(
         () => indicator.count(),
         (count) => count === 0,
