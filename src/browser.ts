@@ -359,6 +359,27 @@ export class BrowserHarness {
     return page;
   }
 
+  async unauthenticatedOscarGet(path: string): Promise<{status: number; cacheControl: string}> {
+    if (!this.browser) throw new Error("Browser harness is not started");
+    const context = await this.browser.newContext({ignoreHTTPSErrors: true});
+    try {
+      const response = await context.request.get(
+        new URL(path, `${this.config.oscarBaseUrl}/`).toString(),
+        {maxRedirects: 0},
+      );
+      try {
+        return {
+          status: response.status(),
+          cacheControl: response.headers()["cache-control"] ?? "",
+        };
+      } finally {
+        await response.dispose();
+      }
+    } finally {
+      await context.close();
+    }
+  }
+
   alarmTransferCameraFixture(): AlarmTransferCameraFixture | undefined {
     return this.alarmTransferCameraFixtureValue;
   }

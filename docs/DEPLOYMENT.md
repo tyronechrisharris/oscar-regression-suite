@@ -59,6 +59,8 @@ container/host fields are simply absent.
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication
 # Release gate for a build that claims the occupancy UUID workflow:
 EVENT_UUID_WORKFLOW=required ./scripts/run-regression.sh full --scenario event-uuid
+# With operational views enabled, this also gates assigned-view URL persistence
+# and non-member-view fail-closed lookup for the reserved lane.
 # Release gate for deterministic Alarm Transfer camera scanning:
 ALARM_TRANSFER_CAMERA_WORKFLOW=required \
   ./scripts/run-regression.sh smoke --scenario alarm-transfer-camera

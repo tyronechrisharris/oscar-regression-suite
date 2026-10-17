@@ -20,7 +20,8 @@ source.
 ## What it validates
 
 - authenticated Viewer access, navigation, map, national statistics, and servers
-- browser-cache policy for immutable hashed Viewer bundles and revalidated service-worker code
+- browser-cache policy for private immutable hashed Viewer bundles, revalidated
+  service-worker code, and non-cacheable anonymous authentication errors
 - SensorHub Admin visibility
 - every configured lane and camera on Status of Health
 - compact Dashboard health indicators for every lane, with independent RPM and
@@ -31,9 +32,12 @@ source.
   extended-occupancy detection and recovery
 - live HLS camera playback, decoded dimensions, and advancing playback time
 - alarm ingestion and full-database event filtering
-- occupancy UUID display, search, fresh direct links, not-found handling, and
-  exact UUID preservation in printable PDFs and truncated QR exports
-- offline alarm JSON export/import and SHA-256 validation
+- occupancy UUID display, search, fresh direct links, not-found handling,
+  operational-view-preserving member lookup and non-member fail-closed behavior,
+  and exact UUID preservation in printable PDFs and truncated QR exports
+- offline alarm JSON export/import and SHA-256 validation, including visible
+  series-color chart redraw and canonical payload/integrity/transport validation
+  when the received package is downloaded again
 - deterministic Alarm Transfer camera scanning, lifecycle cleanup, permission
   failure/retry, and exported QR PNG image import
 - full adjudication, confirmation, and audit-history display
@@ -129,7 +133,10 @@ Start from [.env.example](.env.example). Required values are:
 
 Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
 the occupancy UUID workflow. The default `auto` mode records one skipped check
-instead of failing when the controls are absent from an older deployment.
+instead of failing when the controls are absent from an older deployment. When
+operational views are enabled, the same scenario searches the known UUID from
+one fixture-assigned view, requires the canonical Event Details URL to retain
+that view, and proves a populated non-member view cannot resolve the occupancy.
 
 Set `ALARM_TRANSFER_CAMERA_WORKFLOW=required` when the Alarm Transfer camera
 scanner is part of the release contract. The scenario feeds Chromium a

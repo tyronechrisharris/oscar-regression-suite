@@ -10,6 +10,15 @@ import {
   forceSingleConnectionObservationOffline,
   parseHealthObservationBatch,
 } from "./dashboard-health.js";
+import {
+  assessViewerCachePolicy,
+  canonicalAlarmTransferDocumentJson,
+  importedAlarmChartsRendered,
+  operationalViewScopePair,
+  scopedUuidOperationalViewChecksEnabled,
+  type AlarmChartCanvasSnapshot,
+  type AlarmChartSeries,
+} from "./coverage-oracles.js";
 import {RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
@@ -359,7 +368,7 @@ export class RegressionScenarios {
     await this.check({
       scenario: "preflight", category: "performance", action: "verify Viewer browser cache policy",
       target: "/_next/static and /sw.js",
-      expected: "hashed Viewer assets are privately immutable and the service worker is revalidated",
+      expected: "authenticated hashed assets are privately immutable, the service worker is revalidated, and anonymous asset errors are not cacheable",
     }, async () => {
       const page = await this.browser.oscarPage();
       try {
@@ -368,22 +377,27 @@ export class RegressionScenarios {
         if (!scriptPath) throw new Error("Viewer page did not expose a hashed static script");
 
         const request = page.context().request;
-        const [assetResponse, serviceWorkerResponse] = await Promise.all([
+        const [assetResponse, serviceWorkerResponse, unauthenticatedAsset] = await Promise.all([
           request.get(this.viewerUrl(scriptPath)),
           request.get(this.viewerUrl("/sw.js")),
+          this.browser.unauthenticatedOscarGet(scriptPath),
         ]);
         try {
           const assetCache = assetResponse.headers()["cache-control"] ?? "";
           const serviceWorkerCache = serviceWorkerResponse.headers()["cache-control"] ?? "";
-          const assetPolicyValid = /(?:^|,)\s*private\b/i.test(assetCache) &&
-            /(?:^|,)\s*max-age=31536000\b/i.test(assetCache) &&
-            /(?:^|,)\s*immutable\b/i.test(assetCache);
-          const serviceWorkerPolicyValid = /(?:^|,)\s*no-cache\b/i.test(serviceWorkerCache);
+          const assessment = assessViewerCachePolicy({
+            authenticatedAsset: {status: assetResponse.status(), cacheControl: assetCache},
+            serviceWorker: {status: serviceWorkerResponse.status(), cacheControl: serviceWorkerCache},
+            unauthenticatedAsset,
+          });
           return {
-            passed: assetResponse.ok() && serviceWorkerResponse.ok() &&
-              assetPolicyValid && serviceWorkerPolicyValid,
+            passed: assessment.passed,
             observed: `asset HTTP ${assetResponse.status()} Cache-Control=${assetCache || "missing"}; ` +
-              `sw.js HTTP ${serviceWorkerResponse.status()} Cache-Control=${serviceWorkerCache || "missing"}`,
+              `sw.js HTTP ${serviceWorkerResponse.status()} Cache-Control=${serviceWorkerCache || "missing"}; ` +
+              `anonymous asset HTTP ${unauthenticatedAsset.status} ` +
+              `Cache-Control=${unauthenticatedAsset.cacheControl || "missing"}; ` +
+              `protected=${assessment.unauthenticatedAssetProtected}; ` +
+              `not cacheable=${assessment.unauthenticatedAssetNotCacheable}`,
           };
         } finally {
           await Promise.all([assetResponse.dispose(), serviceWorkerResponse.dispose()]);
@@ -2325,6 +2339,138 @@ export class RegressionScenarios {
         } finally { await searchPage.close(); }
       });
 
+      const laneOracle = this.config.laneConfigOracle;
+      if (!scopedUuidOperationalViewChecksEnabled(this.config.operationalViewWorkflow, true) || !laneOracle) {
+        this.skip({
+          scenario: "event-uuid",
+          category: "scope",
+          action: "enforce operational-view scope during UUID lookup",
+          target: this.config.testLaneLabel,
+          expected: "UUID lookup preserves a member view and fails closed from a non-member view",
+        }, "operational-view workflow is disabled, so scoped UUID lookup is outside this run");
+      } else {
+        let scopedLookupAvailable = true;
+        if (this.config.operationalViewWorkflow === "auto") {
+          const detectionView = [...laneOracle.lanesByView.keys()].sort()[0] ?? "east-gate";
+          const capabilityPage = await this.browser.oscarPage();
+          try {
+            await this.goto(capabilityPage, `/?view=${encodeURIComponent(detectionView)}`);
+            scopedLookupAvailable = await capabilityPage.getByText(`View: ${detectionView}`, {exact: true})
+              .waitFor({timeout: this.config.uiTimeoutMs})
+              .then(() => true, () => false);
+          } finally {
+            await capabilityPage.close();
+          }
+        }
+
+        if (!scopedUuidOperationalViewChecksEnabled(
+          this.config.operationalViewWorkflow,
+          scopedLookupAvailable,
+        )) {
+          this.skip({
+            scenario: "event-uuid",
+            category: "scope",
+            action: "enforce operational-view scope during UUID lookup",
+            target: this.config.testLaneLabel,
+            expected: "UUID lookup preserves a member view and fails closed from a non-member view",
+          }, "operational-view workflow is not present on this build (auto detection)");
+        } else {
+          const {assignedView, nonMemberView} = operationalViewScopePair(
+            laneOracle,
+            this.config.testLaneLabel,
+          );
+
+          await this.check({
+          scenario: "event-uuid",
+          category: "scope",
+          action: "find event by UUID inside its assigned operational view",
+          target: `${eventUuid}@${assignedView}`,
+          expected: "UUID search resolves the event and preserves exactly one assigned view parameter",
+        }, async () => {
+          const scopedPage = await this.browser.oscarPage();
+          try {
+            await this.goto(scopedPage, `/event-log?view=${encodeURIComponent(assignedView)}`);
+            await scopedPage.getByText(`View: ${assignedView}`, {exact: true})
+              .waitFor({timeout: this.config.uiTimeoutMs});
+            await scopedPage.getByTestId("event-uuid-search-input").locator("input").fill(eventUuid);
+            const navigation = scopedPage.waitForURL(
+              (url) => normalizePathname(url.pathname) === "/event-details" &&
+                url.searchParams.get("eventId") === eventUuid &&
+                url.searchParams.get("nodeId") === eventNodeId &&
+                url.searchParams.getAll("view").length === 1 &&
+                url.searchParams.get("view") === assignedView,
+              {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
+            );
+            await scopedPage.getByTestId("event-uuid-search-submit").click();
+            await navigation;
+            const uuid = scopedPage.getByTestId("event-uuid-value");
+            await uuid.waitFor({timeout: this.config.eventTimeoutMs});
+            const resolved = (await uuid.innerText()).trim();
+            const url = new URL(scopedPage.url());
+            const passed = resolved === eventUuid &&
+              url.searchParams.get("nodeId") === eventNodeId &&
+              url.searchParams.getAll("view").length === 1 &&
+              url.searchParams.get("view") === assignedView &&
+              await scopedPage.getByTestId("event-lookup-not-found").count() === 0;
+            const evidence = passed ? "" : await this.screenshotOnFailure(
+              scopedPage,
+              "event-uuid-member-view",
+            );
+            return {
+              passed,
+              observed: `resolved UUID matches=${resolved === eventUuid}; ` +
+                `nodeId matches=${url.searchParams.get("nodeId") === eventNodeId}; ` +
+                `view=${url.searchParams.getAll("view").join(",") || "missing"}`,
+              evidence,
+            };
+          } finally { await scopedPage.close(); }
+        });
+
+          await this.check({
+          scenario: "event-uuid",
+          category: "scope",
+          action: "reject event UUID outside its operational view",
+          target: `${eventUuid}@${nonMemberView}`,
+          expected: "the same UUID fails closed as not found in a known view that excludes its lane",
+        }, async () => {
+          const scopedPage = await this.browser.oscarPage();
+          try {
+            return await this.browser.withExpectedMissingObservation(eventUuid, async () => {
+              await this.goto(scopedPage, `/event-log?view=${encodeURIComponent(nonMemberView)}`);
+              await scopedPage.getByText(`View: ${nonMemberView}`, {exact: true})
+                .waitFor({timeout: this.config.uiTimeoutMs});
+              await scopedPage.getByTestId("event-uuid-search-input").locator("input").fill(eventUuid);
+              const navigation = scopedPage.waitForURL(
+                (url) => normalizePathname(url.pathname) === "/event-details" &&
+                  url.searchParams.get("eventId") === eventUuid &&
+                  url.searchParams.getAll("view").length === 1 &&
+                  url.searchParams.get("view") === nonMemberView,
+                {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
+              );
+              await scopedPage.getByTestId("event-uuid-search-submit").click();
+              await navigation;
+              await scopedPage.getByTestId("event-lookup-not-found")
+                .waitFor({timeout: this.config.eventTimeoutMs});
+              const url = new URL(scopedPage.url());
+              const staleUuid = await scopedPage.getByTestId("event-uuid-value").count() > 0;
+              const passed = !staleUuid &&
+                url.searchParams.get("nodeId") === null &&
+                url.searchParams.getAll("view").length === 1 &&
+                url.searchParams.get("view") === nonMemberView;
+              const evidence = await this.browser.screenshot(scopedPage, "event-uuid-non-member-view");
+              return {
+                passed,
+                observed: `not-found visible=true; stale UUID visible=${staleUuid}; ` +
+                  `nodeId=${url.searchParams.get("nodeId") ?? "absent"}; ` +
+                  `view=${url.searchParams.getAll("view").join(",") || "missing"}`,
+                evidence,
+              };
+            });
+          } finally { await scopedPage.close(); }
+          });
+        }
+      }
+
       await this.check({
         scenario: "event-uuid", category: "reports", action: "include occupancy UUID in printable PDF",
         target: eventUuid, expected: "print-to-PDF output contains the full UUID while copy controls are omitted",
@@ -2437,6 +2583,10 @@ export class RegressionScenarios {
             version?: number;
             source?: {laneId?: string};
             event?: {occupancyId?: string; observationId?: string};
+            series?: {
+              gamma?: {exportedCount?: number};
+              neutron?: {exportedCount?: number};
+            };
           };
         };
         const observationId = parsed.payload?.event?.observationId ?? "";
@@ -2451,21 +2601,24 @@ export class RegressionScenarios {
           parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
         const pngValid = qrBytes.length > 100 &&
           qrBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+        const expectedChartSeries: AlarmChartSeries[] = [];
+        if ((parsed.payload?.series?.gamma?.exportedCount ?? 0) > 0) expectedChartSeries.push("gamma");
+        if ((parsed.payload?.series?.neutron?.exportedCount ?? 0) > 0) expectedChartSeries.push("neutron");
         return {
           passed: bytes.length > 100 && schemaValid && pngValid,
           observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; schema/lane/occupancy/integrity valid=${schemaValid}; PNG valid=${pngValid}`,
-          value: {...artifacts, observationId, occupancyId: exportedOccupancyId},
+          value: {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries},
           evidence: join("downloads", basename(artifacts.qrImage)),
         };
       });
 
       if (alarmArtifacts) {
-        await this.check({
-          scenario: "adjudication", category: "alarm-transfer", action: "import and validate selected alarm",
-          target: "Alarm Transfer", expected: "exported file imports offline and integrity is verified",
-        }, async () => {
-          const importPage = await this.browser.oscarPage();
-          try {
+        const importPage = await this.browser.oscarPage();
+        try {
+          const imported = await this.check({
+            scenario: "adjudication", category: "alarm-transfer", action: "import and validate selected alarm",
+            target: "Alarm Transfer", expected: "exported file imports offline and integrity is verified",
+          }, async () => {
             await this.goto(importPage, "/alarm-transfer");
             await importPage.locator('input[type="file"][accept*="json"]').setInputFiles(alarmArtifacts.alarmFile);
             await importPage.getByText("The alarm data passed its SHA-256 integrity check.", {exact: true})
@@ -2480,10 +2633,124 @@ export class RegressionScenarios {
               passed,
               observed: `UUID matches=${importedUuid === alarmArtifacts.observationId}; ` +
                 `lane present=${body.includes(this.config.testLaneLabel)}`,
+              value: true,
               evidence,
             };
-          } finally { await importPage.close(); }
-        });
+          });
+
+          if (imported) {
+            await this.check({
+              scenario: "adjudication",
+              category: "alarm-transfer",
+              action: "render imported alarm charts",
+              target: "Alarm Transfer",
+              expected: "each received non-empty measurement series redraws with its chart-specific dataset color",
+            }, async () => {
+              const charts = importPage.locator("canvas");
+              const readCharts = () => charts.evaluateAll((elements): AlarmChartCanvasSnapshot[] =>
+                elements.map((element) => {
+                  const canvas = element as HTMLCanvasElement;
+                  const context = canvas.getContext("2d");
+                  let gammaPlotPixels = 0;
+                  let neutronPlotPixels = 0;
+                  if (context && canvas.width > 0 && canvas.height > 0) {
+                    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+                    // Chart.js renders its title and legend above the plotting area. Restrict
+                    // color evidence to the central/lower chart region so a legend swatch
+                    // cannot make an empty dataset appear rendered.
+                    const firstPlotRow = Math.floor(canvas.height * 0.30);
+                    const lastPlotRow = Math.ceil(canvas.height * 0.90);
+                    const firstPlotColumn = Math.floor(canvas.width * 0.05);
+                    const lastPlotColumn = Math.ceil(canvas.width * 0.95);
+                    for (let y = firstPlotRow; y < lastPlotRow; y++) {
+                      for (let x = firstPlotColumn; x < lastPlotColumn; x++) {
+                        const index = (y * canvas.width + x) * 4;
+                        const red = pixels[index] ?? 0;
+                        const green = pixels[index + 1] ?? 0;
+                        const blue = pixels[index + 2] ?? 0;
+                        const alpha = pixels[index + 3] ?? 0;
+                        if (alpha === 0) continue;
+                        if (Math.abs(red - 244) <= 24 && Math.abs(green - 67) <= 24 &&
+                          Math.abs(blue - 54) <= 24) gammaPlotPixels++;
+                        if (Math.abs(red - 41) <= 24 && Math.abs(green - 182) <= 24 &&
+                          Math.abs(blue - 246) <= 24) neutronPlotPixels++;
+                      }
+                    }
+                  }
+                  const bounds = canvas.getBoundingClientRect();
+                  return {
+                    width: canvas.width,
+                    height: canvas.height,
+                    clientWidth: bounds.width,
+                    clientHeight: bounds.height,
+                    gammaPlotPixels,
+                    neutronPlotPixels,
+                  };
+                }));
+              const snapshots = await poll(
+                readCharts,
+                (value) => importedAlarmChartsRendered(alarmArtifacts.expectedChartSeries, value),
+                {
+                  timeoutMs: this.config.uiTimeoutMs,
+                  intervalMs: 250,
+                  description: "imported alarm series datasets to paint",
+                },
+              );
+              const passed = importedAlarmChartsRendered(alarmArtifacts.expectedChartSeries, snapshots);
+              const evidence = passed ? "" : await this.screenshotOnFailure(
+                importPage,
+                "alarm-transfer-imported-charts",
+              );
+              return {
+                passed,
+                observed: `expected series=${alarmArtifacts.expectedChartSeries.join(",") || "none"}; ` +
+                  `rendered=${snapshots.length}; ` +
+                  `gamma plot pixels=${snapshots.map(({gammaPlotPixels}) => gammaPlotPixels).join(",") || "none"}; ` +
+                  `neutron plot pixels=${snapshots.map(({neutronPlotPixels}) => neutronPlotPixels).join(",") || "none"}`,
+                evidence,
+              };
+            });
+
+            await this.check({
+              scenario: "adjudication",
+              category: "alarm-transfer",
+              action: "download received alarm package",
+              target: "Alarm Transfer",
+              expected: "the imported package downloads with the same canonical payload, integrity, transport, and UUID",
+            }, async () => {
+              const downloadPromise = importPage.waitForEvent("download");
+              await importPage.getByRole("button", {name: /download alarm file/i}).click();
+              const download = await downloadPromise;
+              const suggested = safeName(download.suggestedFilename()) || "alarm.json";
+              const receivedFile = join(
+                this.reporter.downloadDir,
+                `received-${suggested.endsWith(".json") ? suggested : `${suggested}.json`}`,
+              );
+              await download.saveAs(receivedFile);
+              const originalBytes = readFileSync(alarmArtifacts.alarmFile);
+              const receivedBytes = readFileSync(receivedFile);
+              const original = JSON.parse(originalBytes.toString("utf8")) as unknown;
+              const received = JSON.parse(receivedBytes.toString("utf8")) as {
+                payload?: {event?: {observationId?: string}};
+              };
+              const originalCanonicalSha256 = createHash("sha256")
+                .update(canonicalAlarmTransferDocumentJson(original)).digest("hex");
+              const receivedCanonicalSha256 = createHash("sha256")
+                .update(canonicalAlarmTransferDocumentJson(received)).digest("hex");
+              const uuidMatches = received.payload?.event?.observationId === alarmArtifacts.observationId;
+              const passed = receivedBytes.length > 100 &&
+                receivedCanonicalSha256 === originalCanonicalSha256 && uuidMatches;
+              return {
+                passed,
+                observed: `${receivedBytes.length} bytes; canonical document SHA-256 matches=${receivedCanonicalSha256 === originalCanonicalSha256}; ` +
+                  `UUID matches=${uuidMatches}`,
+                evidence: join("downloads", basename(receivedFile)),
+              };
+            });
+          }
+        } finally {
+          await importPage.close();
+        }
 
         await this.check({
           scenario: "adjudication", category: "alarm-transfer", action: "decode exported alarm QR image",

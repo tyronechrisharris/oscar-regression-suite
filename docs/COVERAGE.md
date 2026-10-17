@@ -6,7 +6,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Area | Assertion | Profile | Mutation |
 | --- | --- | --- | --- |
 | Authentication | login/session identity and protected Viewer access | smoke | session only |
-| Gateway caching | hashed Viewer bundles return private one-year immutable caching while `/sw.js` requires revalidation | smoke | none |
+| Gateway caching | authenticated hashed Viewer bundles return private one-year immutable caching while `/sw.js` requires revalidation; a clean unauthenticated request for the same protected bundle returns 401/403 without public, immutable, or positive-age cache directives | smoke | none |
 | Navigation | dashboard, events, health, reports, transfer, map, national, servers | smoke | none |
 | Map | interactive map has a non-zero rendered area | smoke | none |
 | National | statistics command returns HTTP success and local-node row renders | smoke | statistics command/bucket data |
@@ -25,8 +25,8 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | RPM connection | stop/restart appears Offline/Online on Status of Health and the Dashboard while camera state remains independently Online | full | reserved RPM only |
 | Faults | gamma high/low, neutron high, and tamper assert and clear on Status of Health and the Dashboard; Dashboard tamper clear stays in place, posts the real SensorHub control command, and clears the observed state | full | reserved RPM only |
 | Alarms | deterministic gamma and neutron alarms reach Event Log | full | permanent event data |
-| Event identity | capture the persisted occupancy UUID; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, print-to-PDF text, and QR v1 round-trip | full | one permanent alarm event; local clipboard/artifacts |
-| Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity; actual exported QR PNG uploads and imports successfully | full | local artifacts only |
+| Event identity | capture the persisted occupancy UUID; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, assigned-view query preservation, non-member-view fail-closed behavior, print-to-PDF text, and QR v1 round-trip | full | one permanent alarm event; local clipboard/artifacts |
+| Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity; each imported non-empty series redraws with its chart-specific dataset color; the received package downloads with the same canonical payload, integrity, transport, and UUID while export-only QR metadata may be omitted; the actual exported QR PNG uploads and imports successfully | full | local artifacts only |
 | Adjudication | Code 9 submission, confirmation, success, audit display | full | permanent audit record |
 | Extended occupancy | duration over configured threshold faults, then clears on Status of Health and the Dashboard | full | reserved RPM only |
 | Adjudication report | one-lane PDF is generated and validated | full | report bucket write |
@@ -75,8 +75,12 @@ fault to verify real Dashboard transitions and recovery.
 
 `event-uuid` is capability-gated with `EVENT_UUID_WORKFLOW`. Its default `auto`
 mode skips cleanly on older Viewer builds; use `required` for builds that claim
-the feature. The not-found check uses a newly generated identity and never
-deletes an event.
+the feature. With operational views enabled, the fixture selects one assigned
+view and one populated non-member view for the reserved lane. Search must retain
+exactly one assigned `view` parameter through canonical Event Details
+navigation, while the same UUID must display the not-found state in the
+non-member scope without leaking event data. The general not-found check uses a
+newly generated identity and never deletes an event.
 
 `alarm-transfer-camera` is capability-gated with
 `ALARM_TRANSFER_CAMERA_WORKFLOW`. Its default `auto` mode skips cleanly on older

@@ -91,7 +91,17 @@ Full-profile filters still perform mandatory setup and cleanup.
 For a Viewer release that claims occupancy UUID lookup and export support, set
 `EVENT_UUID_WORKFLOW=required` and include `event-uuid` (or run the unfiltered
 full profile). Leave the default `auto` only when older deployments must remain
-testable; it records the absent capability as skipped.
+testable; it records the absent capability as skipped. With operational views
+enabled, require the generated UUID to resolve from a view assigned to the
+reserved lane, retain that view through canonical navigation, and fail closed
+for the same UUID from a populated non-member view.
+
+For alarm-transfer release validation, require a received JSON package to render
+every non-empty gamma/neutron series with its chart-specific dataset color and
+download with the same canonical payload, integrity, transport, and occupancy
+UUID. Export-only QR sizing metadata may be omitted from the received download.
+Uploading or decoding the package alone is not sufficient evidence that offline
+review is usable.
 
 For a Viewer release that claims Alarm Transfer camera scanning, set
 `ALARM_TRANSFER_CAMERA_WORKFLOW=required` and include `alarm-transfer-camera`
