@@ -937,7 +937,10 @@ export class RegressionScenarios {
         const link = this.dashboardCard(page).getByRole("link");
         await link.focus();
         await page.keyboard.press("Enter");
-        await page.waitForURL(/\/lane-view(?:\?|$)/, {timeout: this.config.uiTimeoutMs});
+        await page.waitForURL(
+          (url) => normalizePathname(url.pathname) === "/lane-view",
+          {timeout: this.config.uiTimeoutMs},
+        );
         const heading = await page.getByText(`Lane ID: ${this.config.testLaneLabel}`, {exact: true})
           .isVisible().catch(() => false);
         const evidence = heading ? "" : await this.screenshotOnFailure(page, "dashboard-health-lane-navigation");
