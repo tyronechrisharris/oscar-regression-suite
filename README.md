@@ -5,7 +5,7 @@ real OSCAR Viewer, SensorHub Admin UI, and RPM emulator; injects controlled
 faults and alarms; validates adjudication and reporting; and emits machine-readable
 correctness and performance results.
 
-The harness was developed against OSCAR 4.0.0 and the 50-lane emulator site. It
+The harness was developed against OSCAR 3.9.1 and the 50-lane emulator site. It
 is configuration-driven so later builds can be tested without changing source.
 
 > **Test environments only.** The `full` profile stops and restarts the reserved
@@ -138,7 +138,7 @@ the current 20-column schema and assigns ten lanes apiece to `east-gate`,
 in each block also belong to `entrance`; the last five belong to `exit`. Apply
 this file when provisioning the 50-lane regression site and keep
 `OSCAR_LANE_CONFIG_PATH` pointed at that same file. Set
-`OPERATIONAL_VIEW_WORKFLOW=required` for 4.0.0-and-newer release gates. Required
+`OPERATIONAL_VIEW_WORKFLOW=required` for 3.9.1-and-newer release gates. Required
 mode treats any mismatch in all seven exact lane sets—or failure to preserve the
 view query through the real Status of Health navigation link—as a release failure.
 The explicit `auto` mode remains compatible with older Viewers by recording a
