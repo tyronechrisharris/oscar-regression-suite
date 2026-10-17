@@ -22,7 +22,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Alarm import | malformed payload is rejected visibly | smoke | none |
 | Alarm camera import | deterministic Chromium 640x480 stream starts; preview and contained scan overlay are visible and non-zero; visible status says `Scanning`; active camera reports the deterministic identity and 640 × 480; dense QR v23/1,170-character transport decodes with valid integrity and UUID; all tracks stop; denied permission is reported and retry succeeds | both | local generated media only |
 | RPM connection | stop/restart appears Offline/Online on Status of Health and the Dashboard while camera state remains independently Online | full | reserved RPM only |
-| Faults | gamma high/low, neutron high, and tamper assert and clear on Status of Health and the Dashboard; Dashboard tamper clear stays in place and sends the real control command | full | reserved RPM only |
+| Faults | gamma high/low, neutron high, and tamper assert and clear on Status of Health and the Dashboard; Dashboard tamper clear stays in place, posts the real SensorHub control command, and clears the observed state | full | reserved RPM only |
 | Alarms | deterministic gamma and neutron alarms reach Event Log | full | permanent event data |
 | Event identity | capture the persisted occupancy UUID; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, print-to-PDF text, and QR v1 round-trip | full | one permanent alarm event; local clipboard/artifacts |
 | Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity; actual exported QR PNG uploads and imports successfully | full | local artifacts only |

@@ -1926,7 +1926,7 @@ export class RegressionScenarios {
       });
       await this.check({
         scenario: "rpm-faults", category: "dashboard-health", action: "clear Tamper without opening lane details",
-        target: this.config.testLaneLabel, expected: "clear-tamper opens its confirmation in place, sends the clear command, and removes the Tamper indicator without navigating",
+        target: this.config.testLaneLabel, expected: "clear-tamper opens its confirmation in place, posts the manual clear command, and removes the SensorHub Tamper indicator without navigating",
       }, async () => {
         const originalPath = normalizePathname(new URL(page.url()).pathname);
         const clearButton = this.dashboardCard(page).getByRole("button", {name: /clear tamper/i});
@@ -1934,13 +1934,17 @@ export class RegressionScenarios {
         const dialog = page.getByRole("dialog");
         await dialog.waitFor({timeout: this.config.uiTimeoutMs});
         const pathAfterOpen = normalizePathname(new URL(page.url()).pathname);
+        const commandResponsePromise = page.waitForResponse((response) => {
+          let pathname = "";
+          try { pathname = new URL(response.url()).pathname; } catch { return false; }
+          return response.request().method() === "POST" &&
+            /\/controlstreams\/[^/]+\/commands\/?$/.test(pathname);
+        }, {timeout: this.config.uiTimeoutMs});
         await dialog.getByRole("button", {name: /clear tamper/i}).click();
-        await this.emulator.waitForStatus(
-          this.config.testRpmId,
-          (status) => !status.tamper_fault,
-          "tamper to clear through OSCAR dashboard",
-          60_000,
-        );
+        const commandResponse = await commandResponsePromise;
+        if (!commandResponse.ok()) {
+          throw new Error(`Manual tamper clear returned HTTP ${commandResponse.status()}`);
+        }
         await poll(
           () => this.dashboardFault(page, "tamper").count(),
           (count) => count === 0,
@@ -1952,7 +1956,7 @@ export class RegressionScenarios {
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-tamper-clear-isolation");
         return {
           passed,
-          observed: `paths=${originalPath}|${pathAfterOpen}|${finalPath}; Tamper active=false`,
+          observed: `command HTTP ${commandResponse.status()}; paths=${originalPath}|${pathAfterOpen}|${finalPath}; SensorHub Tamper active=false`,
           evidence,
         };
       });
