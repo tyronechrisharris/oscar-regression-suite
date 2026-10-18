@@ -4132,36 +4132,44 @@ export class RegressionScenarios {
       });
       if (!identityAccepted) throw new Error("Destructive restore refused because exact 3.9.2 identity failed");
 
-      const restoreResult = await this.check<Record<string, unknown>>({
-        scenario: "storage-restore-drill",
-        category: "restore",
-        action: "restore authenticated backup over isolated deployment",
-        target: this.config.targetHost,
-        expected: "all pre-backup canaries return, PostgreSQL promotes to a fresh failure-free archive timeline, the exact VERIFIED epoch is reconstructed, and one-time recovery state is cleared",
-      }, async () => {
-        const value = await probe.runJson<Record<string, unknown>>(
-          "restore-drill",
-          [
-            fixtureRun,
-            `${fixtureRun}:DESTRUCTIVE-RESTORE`,
-            this.config.restoreArchiveDirectory ?? "missing",
-            this.config.restoreWalArchiveDirectory ?? "missing",
-            this.config.restoreBackupDirectory ?? "missing",
-          ],
-        );
-        const passed = [
-          "databaseRestored", "applicationStateRestored", "archiveRestored", "walRestored",
-          "credentialsRestored", "servicesHealthy", "archiveVerified", "freshTimeline",
-          "timelineHistoryArchived", "newTimelineWalArchived", "priorWalPreserved",
-          "postBackupWalPreserved",
-          "archiverFailureFree", "recoverySettingsCleared", "verifiedEpochRestored",
-          "allCanariesRestored", "authenticatedBackupReverified", "preRestoreSafetyCopyVerified",
-        ].every(field => value[field] === true) &&
-          typeof value.backupId === "string" &&
-          /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/.test(value.backupId) &&
-          typeof value.preRestoreSafetyDirectory === "string";
-        return {passed, ...(passed ? {value} : {}), observed: JSON.stringify(value)};
-      });
+      const restoreDisruptionPhase = "storage-restore-drill-disruption";
+      this.reporter.expectRemoteMetricDisruptionPhase(restoreDisruptionPhase);
+      this.metrics.setPhase(restoreDisruptionPhase);
+      let restoreResult: Record<string, unknown> | undefined;
+      try {
+        restoreResult = await this.check<Record<string, unknown>>({
+          scenario: "storage-restore-drill",
+          category: "restore",
+          action: "restore authenticated backup over isolated deployment",
+          target: this.config.targetHost,
+          expected: "all pre-backup canaries return, PostgreSQL promotes to a fresh failure-free archive timeline, the exact VERIFIED epoch is reconstructed, and one-time recovery state is cleared",
+        }, async () => {
+          const value = await probe.runJson<Record<string, unknown>>(
+            "restore-drill",
+            [
+              fixtureRun,
+              `${fixtureRun}:DESTRUCTIVE-RESTORE`,
+              this.config.restoreArchiveDirectory ?? "missing",
+              this.config.restoreWalArchiveDirectory ?? "missing",
+              this.config.restoreBackupDirectory ?? "missing",
+            ],
+          );
+          const passed = [
+            "databaseRestored", "applicationStateRestored", "archiveRestored", "walRestored",
+            "credentialsRestored", "servicesHealthy", "archiveVerified", "freshTimeline",
+            "timelineHistoryArchived", "newTimelineWalArchived", "priorWalPreserved",
+            "postBackupWalPreserved",
+            "archiverFailureFree", "recoverySettingsCleared", "verifiedEpochRestored",
+            "allCanariesRestored", "authenticatedBackupReverified", "preRestoreSafetyCopyVerified",
+          ].every(field => value[field] === true) &&
+            typeof value.backupId === "string" &&
+            /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/.test(value.backupId) &&
+            typeof value.preRestoreSafetyDirectory === "string";
+          return {passed, ...(passed ? {value} : {}), observed: JSON.stringify(value)};
+        });
+      } finally {
+        this.metrics.setPhase("storage-restore-drill-post");
+      }
 
       const after = assessStoragePlatform(await probe.runJson("platform"));
       const immutableImageIdentityPreserved = await this.check<boolean>({

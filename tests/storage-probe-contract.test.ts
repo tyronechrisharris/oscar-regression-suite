@@ -675,6 +675,89 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
   assert.match(block, /archive_restored=false; \[\[ -d \$archive_canary && ! -L \$archive_canary \]\]/);
   assert.doesNotMatch(block, /archive_dir\/[.]restore-regression-/,
     "archive restore canaries must stay inside the production-approved datasets layout");
+  assert.match(block,
+    /secret_canary="\$release_dir\/secrets\/oscar-admin-password[.]txt"/);
+  assert.match(block, /tls_canary="\$release_dir\/tls\/server[.]crt"/);
+  assert.doesNotMatch(block, /secrets\/[.]restore-regression-/,
+    "restore must not add a file outside the production deployment-secrets allowlist");
+  assert.doesNotMatch(block, /tls\/[.]restore-regression-/,
+    "restore must not add a file outside the production deployment-secrets allowlist");
+  for (const required of [
+    'secret_original=$restore_work/oscar-admin-password.original',
+    'tls_original=$restore_work/server.crt.original',
+    'cp --preserve=mode,ownership,timestamps -- "$secret_canary" "$secret_original"',
+    'cp --preserve=mode,ownership,timestamps -- "$tls_canary" "$tls_original"',
+    'cmp -s -- "$secret_original" "$secret_canary"',
+    'cmp -s -- "$tls_original" "$tls_canary"',
+    '$(stat -c \'%u:%g:%a\' -- "$secret_canary") == "$secret_original_metadata"',
+    '$(stat -c \'%u:%g:%a\' -- "$tls_canary") == "$tls_original_metadata"',
+    '$(cat -- "$safety/secrets/oscar-admin-password.txt") == "$mutated"',
+    '$(cat -- "$safety/tls/server.crt") == "$mutated"',
+    'secret_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-admin-password"',
+    'tls_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-server-cert"',
+    '-name \'.oscar-regression-restore-stage-*\' -print -quit',
+    'A stale root-level restore staging entry exists',
+    'install -o 0 -g 0 -m 0600 -- "$source" "$temporary"',
+    'mv -fT -- "$temporary" "$target"',
+    'credential_files_replaced=true',
+    'if $credential_files_replaced; then',
+    'compose up --detach --force-recreate --no-deps --no-build --pull never',
+    '--wait --wait-timeout 240 oscar gateway',
+    'credential-recovery-force-recreate.log',
+    'elif ! oscar_services_healthy; then',
+    'sudo bash oscar.sh restart >"$credential_restart_log" 2>&1',
+    'oscar_services_healthy || credential_recovery_failed=true',
+    '"$restore_work/credential-recovery-restart.log"',
+    'failure_bundle="/var/tmp/oscar-regression-restore-failure-$run"',
+    'mkdir -m 0700 -- "$failure_bundle"',
+    'Restore-drill failure diagnostics retained at %s',
+    'Restore-drill credential recovery failed; private originals retained at %s',
+    'SELECT count(*) FROM oscar_regression_fixture WHERE run_id=\'$run\';',
+    'test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"',
+    '[[ ! -e $archive_canary && ! -L $archive_canary ]] || cleanup_failed=true',
+    '[[ $marker_status == 1 ]] || cleanup_failed=true',
+    '[[ -e $restore_work || -L $restore_work ]]',
+    'restore_drill_verified=false',
+    'elif ((original_status != 0)) || ! $restore_drill_verified || $cleanup_failed; then',
+  ]) assert.ok(block.includes(required), `missing allowlist-safe credential proof: ${required}`);
+  assert.doesNotMatch(block, /temporary="\$target/,
+    "credential recovery staging must not live inside secrets or tls");
+  assert.match(block,
+    /if \[\[ -f \$target && ! -L \$target \]\] &&[\s\S]*cmp -s -- "\$source" "\$target"[\s\S]*return 0/,
+    "already exact credentials must avoid host replacement and unnecessary restart");
+  const cleanupTrap = block.indexOf("trap cleanup_restore_drill EXIT");
+  const firstPrivateCopy = block.indexOf(
+    'cp --preserve=mode,ownership,timestamps -- "$secret_canary" "$secret_original"',
+  );
+  const firstPrivateHash = block.indexOf('secret_original_sha=$(sha256_file "$secret_original")');
+  assert.ok(cleanupTrap > 0 && cleanupTrap < firstPrivateCopy && cleanupTrap < firstPrivateHash,
+    "EXIT recovery must be installed before private credential snapshots and hashes");
+  const removePrivateOriginals = block.indexOf('rm -f -- "$secret_original" "$tls_original"');
+  const preserveDiagnostics = block.indexOf("preserve_restore_diagnostics");
+  assert.ok(removePrivateOriginals > 0 && preserveDiagnostics > 0 &&
+    removePrivateOriginals < block.lastIndexOf("preserve_restore_diagnostics"),
+  "private originals must be removed before failure diagnostics are published");
+  const restoreCredential = block.indexOf(
+    'restore_private_original "$secret_original" "$secret_canary" "$secret_restore_stage"',
+  );
+  const supportedRecovery = block.indexOf(
+    "compose up --detach --force-recreate --no-deps --no-build --pull never", restoreCredential,
+  );
+  const fixtureDelete = block.indexOf(
+    'DELETE FROM oscar_regression_fixture WHERE run_id=\'$run\';', supportedRecovery,
+  );
+  assert.ok(restoreCredential > 0 && supportedRecovery > restoreCredential && fixtureDelete > supportedRecovery,
+    "credential recovery and force recreation must precede database/application canary cleanup");
+  const verifiedAssignment = block.indexOf("restore_drill_verified=$all_restored");
+  const resultJson = block.indexOf('printf \'{"backupId"', verifiedAssignment);
+  const explicitCleanup = block.lastIndexOf("cleanup_restore_drill");
+  assert.ok(verifiedAssignment > 0 && resultJson > verifiedAssignment && explicitCleanup > resultJson,
+    "restore acceptance must bind all_restored before JSON and explicit cleanup");
+  const backupCreated = block.indexOf("backup_output=$(sudo bash oscar.sh backup)");
+  const secretMutated = block.indexOf("printf '%s\\n' \"$mutated\" >\"$secret_canary\"");
+  const tlsMutated = block.indexOf("printf '%s\\n' \"$mutated\" >\"$tls_canary\"");
+  assert.ok(backupCreated > 0 && secretMutated > backupCreated && tlsMutated > backupCreated,
+    "approved credential files may be mutated only after the backup captures their originals");
   const archiveCanaryRelative =
     "datasets/observations/date=2026-10-18/profile=restore_2026_10_18t17_43_32_227z_nimo_mme3l";
   assert.match(archiveCanaryRelative,
@@ -858,13 +941,18 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
   assert.match(block, /lane\.bytes >= directJournalAfterAppend!\.bytes/);
 });
 
-test("restore drill re-runs the exact schema/checksum release identity gate", () => {
+test("restore drill re-runs release identity and scopes metrics disruption to the supported restore", () => {
   const start = scenarios.indexOf("private async storageRestoreDrill");
   const end = scenarios.indexOf("private async extendedOccupancy", start);
   const block = scenarios.slice(start, end);
   assert.equal(block.match(/storagePlatformHasExactReleaseIdentity/g)?.length, 2);
   assert.match(block, /const before = assessStoragePlatform/);
   assert.match(block, /const after = assessStoragePlatform/);
+  assert.match(block, /expectRemoteMetricDisruptionPhase\(restoreDisruptionPhase\)/);
+  const disruption = block.indexOf('this.metrics.setPhase(restoreDisruptionPhase)');
+  const restore = block.indexOf('"restore-drill"', disruption);
+  const steady = block.indexOf('this.metrics.setPhase("storage-restore-drill-post")', restore);
+  assert.ok(disruption > 0 && restore > disruption && steady > restore);
 });
 
 test("retained-media gallery measures concurrency and proves selected content loaded", () => {

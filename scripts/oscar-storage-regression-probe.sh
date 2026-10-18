@@ -2655,40 +2655,253 @@ case $action in
     archive_canary_profile="restore_$run"
     archive_canary_parent="$archive_dir/datasets/observations/date=$archive_canary_day"
     archive_canary="$archive_canary_parent/profile=$archive_canary_profile"
-    secret_canary="$release_dir/secrets/.restore-regression-$run.canary"
-    tls_canary="$release_dir/tls/.restore-regression-$run.canary"
+    secret_canary="$release_dir/secrets/oscar-admin-password.txt"
+    tls_canary="$release_dir/tls/server.crt"
     env_canary="# OSCAR_RESTORE_DRILL_CANARY=$marker"
     env_mutated="# OSCAR_RESTORE_DRILL_CANARY=$mutated"
+    umask 077
+    secret_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-admin-password"
+    tls_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-server-cert"
+    failure_bundle="/var/tmp/oscar-regression-restore-failure-$run"
+    if ! stale_restore_stage=$(find "$release_dir" -mindepth 1 -maxdepth 1 \
+        -name '.oscar-regression-restore-stage-*' -print -quit); then
+      fail 'Could not inspect the release root for stale restore staging entries.'
+    fi
+    [[ -z $stale_restore_stage ]] ||
+      fail 'A stale root-level restore staging entry exists; recover it before another drill.'
+    [[ ! -e $secret_restore_stage && ! -L $secret_restore_stage &&
+       ! -e $tls_restore_stage && ! -L $tls_restore_stage ]] ||
+      fail 'A root-level restore staging path already exists; investigate a prior interrupted run.'
+    [[ ! -e $failure_bundle && ! -L $failure_bundle ]] ||
+      fail 'A restore-drill failure bundle already exists for this run ID.'
     restore_work=$(mktemp -d "/tmp/oscar-regression-restore-$run.XXXXXXXX")
     wal_baseline=$restore_work/source-wal.sha256
+    secret_original=$restore_work/oscar-admin-password.original
+    tls_original=$restore_work/server.crt.original
+    private_originals_ready=false
+    credentials_mutated=false
+    credential_files_replaced=false
+    restore_drill_verified=false
+
+    restore_private_original() {
+      local source=$1 target=$2 temporary=$3 source_sha source_metadata
+      [[ -f $source && ! -L $source && -d ${target%/*} && ! -L ${target%/*} &&
+         ${temporary%/*} == "$release_dir" ]] || return 1
+      [[ ! -e $temporary && ! -L $temporary ]] || return 1
+      source_sha=$(sha256_file "$source")
+      source_metadata=$(stat -c '%u:%g:%a' -- "$source")
+      [[ $source_sha =~ ^[0-9a-f]{64}$ && $source_metadata =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ ]] ||
+        return 1
+      if [[ -f $target && ! -L $target ]] &&
+         cmp -s -- "$source" "$target" &&
+         [[ $(sha256_file "$target") == "$source_sha" &&
+            $(stat -c '%u:%g:%a' -- "$target") == "$source_metadata" ]]; then
+        return 0
+      fi
+      if ! install -o 0 -g 0 -m 0600 -- "$source" "$temporary" ||
+         [[ ! -f $temporary || -L $temporary ]] ||
+         ! cmp -s -- "$source" "$temporary" ||
+         [[ $(sha256_file "$temporary") != "$source_sha" ]] ||
+         [[ $(stat -c '%u:%g:%a' -- "$temporary") != 0:0:600 ]] ||
+         ! mv -fT -- "$temporary" "$target" ||
+         ! chown --reference="$source" -- "$target" ||
+         ! chmod --reference="$source" -- "$target" ||
+         [[ ! -f $target || -L $target ]] ||
+         ! cmp -s -- "$source" "$target" ||
+         [[ $(sha256_file "$target") != "$source_sha" ]] ||
+         [[ $(stat -c '%u:%g:%a' -- "$target") != "$source_metadata" ]]; then
+        rm -f -- "$temporary"
+        return 1
+      fi
+      credential_files_replaced=true
+      return 0
+    }
+
+    oscar_services_healthy() {
+      local service container state health
+      for service in gateway oscar postgres; do
+        container=$(compose ps -q "$service" 2>/dev/null) || return 1
+        [[ $container =~ ^[0-9a-f]{64}$ ]] || return 1
+        state=$(docker inspect "$container" --format '{{.State.Status}}' 2>/dev/null) || return 1
+        health=$(docker inspect "$container" \
+          --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null) ||
+          return 1
+        [[ $state == running && $health == healthy ]] || return 1
+      done
+      return 0
+    }
+
+    preserve_restore_diagnostics() {
+      local source destination name
+      [[ ! -e $failure_bundle && ! -L $failure_bundle ]] || return 1
+      mkdir -m 0700 -- "$failure_bundle" || return 1
+      chown 0:0 -- "$failure_bundle" && chmod 0700 -- "$failure_bundle" || return 1
+      for source in "$wal_baseline" "$restore_work/backup-verify.log" \
+                    "$restore_work/pre-restore-expected.tsv" "$restore_work/restore.log" \
+                    "$restore_work/archive-verify.log" "$restore_work/pre-restore-actual.tsv" \
+                    "$restore_work/credential-recovery-force-recreate.log" \
+                    "$restore_work/credential-recovery-restart.log"; do
+        [[ -f $source && ! -L $source ]] || continue
+        name=${source##*/}
+        destination=$failure_bundle/$name
+        case $name in
+          *.log) tail -c 1048576 -- "$source" >"$destination" || return 1 ;;
+          *) head -c 4194304 -- "$source" >"$destination" || return 1 ;;
+        esac
+        chown 0:0 -- "$destination" && chmod 0600 -- "$destination" || return 1
+      done
+      printf 'run=%s\nbackup=%s\nrelease=%s\n' \
+        "$run" "${backup:-unavailable}" "$release_dir" >"$failure_bundle/summary.txt" || return 1
+      chown 0:0 -- "$failure_bundle/summary.txt" &&
+        chmod 0600 -- "$failure_bundle/summary.txt" || return 1
+      [[ $(stat -c '%u:%g:%a' -- "$failure_bundle") == 0:0:700 ]] || return 1
+      return 0
+    }
+
+    cleanup_restore_drill() {
+      local original_status=$? had_errexit=false credential_recovery_failed=false
+      local cleanup_failed=false diagnostics_failed=false fixture_remaining marker_status
+      local credential_restart_log
+      [[ $- == *e* ]] && had_errexit=true
+      trap - EXIT
+      set +e
+      if $credentials_mutated; then
+        if ! $private_originals_ready; then
+          credential_recovery_failed=true
+        else
+          restore_private_original "$secret_original" "$secret_canary" "$secret_restore_stage" ||
+            credential_recovery_failed=true
+          restore_private_original "$tls_original" "$tls_canary" "$tls_restore_stage" ||
+            credential_recovery_failed=true
+        fi
+      fi
+      rm -f -- "$secret_restore_stage" "$tls_restore_stage" 2>/dev/null
+      if [[ -e $secret_restore_stage || -L $secret_restore_stage ||
+            -e $tls_restore_stage || -L $tls_restore_stage ]]; then
+        credential_recovery_failed=true
+      fi
+      if $credentials_mutated && ! $credential_recovery_failed; then
+        if $credential_files_replaced; then
+          credential_restart_log=$restore_work/credential-recovery-force-recreate.log
+          if ! compose up --detach --force-recreate --no-deps --no-build --pull never \
+              --wait --wait-timeout 240 oscar gateway >"$credential_restart_log" 2>&1; then
+            emit_command_diagnostics 'OSCAR credential-recovery force recreation' \
+              "$credential_restart_log"
+            credential_recovery_failed=true
+          fi
+        elif ! oscar_services_healthy; then
+          credential_restart_log=$restore_work/credential-recovery-restart.log
+          if ! sudo bash oscar.sh restart >"$credential_restart_log" 2>&1; then
+            emit_command_diagnostics 'OSCAR credential-recovery restart' "$credential_restart_log"
+            credential_recovery_failed=true
+          fi
+        fi
+        if ! $credential_recovery_failed; then
+          for _ in {1..30}; do
+            oscar_services_healthy && break
+            sleep 2
+          done
+        fi
+        oscar_services_healthy || credential_recovery_failed=true
+      fi
+      if compose ps --status running --services 2>/dev/null | grep -Fxq postgres; then
+        if ! psql_admin --command "DELETE FROM oscar_regression_fixture WHERE run_id='$run';" \
+            >/dev/null 2>&1 ||
+           ! fixture_remaining=$(scalar \
+             "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';" 2>/dev/null) ||
+           [[ $fixture_remaining != 0 ]]; then
+          cleanup_failed=true
+        fi
+      else
+        cleanup_failed=true
+      fi
+      if compose ps --status running --services 2>/dev/null | grep -Fxq oscar; then
+        if ! compose exec -T oscar sh -eu -c \
+             'rm -f -- "/var/lib/oscar/$1"; test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"; rmdir /var/lib/oscar/files/.restore-regression 2>/dev/null || true' \
+             cleanup "$state_relative" >/dev/null 2>&1; then
+          cleanup_failed=true
+        fi
+      else
+        cleanup_failed=true
+      fi
+      rmdir -- "$archive_canary" 2>/dev/null || true
+      [[ ! -e $archive_canary && ! -L $archive_canary ]] || cleanup_failed=true
+      rmdir -- "$archive_canary_parent" "$archive_dir/datasets/observations" \
+        "$archive_dir/datasets" 2>/dev/null || true
+      if ! sed -i "/^# OSCAR_RESTORE_DRILL_CANARY=$run:/d" .env 2>/dev/null; then
+        cleanup_failed=true
+      else
+        marker_status=0
+        grep -Eq "^# OSCAR_RESTORE_DRILL_CANARY=$run:" .env 2>/dev/null || marker_status=$?
+        [[ $marker_status == 1 ]] || cleanup_failed=true
+      fi
+      if ! $credential_recovery_failed; then
+        rm -f -- "$secret_original" "$tls_original" 2>/dev/null
+        if [[ -e $secret_original || -L $secret_original ||
+              -e $tls_original || -L $tls_original ]]; then
+          credential_recovery_failed=true
+        fi
+      fi
+      if $credential_recovery_failed; then
+        chown -R 0:0 -- "$restore_work" 2>/dev/null || true
+        chmod 0700 -- "$restore_work" 2>/dev/null || true
+        printf 'Restore-drill credential recovery failed; private originals retained at %s\n' \
+          "$restore_work" >&2
+      elif ((original_status != 0)) || ! $restore_drill_verified || $cleanup_failed; then
+        if preserve_restore_diagnostics; then
+          rm -rf -- "$restore_work"
+          if [[ -e $restore_work || -L $restore_work ]]; then
+            diagnostics_failed=true
+            printf 'Restore-drill workspace deletion failed after preserving diagnostics: %s\n' \
+              "$restore_work" >&2
+          else
+            printf 'Restore-drill failure diagnostics retained at %s\n' "$failure_bundle" >&2
+          fi
+        else
+          diagnostics_failed=true
+          chown -R 0:0 -- "$restore_work" 2>/dev/null || true
+          chmod 0700 -- "$restore_work" 2>/dev/null || true
+          printf 'Restore-drill diagnostics preservation failed; bounded source workspace retained at %s\n' \
+            "$restore_work" >&2
+        fi
+      else
+        rm -rf -- "$restore_work"
+        if [[ -e $restore_work || -L $restore_work ]]; then
+          cleanup_failed=true
+          printf 'Restore-drill workspace cleanup failed: %s\n' "$restore_work" >&2
+        fi
+      fi
+      $had_errexit && set -e
+      if ((original_status != 0)); then return "$original_status"; fi
+      if $credential_recovery_failed || $cleanup_failed || $diagnostics_failed; then return 1; fi
+      return 0
+    }
+
+    trap cleanup_restore_drill EXIT
+    chmod 0700 -- "$restore_work"
     : >"$wal_baseline"
+    [[ -f $secret_canary && ! -L $secret_canary && -s $secret_canary &&
+       -f $tls_canary && ! -L $tls_canary && -s $tls_canary ]] ||
+      fail 'Restore drill requires the existing approved admin-password and server-certificate files.'
+    cp --preserve=mode,ownership,timestamps -- "$secret_canary" "$secret_original"
+    cp --preserve=mode,ownership,timestamps -- "$tls_canary" "$tls_original"
+    secret_original_sha=$(sha256_file "$secret_original")
+    tls_original_sha=$(sha256_file "$tls_original")
+    secret_original_metadata=$(stat -c '%u:%g:%a' -- "$secret_canary")
+    tls_original_metadata=$(stat -c '%u:%g:%a' -- "$tls_canary")
+    [[ $secret_original_sha =~ ^[0-9a-f]{64}$ && $tls_original_sha =~ ^[0-9a-f]{64}$ &&
+       $secret_original_metadata =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+       $tls_original_metadata =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ ]] ||
+      fail 'Restore drill could not snapshot the approved credential canaries.'
+    private_originals_ready=true
     compose exec -T oscar sh -eu -c 'test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"' \
       canary "$state_relative" || fail 'An application-state restore-drill canary already exists.'
-    [[ ! -e $archive_canary && ! -L $archive_canary && ! -e $secret_canary &&
-          ! -L $secret_canary && ! -e $tls_canary && ! -L $tls_canary ]] ||
+    [[ ! -e $archive_canary && ! -L $archive_canary ]] ||
       fail 'A restore-drill canary already exists; investigate a prior interrupted run.'
     [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';") == 0 ]] ||
       fail 'Restore-drill run ID already exists in the fixture registry.'
     grep -Fq 'OSCAR_RESTORE_DRILL_CANARY=' .env &&
       fail 'The deployment .env contains an unresolved restore-drill canary.'
-
-    cleanup_restore_drill() {
-      set +e
-      if compose ps --status running --services 2>/dev/null | grep -Fxq postgres; then
-        psql_admin --command "DELETE FROM oscar_regression_fixture WHERE run_id='$run';" >/dev/null 2>&1
-      fi
-      if compose ps --status running --services 2>/dev/null | grep -Fxq oscar; then
-        compose exec -T oscar sh -c "rm -f -- '/var/lib/oscar/$state_relative'; rmdir /var/lib/oscar/files/.restore-regression 2>/dev/null || true" >/dev/null 2>&1
-      fi
-      rmdir -- "$archive_canary" "$archive_canary_parent" \
-        "$archive_dir/datasets/observations" "$archive_dir/datasets" 2>/dev/null || true
-      rm -f -- "$secret_canary" "$tls_canary"
-      rm -rf -- "$restore_work"
-      sed -i "/^# OSCAR_RESTORE_DRILL_CANARY=$run:/d" .env 2>/dev/null
-      set -e
-    }
-    trap cleanup_restore_drill EXIT
-    umask 077
     # A registered database row plus canaries in each replaceable storage plane
     # prove that restore replaces, rather than merely restarts, PostgreSQL,
     # application state, archive, and deployment credentials. WAL is append-only;
@@ -2702,8 +2915,6 @@ case $action in
       UPDATE oscar_regression_fixture SET restore_marker='$marker' WHERE run_id='$run';" >/dev/null
     compose exec -T oscar sh -eu -c 'mkdir -p /var/lib/oscar/files/.restore-regression; printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$marker"
     install -d -o 10001 -g 10001 -m 0750 -- "$archive_canary"
-    printf '%s\n' "$marker" >"$secret_canary"
-    printf '%s\n' "$marker" >"$tls_canary"
     printf '%s\n' "$env_canary" >>.env
 
     # Force and retain at least one source-timeline WAL object, then fingerprint every
@@ -2770,6 +2981,9 @@ case $action in
     future_segment_sha=$(sha256_file "$wal_dir/$future_segment")
     compose exec -T oscar sh -eu -c 'printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$mutated"
     rmdir -- "$archive_canary" || fail 'Could not remove the empty post-backup archive directory canary.'
+    [[ -f $secret_canary && ! -L $secret_canary && -f $tls_canary && ! -L $tls_canary ]] ||
+      fail 'Approved credential canaries became unsafe before post-backup mutation.'
+    credentials_mutated=true
     printf '%s\n' "$mutated" >"$secret_canary"
     printf '%s\n' "$mutated" >"$tls_canary"
     sed -i "s|^# OSCAR_RESTORE_DRILL_CANARY=$marker$|$env_mutated|" .env
@@ -2789,9 +3003,14 @@ case $action in
     [[ $(compose exec -T oscar sh -c "cat -- '/var/lib/oscar/$state_relative'" 2>/dev/null || true) == "$marker" ]] && state_restored=true
     archive_restored=false; [[ -d $archive_canary && ! -L $archive_canary ]] && archive_restored=true
     credentials_restored=false
-    if [[ $(cat -- "$secret_canary" 2>/dev/null || true) == "$marker" &&
-          $(cat -- "$tls_canary" 2>/dev/null || true) == "$marker" &&
-          $(grep -Fxc "$env_canary" .env) == 1 ]]; then credentials_restored=true; fi
+    if [[ -f $secret_canary && ! -L $secret_canary && -f $tls_canary && ! -L $tls_canary &&
+          $(sha256_file "$secret_canary") == "$secret_original_sha" &&
+          $(sha256_file "$tls_canary") == "$tls_original_sha" &&
+          $(stat -c '%u:%g:%a' -- "$secret_canary") == "$secret_original_metadata" &&
+          $(stat -c '%u:%g:%a' -- "$tls_canary") == "$tls_original_metadata" ]] &&
+       cmp -s -- "$secret_original" "$secret_canary" &&
+       cmp -s -- "$tls_original" "$tls_canary" &&
+       [[ $(grep -Fxc "$env_canary" .env) == 1 ]]; then credentials_restored=true; fi
     services_healthy=true
     for service in gateway oscar postgres; do
       container=$(compose ps -q "$service")
@@ -2902,8 +3121,8 @@ case $action in
     pre_restore_safety_copy_verified=false
     if credential_tree_inventory "$safety" "$actual_safety_inventory" &&
        cmp -s "$expected_safety_inventory" "$actual_safety_inventory" &&
-       [[ $(cat -- "$safety/secrets/.restore-regression-$run.canary") == "$mutated" &&
-          $(cat -- "$safety/tls/.restore-regression-$run.canary") == "$mutated" &&
+       [[ $(cat -- "$safety/secrets/oscar-admin-password.txt") == "$mutated" &&
+          $(cat -- "$safety/tls/server.crt") == "$mutated" &&
           $(grep -Fxc "$env_mutated" "$safety/.env") == 1 ]]; then
       pre_restore_safety_copy_verified=true
     fi
@@ -2914,6 +3133,7 @@ case $action in
        $post_backup_wal_preserved &&
        $archiver_failure_free && $recovery_settings_cleared && $verified_epoch_restored &&
        $pre_restore_safety_copy_verified; then all_restored=true; fi
+    restore_drill_verified=$all_restored
     printf '{"backupId":"%s","authenticatedBackupReverified":%s,"databaseRestored":%s,"applicationStateRestored":%s,"archiveRestored":%s,"walRestored":%s,"credentialsRestored":%s,"servicesHealthy":%s,"archiveVerified":%s,"freshTimeline":%s,"sourceTimeline":%s,"restoredTimeline":%s,"timelineHistoryArchived":%s,"newTimelineWalArchived":%s,"priorWalPreserved":%s,"postBackupWalPreserved":%s,"archiverFailureFree":%s,"recoverySettingsCleared":%s,"verifiedEpochRestored":%s,"allCanariesRestored":%s,"preRestoreSafetyCopyVerified":%s,"preRestoreSafetyDirectory":"%s"}\n' \
       "$backup" "$authenticated_backup_reverified" "$database_restored" "$state_restored" "$archive_restored" "$wal_restored" \
       "$credentials_restored" "$services_healthy" "$archive_verified" "$fresh_timeline" \

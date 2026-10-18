@@ -93,6 +93,7 @@ export class RunReporter {
   private readonly secrets: string[];
   private readonly metadata: RunMetadata;
   private readonly requiredRemoteMetricPhases = new Set<string>();
+  private readonly expectedRemoteMetricDisruptionPhases = new Set<string>();
   private remoteMetricTarget: string | undefined;
 
   constructor(
@@ -117,6 +118,17 @@ export class RunReporter {
   requireRemoteMetricPhase(phase: string): void {
     const normalized = oneLine(phase);
     if (normalized) this.requiredRemoteMetricPhases.add(normalized);
+  }
+
+  expectRemoteMetricDisruptionPhase(phase: string): void {
+    const normalized = oneLine(phase);
+    if (this.metadata.profile !== "restore-drill" ||
+        normalized !== "storage-restore-drill-disruption") {
+      throw new Error(
+        "Remote metric disruption exemptions are restricted to the exact restore-drill disruption phase",
+      );
+    }
+    this.expectedRemoteMetricDisruptionPhases.add(normalized);
   }
 
   setRemoteMetricTarget(target: string): void {
@@ -244,14 +256,20 @@ export class RunReporter {
       item.source === "oscar-container" && item.composeService !== null &&
       OSCAR_COMPOSE_SERVICES.includes(item.composeService));
     const requiredPhases = [...this.requiredRemoteMetricPhases];
+    const disruptionPhases = this.expectedRemoteMetricDisruptionPhases;
+    const steadyRequiredPhases = requiredPhases.filter((phase) => !disruptionPhases.has(phase));
+    const steadyContainers = containers.filter((item) => !disruptionPhases.has(item.phase));
     const remoteTarget = this.remoteMetricTarget
       ?? this.metrics.find((item) => item.source === "oscar-host")?.target
       ?? "configured OSCAR_SSH_TARGET";
     const missingCoverage: string[] = [];
-    if (!requiredPhases.length) missingCoverage.push("no required phases were registered");
-    for (const phase of requiredPhases) {
+    if (!steadyRequiredPhases.length) missingCoverage.push("no steady-state required phases were registered");
+    if (disruptionPhases.size && steadyRequiredPhases.length < 2) {
+      missingCoverage.push("expected disruption lacks distinct pre/post steady-state phases");
+    }
+    for (const phase of steadyRequiredPhases) {
       for (const service of OSCAR_COMPOSE_SERVICES) {
-        const serviceSamples = containers.filter((item) =>
+        const serviceSamples = steadyContainers.filter((item) =>
           item.phase === phase && item.composeService === service);
         if (!serviceSamples.some((item) => item.containerId !== null) ||
             serviceSamples.some((item) => item.containerId === null)) {
@@ -261,14 +279,42 @@ export class RunReporter {
     }
     this.outcome(
       "performance", "performance", "capture exact OSCAR Compose service metrics", remoteTarget,
-      "gateway, oscar, and postgres identities are sampled in every required phase",
+      "gateway, oscar, and postgres identities are sampled in every steady-state required phase",
       missingCoverage.length
         ? `missing phase/service coverage: ${missingCoverage.join(", ")}`
-        : `${requiredPhases.length * OSCAR_COMPOSE_SERVICES.length} required phase/service pairs covered`,
+        : `${steadyRequiredPhases.length * OSCAR_COMPOSE_SERVICES.length} steady-state phase/service pairs covered`,
       missingCoverage.length ? "incorrect" : "correct", 0,
     );
 
-    const incomplete = containers.filter((item) => {
+    if (disruptionPhases.size) {
+      const unregistered = [...disruptionPhases].filter((phase) => !this.requiredRemoteMetricPhases.has(phase));
+      const disruptionSamples = containers.filter((item) => disruptionPhases.has(item.phase));
+      const missingHostCoverage = [...disruptionPhases].filter((phase) =>
+        !this.metrics.some((item) => item.source === "oscar-host" && item.phase === phase &&
+          item.load1m !== null && item.hostMemoryAvailableBytes !== null &&
+          item.memoryLimitBytes !== null));
+      const missingDisruptionCoverage = [...disruptionPhases].flatMap((phase) =>
+        OSCAR_COMPOSE_SERVICES.filter((service) => !disruptionSamples.some((item) =>
+          item.phase === phase && item.composeService === service)).map((service) => `${phase}/${service}`));
+      this.outcome(
+        "performance", "performance", "retain exact expected restore-disruption metrics", remoteTarget,
+        "only explicitly registered restore-disruption phases are exempted from steady-state checks while every raw sample remains reported",
+        unregistered.length
+          ? `unregistered disruption phases: ${unregistered.join(", ")}`
+          : missingHostCoverage.length
+            ? `missing successful OSCAR host samples: ${missingHostCoverage.join(", ")}`
+          : missingDisruptionCoverage.length
+            ? `missing raw disruption samples: ${missingDisruptionCoverage.join(", ")}`
+          : disruptionSamples.length
+            ? `${disruptionSamples.length} raw samples retained for ${[...disruptionPhases].join(", ")}`
+            : "no raw samples were captured for the expected disruption phase",
+        unregistered.length || missingHostCoverage.length || missingDisruptionCoverage.length ||
+          !disruptionSamples.length
+          ? "incorrect" : "correct", 0,
+      );
+    }
+
+    const incomplete = steadyContainers.filter((item) => {
       const identityMissing = item.containerId === null || item.containerState === null ||
         item.containerHealth === null || item.restartCount === null || item.oomKilled === null;
       const runningStatsMissing = item.containerState === "running" && (
@@ -280,18 +326,22 @@ export class RunReporter {
     });
     this.outcome(
       "performance", "performance", "validate OSCAR container metric samples", remoteTarget,
-      "every observed service has complete identity, state, health, restart, OOM, and running resource data",
+      disruptionPhases.size
+        ? "every steady-state service sample has complete identity, state, health, restart, OOM, and running resource data"
+        : "every observed service has complete identity, state, health, restart, OOM, and running resource data",
       incomplete.length
         ? `incomplete samples: ${[...new Set(incomplete.map(containerSampleLabel))].join(", ")}`
         : "all required container samples are complete",
       incomplete.length ? "incorrect" : "correct", 0,
     );
 
-    const stopped = containers.filter((item) =>
+    const stopped = steadyContainers.filter((item) =>
       item.containerId !== null && item.containerState !== null && item.containerState !== "running");
     this.outcome(
       "performance", "performance", "detect stopped OSCAR containers", remoteTarget,
-      "gateway, oscar, and postgres remain running in every sample",
+      disruptionPhases.size
+        ? "gateway, oscar, and postgres remain running in every steady-state sample"
+        : "gateway, oscar, and postgres remain running in every sample",
       stopped.length
         ? `non-running: ${[...new Set(stopped.map((item) =>
           `${containerSampleLabel(item)}=${item.containerState}`))].join(", ")}`
@@ -299,11 +349,13 @@ export class RunReporter {
       stopped.length ? "incorrect" : "correct", 0,
     );
 
-    const unhealthy = containers.filter((item) =>
+    const unhealthy = steadyContainers.filter((item) =>
       item.containerId !== null && item.containerHealth !== null && item.containerHealth !== "healthy");
     this.outcome(
       "performance", "performance", "detect unhealthy OSCAR containers", remoteTarget,
-      "gateway, oscar, and postgres remain healthy in every sample",
+      disruptionPhases.size
+        ? "gateway, oscar, and postgres remain healthy in every steady-state sample"
+        : "gateway, oscar, and postgres remain healthy in every sample",
       unhealthy.length
         ? `not healthy: ${[...new Set(unhealthy.map((item) =>
           `${containerSampleLabel(item)}=${item.containerHealth}`))].join(", ")}`
@@ -341,13 +393,26 @@ export class RunReporter {
 
     const identityIssues: string[] = [];
     for (const service of OSCAR_COMPOSE_SERVICES) {
-      const serviceSamples = containers.filter((item) => item.composeService === service);
-      const identities = [...new Set(serviceSamples.flatMap((item) =>
-        item.containerId ? [item.containerId] : []))];
-      if (identities.length > 1) {
-        identityIssues.push(`${service} used multiple container IDs (${identities.map((id) => id.slice(0, 12)).join(", ")})`);
+      const serviceSamples = steadyContainers.filter((item) => item.composeService === service);
+      if (disruptionPhases.size) {
+        for (const phase of steadyRequiredPhases) {
+          const identities = [...new Set(serviceSamples
+            .filter((item) => item.phase === phase)
+            .flatMap((item) => item.containerId ? [item.containerId] : []))];
+          if (identities.length > 1) {
+            identityIssues.push(
+              `${service} used multiple container IDs in ${phase} (${identities.map((id) => id.slice(0, 12)).join(", ")})`,
+            );
+          }
+        }
+      } else {
+        const identities = [...new Set(serviceSamples.flatMap((item) =>
+          item.containerId ? [item.containerId] : []))];
+        if (identities.length > 1) {
+          identityIssues.push(`${service} used multiple container IDs (${identities.map((id) => id.slice(0, 12)).join(", ")})`);
+        }
       }
-      const absentPhases = requiredPhases.filter((phase) => {
+      const absentPhases = steadyRequiredPhases.filter((phase) => {
         const phaseSamples = serviceSamples.filter((item) => item.phase === phase);
         return !phaseSamples.some((item) => item.containerId !== null) ||
           phaseSamples.some((item) => item.containerId === null);
@@ -356,7 +421,9 @@ export class RunReporter {
     }
     this.outcome(
       "performance", "performance", "detect service disappearance or recreation", remoteTarget,
-      "each OSCAR Compose service keeps one container identity and is present in every required phase",
+      disruptionPhases.size
+        ? "each OSCAR Compose service keeps one identity within every pre/post steady-state phase and is present in each"
+        : "each OSCAR Compose service keeps one container identity and is present in every required phase",
       identityIssues.length ? identityIssues.join("; ") : "service identities remained present and stable",
       identityIssues.length ? "incorrect" : "correct", 0,
     );

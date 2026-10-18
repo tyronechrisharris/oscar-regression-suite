@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import {execFileSync} from "node:child_process";
 import {createHash} from "node:crypto";
 import {mkdirSync, rmSync, writeFileSync} from "node:fs";
 import {arch, hostname, platform, tmpdir} from "node:os";
@@ -7,6 +6,7 @@ import {join} from "node:path";
 import {BrowserHarness} from "./browser.js";
 import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "./config.js";
 import {RpmEmulatorClient} from "./emulator.js";
+import {suiteGitCommit as resolveSuiteGitCommit} from "./git-state.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {RunReporter} from "./reporter.js";
@@ -14,14 +14,6 @@ import {validateRestoreEvidenceBundle} from "./release-certification.js";
 import {RemoteSuiteLease} from "./remote-suite-lease.js";
 import {RegressionScenarios} from "./scenarios.js";
 import {describeError} from "./util.js";
-
-function gitCommit(): string {
-  try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]}).trim();
-  } catch {
-    return "uncommitted-or-unavailable";
-  }
-}
 
 function acquireFullRunLock(emulatorUrl: string, rpmId: string): {path: string; release: () => void} {
   const identity = createHash("sha256").update(`${emulatorUrl}\n${rpmId}`).digest("hex").slice(0, 16);
@@ -68,7 +60,7 @@ async function main(): Promise<number> {
   const startedAt = new Date();
   const config = loadConfig();
   assertMutationAllowed(config);
-  const suiteGitCommit = gitCommit();
+  const suiteGitCommit = resolveSuiteGitCommit(config.profile);
   const restoreEvidence = config.profile === "3.9.2-release"
     ? validateRestoreEvidenceBundle(config.releaseRestoreEvidenceDirectory ?? "", {
       suiteGitCommit,

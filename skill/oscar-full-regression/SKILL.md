@@ -41,11 +41,18 @@ checks. Preserve its evidence and restore the reserved RPM even when a test fail
 - Treat `restore-drill` as a distinct destructive profile. It is never part of
   smoke/full and requires the exact target/storage acknowledgements plus the
   restore-specific path binding documented in `docs/STORAGE_REGRESSION.md`.
+  Require both `STORAGE_WORKFLOW=required` and
+  `STORAGE_BACKUP_WORKFLOW=required`. Run it and the matching
+  `3.9.2-release` only from the same available, committed, clean canonical
+  40-hex suite HEAD; ignored `.env` and `results/` remain permitted.
   Require the three canonical archive/WAL/backup paths and exact path
   acknowledgement, and run it only on an isolated disposable deployment whose
   PostgreSQL, OSCAR state, archive, WAL, and credentials may all be overwritten.
   Preserve its backup, permission-restricted plaintext safety directory, and
-  failure logs.
+  root-owned bounded failure-diagnostics bundle. If recovery replaces an
+  approved credential leaf, require Compose force recreation to guarantee
+  file-backed secret rebinding and reset gateway in-memory TLS state, followed
+  by 3/3 healthy services.
 - Keep result bundles private; they may contain operational and vehicle data.
 
 Read references/TARGET_CHECKLIST.md before deploying to a new runner or target.
@@ -169,7 +176,8 @@ checksums/pg_stat, and storage/resource metrics.
 as CLI output. Pre-v5 generation holds must migrate to `GENERATION_EXACT`.
 
 Only when the user has explicitly authorized a destructive isolated recovery
-test and all documented acknowledgements are present, run
+test and all documented acknowledgements are present, set both
+`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, then run
 `npm run test:restore-drill` separately. Require pre-backup canaries to return
 across the database, application state, archive, WAL, `.env`, secrets, and TLS;
 require promotion onto a timeline newer than the base backup, byte-identical
@@ -181,6 +189,11 @@ and signals, healthy services, archive verification, and unchanged immutable ima
 IDs. The acknowledged storage planes must resolve exactly and remain distinct and
 non-overlapping. Require the private safety copy to preserve the exact mutated
 `.env`/secrets/TLS names, contents, owners, groups, and modes with no links.
+Keep every raw resource sample. Exempt only the exact
+`storage-restore-drill-disruption` phase from steady-state service checks, and
+only in this profile; require a real target-host sample during it, healthy
+pre/post coverage, immutable image identity, stable restart counts per identity,
+and no OOM in any phase.
 Never reinterpret a smoke/full request as restore authorization.
 
 For final 3.9.2 certification, first preserve a complete unfiltered

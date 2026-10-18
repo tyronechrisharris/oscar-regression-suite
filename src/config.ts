@@ -300,6 +300,9 @@ export function assertMutationAllowed(config: SuiteConfig): void {
     if (config.storageWorkflow !== "required") {
       throw new Error("Restore drill refused: STORAGE_WORKFLOW must be required");
     }
+    if (config.storageBackupWorkflow !== "required") {
+      throw new Error("Restore drill refused: STORAGE_BACKUP_WORKFLOW must be required");
+    }
     if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
       throw new Error("Restore drill refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required");
     }

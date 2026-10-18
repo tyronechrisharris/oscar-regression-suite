@@ -241,6 +241,7 @@ test("restore drill is isolated from ordinary profiles and requires exact target
   const restoreEnvironment = {
     ...baseEnvironment,
     STORAGE_WORKFLOW: "required",
+    STORAGE_BACKUP_WORKFLOW: "required",
     OSCAR_SSH_TARGET: "tester@192.0.2.10",
     OSCAR_RELEASE_DIR: "/opt/oscar-restore-test",
     OSCAR_STORAGE_TARGET_ACK:
@@ -276,6 +277,10 @@ test("restore drill is isolated from ordinary profiles and requires exact target
     assert.throws(
       () => assertMutationAllowed({...config, restoreWalArchiveDirectory: config.restoreArchiveDirectory!}),
       /distinct, non-overlapping planes/,
+    );
+    assert.throws(
+      () => assertMutationAllowed({...config, storageBackupWorkflow: "auto"}),
+      /STORAGE_BACKUP_WORKFLOW must be required/,
     );
   });
 });

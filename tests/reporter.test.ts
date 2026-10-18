@@ -51,6 +51,29 @@ function containerMetric(
   };
 }
 
+function hostMetric(phase: string): MetricInput {
+  return {
+    phase,
+    source: "oscar-host",
+    target: "operator@metrics.test",
+    composeService: null,
+    containerId: null,
+    containerState: null,
+    containerHealth: null,
+    containerStatsAvailable: null,
+    cpuPercent: null,
+    memoryUsedBytes: 100,
+    memoryLimitBytes: 1_000,
+    memoryPercent: 10,
+    pids: null,
+    restartCount: null,
+    oomKilled: null,
+    load1m: 1,
+    hostMemoryAvailableBytes: 900,
+    note: "host aggregate",
+  };
+}
+
 test("reporter aggregates correct and incorrect behavior and redacts secrets", () => {
   const root = mkdtempSync(join(tmpdir(), "oscar-regression-"));
   const reporter = new RunReporter("run-1", root, ["private-value"], {...metadata});
@@ -186,6 +209,13 @@ test("remote metrics pass only with exact healthy service coverage in every requ
 
   const result = reporter.finalize(new Date());
   assert.equal(result.exitCode, 0);
+  const run = JSON.parse(readFileSync(join(result.outputDir, "run.json"), "utf8")) as {
+    status: string;
+    counts: {incorrect: number; skipped: number};
+  };
+  assert.equal(run.status, "PASS");
+  assert.equal(run.counts.incorrect, 0);
+  assert.equal(run.counts.skipped, 0);
   const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
   const performance = readFileSync(join(result.outputDir, "performance.csv"), "utf8");
   assert.match(functional, /capture exact OSCAR Compose service metrics,operator@metrics\.test/);
@@ -194,6 +224,157 @@ test("remote metrics pass only with exact healthy service coverage in every requ
   const containerGroups = reporter.aggregate().filter((item) =>
     item.section === "performance" && item.group.startsWith("oscar-container:"));
   assert.equal(containerGroups.length, 3);
+});
+
+test("restore metrics retain the exact disruption while requiring healthy pre/post phases", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-restore-metrics-"));
+  const reporter = new RunReporter("restore-metrics", root, [], {
+    ...metadata,
+    profile: "restore-drill",
+    remoteMetricsExpected: true,
+  });
+  const disruption = "storage-restore-drill-disruption";
+  for (const phase of ["restore-before", disruption, "restore-after"]) {
+    reporter.requireRemoteMetricPhase(phase);
+  }
+  reporter.expectRemoteMetricDisruptionPhase(disruption);
+  for (const service of ["gateway", "oscar", "postgres"] as const) {
+    reporter.metric(containerMetric("restore-before", service));
+  }
+  reporter.metric(containerMetric(disruption, "gateway", {
+    containerState: "exited", containerHealth: "unhealthy", containerStatsAvailable: false,
+    cpuPercent: null, memoryUsedBytes: null, memoryLimitBytes: null, memoryPercent: null, pids: null,
+  }));
+  reporter.metric(containerMetric(disruption, "oscar", {
+    containerId: null, containerState: null, containerHealth: null, containerStatsAvailable: false,
+    cpuPercent: null, memoryUsedBytes: null, memoryLimitBytes: null, memoryPercent: null, pids: null,
+    restartCount: null, oomKilled: null,
+  }));
+  reporter.metric(containerMetric(disruption, "postgres", {
+    containerId: "d".repeat(64), containerState: "running", containerHealth: "starting",
+  }));
+  reporter.metric(hostMetric(disruption));
+  for (const [index, service] of (["gateway", "oscar", "postgres"] as const).entries()) {
+    reporter.metric(containerMetric("restore-after", service, {
+      containerId: String(index + 1).repeat(64),
+    }));
+  }
+  reporter.outcome("restore", "restore", "exercise supported restore", "fixture",
+    "completes", "completed", "correct", 1);
+
+  const result = reporter.finalize(new Date());
+  assert.equal(result.exitCode, 0);
+  const run = JSON.parse(readFileSync(join(result.outputDir, "run.json"), "utf8")) as {
+    status: string;
+    counts: {incorrect: number; skipped: number};
+  };
+  assert.equal(run.status, "PASS");
+  assert.equal(run.counts.incorrect, 0);
+  assert.equal(run.counts.skipped, 0);
+  const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
+  const performance = readFileSync(join(result.outputDir, "performance.csv"), "utf8");
+  assert.doesNotMatch(functional, /,incorrect,/);
+  assert.match(functional, /retain exact expected restore-disruption metrics/);
+  assert.match(functional, /3 raw samples retained for storage-restore-drill-disruption/);
+  assert.match(performance, /storage-restore-drill-disruption/);
+  assert.match(performance, /exited/);
+  assert.match(performance, /starting/);
+});
+
+test("restore disruption exemption does not hide OOM or a steady-state outage", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-restore-metrics-fail-"));
+  const reporter = new RunReporter("restore-metrics-fail", root, [], {
+    ...metadata,
+    profile: "restore-drill",
+    remoteMetricsExpected: true,
+  });
+  const disruption = "storage-restore-drill-disruption";
+  for (const phase of ["restore-before", disruption, "restore-after"]) {
+    reporter.requireRemoteMetricPhase(phase);
+  }
+  reporter.expectRemoteMetricDisruptionPhase(disruption);
+  for (const service of ["gateway", "oscar", "postgres"] as const) {
+    reporter.metric(containerMetric("restore-before", service));
+    reporter.metric(containerMetric("restore-after", service, service === "postgres" ? {
+      containerState: "exited", containerHealth: "unhealthy", containerStatsAvailable: false,
+      cpuPercent: null, memoryUsedBytes: null, memoryLimitBytes: null, memoryPercent: null, pids: null,
+    } : {}));
+  }
+  reporter.metric(containerMetric(disruption, "gateway", {oomKilled: true}));
+  reporter.metric(containerMetric(disruption, "oscar"));
+  reporter.metric(containerMetric(disruption, "postgres"));
+  reporter.metric(hostMetric(disruption));
+  reporter.outcome("restore", "restore", "exercise supported restore", "fixture",
+    "completes", "completed", "correct", 1);
+
+  const result = reporter.finalize(new Date());
+  assert.equal(result.exitCode, 1);
+  const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
+  assert.match(functional, /OOM-killed: storage-restore-drill-disruption\/gateway/);
+  assert.match(functional, /non-running: restore-after\/postgres/);
+  assert.match(functional, /not healthy: restore-after\/postgres/);
+});
+
+test("restore disruption exemption rejects any profile or phase outside the exact contract", () => {
+  for (const profile of ["smoke", "full"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `oscar-regression-${profile}-disruption-misuse-`));
+    const reporter = new RunReporter(`disruption-${profile}`, root, [], {...metadata, profile});
+    assert.throws(
+      () => reporter.expectRemoteMetricDisruptionPhase("storage-restore-drill-disruption"),
+      /restricted to the exact restore-drill disruption phase/,
+    );
+  }
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-restore-disruption-misuse-"));
+  const reporter = new RunReporter("disruption-wrong-phase", root, [], {
+    ...metadata,
+    profile: "restore-drill",
+  });
+  assert.throws(
+    () => reporter.expectRemoteMetricDisruptionPhase("restore-disruption"),
+    /restricted to the exact restore-drill disruption phase/,
+  );
+});
+
+test("synthetic restore-disruption service rows do not replace a successful host sample", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-restore-synthetic-only-"));
+  const reporter = new RunReporter("restore-synthetic-only", root, [], {
+    ...metadata,
+    profile: "restore-drill",
+    remoteMetricsExpected: true,
+  });
+  const disruption = "storage-restore-drill-disruption";
+  for (const phase of ["restore-before", disruption, "restore-after"]) {
+    reporter.requireRemoteMetricPhase(phase);
+  }
+  reporter.expectRemoteMetricDisruptionPhase(disruption);
+  for (const service of ["gateway", "oscar", "postgres"] as const) {
+    reporter.metric(containerMetric("restore-before", service));
+    reporter.metric(containerMetric(disruption, service, {
+      containerId: null,
+      containerState: null,
+      containerHealth: null,
+      containerStatsAvailable: false,
+      cpuPercent: null,
+      memoryUsedBytes: null,
+      memoryLimitBytes: null,
+      memoryPercent: null,
+      pids: null,
+      restartCount: null,
+      oomKilled: null,
+      load1m: null,
+      hostMemoryAvailableBytes: null,
+      note: "remote OSCAR metrics snapshot failed",
+    }));
+    reporter.metric(containerMetric("restore-after", service));
+  }
+  reporter.outcome("restore", "restore", "exercise supported restore", "fixture",
+    "completes", "completed", "correct", 1);
+
+  const result = reporter.finalize(new Date());
+  assert.equal(result.exitCode, 1);
+  const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
+  assert.match(functional,
+    /missing successful OSCAR host samples: storage-restore-drill-disruption/);
 });
 
 test("remote metrics fail closed for unrelated, missing, stopped, OOM, restarted, and recreated containers", () => {

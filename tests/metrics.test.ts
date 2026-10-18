@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {spawnSync} from "node:child_process";
-import {mkdtempSync} from "node:fs";
+import {chmodSync, mkdtempSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import test from "node:test";
@@ -80,6 +80,57 @@ test("remote command scopes all-state discovery to the exact OSCAR Compose servi
   assert.doesNotMatch(command, /docker stats --no-stream --format '\{\{json \.\}\}'\s*(?:\n|$)/);
   const syntax = spawnSync("sh", ["-n"], {input: command, encoding: "utf8"});
   assert.equal(syntax.status, 0, syntax.stderr);
+});
+
+test("remote command survives containers disappearing between ps and either inspect", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-metrics-docker-race-"));
+  const docker = join(root, "docker");
+  const awk = join(root, "awk");
+  writeFileSync(docker, `#!/bin/sh
+set -eu
+case "$1" in
+  ps)
+    case "$*" in
+      *service=gateway*) printf '%s\\n' gone-first ;;
+      *service=oscar*) printf '%s\\n' gone-second ;;
+      *service=postgres*) : ;;
+    esac
+    ;;
+  inspect)
+    format=$3
+    identity=$4
+    [ "$identity" != gone-first ] || exit 1
+    if [ "$format" = '{{json .}}' ]; then
+      printf '%s\\n' '{"Id":"gone-second","Name":"/oscar-oscar-1","RestartCount":0,"Config":{"Labels":{"com.docker.compose.project":"oscar","com.docker.compose.service":"oscar"}},"State":{"Status":"running","Running":true,"OOMKilled":false,"Health":{"Status":"healthy"}}}'
+    else
+      exit 1
+    fi
+    ;;
+  stats) exit 0 ;;
+  *) exit 2 ;;
+esac
+`);
+  chmodSync(docker, 0o700);
+  writeFileSync(awk, `#!/bin/sh
+case "$*" in
+  */proc/loadavg*) printf '0.5\\n' ;;
+  *MemAvailable*) printf '1000\\n' ;;
+  *MemTotal*) printf '2000\\n' ;;
+  */proc/stat*) printf '100 50\\n' ;;
+  *) exit 2 ;;
+esac
+`);
+  chmodSync(awk, 0o700);
+  const result = spawnSync("sh", ["-c", buildOscarMetricsCommand()], {
+    encoding: "utf8",
+    env: {...process.env, PATH: `${root}:${process.env.PATH ?? ""}`},
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /__MISSING__\tgateway/);
+  assert.match(result.stdout, /__MISSING__\tpostgres/);
+  assert.doesNotMatch(result.stdout, /__MISSING__\toscar/);
+  assert.match(result.stdout, /"Id":"gone-second"/);
+  assert.match(result.stdout, /__HOST__/);
 });
 
 test("OSCAR snapshot parsing includes stopped and missing services while ignoring unrelated containers", () => {

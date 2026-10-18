@@ -390,6 +390,8 @@ three paths must be the canonical paths resolved from the target `.env`; they
 must be distinct and must not contain one another:
 
 ```text
+STORAGE_WORKFLOW=required
+STORAGE_BACKUP_WORKFLOW=required
 OSCAR_RESTORE_TARGET_ACK=<viewer-host>|<user@ssh-host>|<release-dir>|ISOLATED-RESTORE
 OSCAR_RESTORE_DISPOSABLE_ACK=<host>:DISPOSABLE-NO-PRODUCTION-DATA
 OSCAR_RESTORE_DATA_LOSS_ACK=I-ACCEPT-DESTRUCTIVE-RESTORE
@@ -402,7 +404,11 @@ OSCAR_RESTORE_PATHS_ACK=<archive>|<wal-archive>|<backup>|DEDICATED-RESTORE-PATHS
 Then, and only then, run `npm run test:restore-drill`. The profile accepts no
 ordinary scenario and uses both a local target/release lock and the host-wide
 remote suite lease. Before mutation
-it requires the exact 3.9.2 image/marker gate. The target-side helper creates
+it requires both storage workflows to be `required`, the exact 3.9.2
+image/marker gate, and an available committed clean suite checkout with a
+canonical 40-hex HEAD. The later `3.9.2-release` run requires that same exact
+suite commit; tracked and untracked changes are refused, while Git-ignored
+`.env` and `results/` are allowed. The target-side helper creates
 unique pre-backup canaries in PostgreSQL, OSCAR application state, the external
 cold archive, `.env`, secrets, and TLS, plus real switched WAL fingerprints before
 and after the backup; creates and re-verifies a
@@ -421,6 +427,19 @@ mode-0700 `pre-restore-ID` safety directory remain intentionally. Its `.env`,
 content/size/hash, owner, group, and mode with no link or special entry. It contains
 plaintext pre-restore `.env`, secrets, and TLS material; record and restrict it,
 then remove it under the disposable site's approved retention policy.
+Cleanup does not add canary files beneath the production credential directories.
+If recovery must atomically replace either approved credential leaf, it
+force-recreates the Compose services so file-backed secret mounts and the
+gateway's in-memory TLS state cannot retain the old inode, then requires all
+three services healthy before deleting the database/application canaries.
+
+The report retains all raw pre/restore/post samples. Only the exact
+`storage-restore-drill-disruption` phase of this profile is excluded from
+steady-state running, health, completeness, and within-phase identity checks.
+It still requires a successful target-host sample during that phase, complete
+healthy pre/post samples, immutable image identity, stable restart counts per
+container identity, and no OOM kill in any phase. A synthetic missing-service
+snapshot cannot satisfy disruption coverage.
 
 ## Strict 3.9.2 release certification
 
@@ -445,7 +464,8 @@ separate Windows-native transcript when that acceptance environment is
 available.
 
 If restore fails after services stop, do not improvise deletion. Preserve the
-probe logs in `/tmp`, the backup, and any `pre-restore-ID` directory; use the
+root-owned mode-0700 `/var/tmp/oscar-regression-restore-failure-<run>` bounded
+diagnostic bundle, the backup, and any `pre-restore-ID` directory; use the
 documented OSCAR recovery procedure on that isolated target.
 
 ## Clean-directory upgrade qualification

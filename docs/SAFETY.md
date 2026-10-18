@@ -63,7 +63,8 @@ the same API, five-JPEG hash/type/structure, Chromium decode, and gallery proof
 before lifecycle mutation begins.
 
 The only restore coverage is the separately selected `restore-drill` profile.
-It is rejected unless `STORAGE_WORKFLOW=required`, the ordinary target and
+It is rejected unless `STORAGE_WORKFLOW=required` and
+`STORAGE_BACKUP_WORKFLOW=required`, the ordinary target and
 disposable-storage acknowledgements pass, all three storage-plane directories
 are canonical, dedicated, and non-overlapping, and all additional values match:
 
@@ -84,8 +85,20 @@ canaries to prove each plane returned, cleans those canaries after success, and
 leaves the verified backup plus a mode-0700 `pre-restore-ID` safety directory
 containing plaintext pre-restore deployment credentials for manual review.
 Restrict and remove that directory under the disposable site's approved policy.
+If cleanup atomically replaces either approved live credential file, it
+force-recreates the affected Compose services to guarantee file-backed secret
+rebinding and reset the gateway's in-memory TLS state, then proves all three
+services healthy.
 Never place those acknowledgements in a normal runner `.env`.
 Never run the profile against a target whose loss would matter.
+
+Both `restore-drill` and the matching `3.9.2-release` require the same
+available, committed, clean canonical 40-hex suite HEAD. Any tracked or
+untracked file fails closed; ignored `.env` and `results/` are permitted. The
+supported restore's exact disruption phase retains raw metrics but is excluded
+from steady-state service checks only for this profile. Host coverage, healthy
+pre/post samples, restart/OOM checks, and immutable image identity remain
+mandatory.
 
 The lane CSV is read-only during a suite run. Apply it only while provisioning
 the authorized disposable regression system. OSCAR's spreadsheet import is

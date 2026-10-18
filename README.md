@@ -143,7 +143,7 @@ it only after reviewing
 [docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md):
 
 ```bash
-npm run test:restore-drill
+STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required npm run test:restore-drill
 ```
 
 For final 3.9.2 certification, first preserve the complete PASS directory from
@@ -157,7 +157,9 @@ npm run test:3.9.2-release
 
 This mode rejects scenario filters, missing/skipped gates, mismatched build or
 target identity, and restore evidence without the complete authenticated-backup,
-canary, immutable-image, and pre-restore-safety-copy attestation.
+canary, immutable-image, and pre-restore-safety-copy attestation. Both commands
+also require the same available, committed, clean 40-hex suite HEAD. Tracked and
+untracked changes are refused; Git-ignored `.env` and `results/` remain allowed.
 
 Run one or more named scenarios with a comma-separated filter:
 
@@ -271,6 +273,10 @@ timeline, preserved backup-era and divergent post-backup WAL, archived timeline 
 failure, a reconstructed exact VERIFIED epoch receipt, cleared one-time recovery state,
 all service health, archive verification, and immutable image identities to return. The test backup
 and `pre-restore-<backup-id>` safety directory are preserved for operator review.
+All raw pre/restore/post resource samples remain in the report. Only the exact
+`storage-restore-drill-disruption` phase is exempt from steady-state
+running/health/identity checks, and only for `restore-drill`; a real host sample,
+pre/post healthy coverage, stable restart counts, and zero OOM kills remain required.
 
 ## Results
 
