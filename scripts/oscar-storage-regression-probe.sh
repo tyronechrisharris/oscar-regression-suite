@@ -35,8 +35,8 @@ psql_admin() {
     exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"
   ' psql-wrapper "$@"
 }
-scalar() { psql_admin --tuples-only --no-align --command "$1" | tr -d '[:space:]'; }
-json_query() { psql_admin --tuples-only --no-align --command "$1" | tail -n 1; }
+scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" | tr -d '[:space:]'; }
+json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-fA-F-]{36}$ ]]; }
 valid_deployment_id() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }

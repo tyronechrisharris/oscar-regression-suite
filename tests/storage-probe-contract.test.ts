@@ -8,6 +8,35 @@ const probePath = resolve("scripts/oscar-storage-regression-probe.sh");
 const probe = readFileSync(probePath, "utf8");
 const scenarios = readFileSync(resolve("src/scenarios.ts"), "utf8");
 
+function runProbeQueryHelpers(helperSource: string): string {
+  return execFileSync("bash", ["-c", `set -Eeuo pipefail
+psql_admin() {
+  local quiet=false argument query
+  for argument in "$@"; do [[ $argument == --quiet ]] && quiet=true; done
+  query=\${!#}
+  if [[ $query == *json* ]]; then printf '%s\\n' '{"ok":true}'
+  else printf '%s\\n' '1'; fi
+  $quiet || printf '%s\\n' 'UPDATE 1'
+}
+${helperSource}
+scalar_value=$(scalar 'UPDATE fixture SET value=1 RETURNING 1')
+json_value=$(json_query 'UPDATE fixture SET value=1 RETURNING json')
+printf '%s\\t%s' "$scalar_value" "$json_value"`], {encoding: "utf8"});
+}
+
+test("query helpers suppress DML command tags before parsing scalar and JSON rows", () => {
+  const scalarHelper = probe.match(/^scalar\(\) \{[^\n]+\}$/mu)?.[0];
+  const jsonHelper = probe.match(/^json_query\(\) \{[^\n]+\}$/mu)?.[0];
+  assert.ok(scalarHelper && jsonHelper, "missing storage query helpers");
+  const helpers = `${scalarHelper}\n${jsonHelper}`;
+  assert.match(scalarHelper, /psql_admin --quiet --tuples-only --no-align/);
+  assert.match(jsonHelper, /psql_admin --quiet --tuples-only --no-align/);
+  assert.equal(runProbeQueryHelpers(helpers), '1\t{"ok":true}');
+
+  const legacyHelpers = helpers.replaceAll(" --quiet", "");
+  assert.equal(runProbeQueryHelpers(legacyHelpers), "1UPDATE1\tUPDATE 1");
+});
+
 test("storage probe remains valid Bash and gates exact 3.9.2 image identity", () => {
   assert.doesNotThrow(() => execFileSync("bash", ["-n", probePath]));
   for (const required of [
