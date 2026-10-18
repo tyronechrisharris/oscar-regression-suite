@@ -450,6 +450,42 @@ test("journal status validates exact bounded v1 manifests and direct lane state"
   assert.match(block, /'\$csv_day'::date::timestamp AT TIME ZONE '\$journal_zone'/);
   assert.match(block, /publishedAt'\)::timestamptz >=/);
   assert.doesNotMatch(block, /for manifest in \$\(find/);
+  assert.match(block, /awk -v today="\$today" "\\\$0 ~ \/\^\[0-9\]\{4\}/);
+  assert.match(block, /awk "\{ total \+= \\\$1 \} END \{ printf \\"%\.0f\\n\\", total\+0 \}"/);
+  assert.doesNotMatch(block, /awk -v today="\$today" '\$0/,
+    "the container-shell program must not terminate the host's single-quoted sh -c argument");
+});
+
+test("journal inventory serializes one intact POSIX shell payload", () => {
+  const block = probe.slice(probe.indexOf("  journal-status)"), probe.indexOf("  journal-restart)"));
+  const start = block.indexOf("    inventory=$(compose exec -T oscar sh -eu -c '");
+  const end = block.indexOf("\n    IFS='|' read -r publications", start);
+  assert.ok(start >= 0 && end > start, "missing journal inventory command substitution");
+  const assignment = block.slice(start, end);
+  const root = mkdtempSync(resolve(tmpdir(), "oscar-journal-payload-"));
+  const capture = resolve(root, "payload.sh");
+  try {
+    execFileSync("bash", ["-c", `set -Eeuo pipefail
+capture=$1
+compose() {
+  [[ $# -eq 9 ]] || { printf 'unexpected compose argv count: %s\\n' "$#" >&2; return 90; }
+  [[ $1 == exec && $2 == -T && $3 == oscar && $4 == sh && $5 == -eu && $6 == -c ]] || return 91
+  [[ $8 == journal-inventory && $9 == 2026-10-18 ]] || return 92
+  printf '%s' "$7" >"$capture"
+  printf '%s\\n' '0|0|0|0|0|0|0|0|0|0|0|0|0|0'
+}
+fail() { printf '%s\\n' "$*" >&2; return 93; }
+journal_today=2026-10-18
+${assignment}
+`, "journal-payload", capture], {stdio: ["ignore", "pipe", "pipe"]});
+    const serialized = readFileSync(capture, "utf8");
+    assert.match(serialized, /awk -v today="\$today" "\\\$0 ~/);
+    assert.doesNotThrow(() => execFileSync("sh", ["-n", "-c", serialized], {
+      stdio: ["ignore", "pipe", "pipe"],
+    }));
+  } finally {
+    rmSync(root, {recursive: true, force: true});
+  }
 });
 
 test("journal restart prefix oracle rejects truncation masked by later growth", () => {

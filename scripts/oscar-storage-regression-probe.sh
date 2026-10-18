@@ -1571,9 +1571,9 @@ case $action in
     invalid_days=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -printf "%f\n" |
       grep -Evc "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" || true)
     eligible_days=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -printf "%f\n" |
-      awk -v today="$today" '$0 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && $0 < today { count++ } END { print count+0 }')
+      awk -v today="$today" "\$0 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && \$0 < today { count++ } END { print count+0 }")
     future_days=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -printf "%f\n" |
-      awk -v today="$today" '$0 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && $0 > today { count++ } END { print count+0 }')
+      awk -v today="$today" "\$0 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && \$0 > today { count++ } END { print count+0 }")
     current_dirs=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -name "$today" -print |
       wc -l | tr -d "[:space:]")
     current_open=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -type f \
@@ -1583,7 +1583,7 @@ case $action in
     current_bytes=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -type f \
       \( -name "[0-9][0-9][0-9][0-9][0-9][0-9].open" -o \
          -name "[0-9][0-9][0-9][0-9][0-9][0-9].seg" \) -printf "%s\n" |
-      awk '{ total += $1 } END { printf "%.0f\n", total+0 }')
+      awk "{ total += \$1 } END { printf \"%.0f\n\", total+0 }")
     current_entries=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -print |
       wc -l | tr -d "[:space:]")
     current_expected=$((current_open+current_sealed))
