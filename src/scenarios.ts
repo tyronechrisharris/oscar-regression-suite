@@ -15,7 +15,12 @@ import {
   type AlarmVideoAssociation,
 } from "./alarm-media-oracles.js";
 import {
+  assessDashboardConnectionResolution,
+  assessHealthObservationBatches,
   connectionDataStreamIds,
+  DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
+  DASHBOARD_HEALTH_MAX_IN_FLIGHT,
+  expectedDashboardConnectionIds,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
   parseHealthObservationBatch,
@@ -962,27 +967,37 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "dashboard-health", category: "dashboard-health", action: "resolve dashboard connection indicators",
-        target: "Dashboard Lane Status", expected: "every RPM and configured camera indicator resolves independently to Online",
+        target: "Dashboard Lane Status", expected: "every exact expected RPM and configured camera indicator resolves independently to Online within 45 seconds",
       }, async () => {
         const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-rpm"], [data-testid^="lane-health-"][data-testid$="-camera"]');
-        const expected = this.config.expectedLaneCount + this.config.expectedCameraCount;
-        const states = await poll(
-          () => indicators.evaluateAll((nodes) => nodes.map((node) => ({
-            state: node.getAttribute("data-state"),
-            label: node.getAttribute("aria-label") ?? "",
-          }))),
-          (values) => values.length === expected && values.every(({state, label}) =>
-            state === "online" && /online/i.test(label)),
-          {timeoutMs: 45_000, intervalMs: 1_000, description: "dashboard RPM and camera indicators to resolve online"},
-        ).catch(() => indicators.evaluateAll((nodes) => nodes.map((node) => ({
+        const fixtureLaneNames = this.config.laneConfigOracle?.lanes.map((lane) => lane.name) ?? [];
+        const renderedLaneNames = await page.locator('[data-testid^="lane-health-card-"]').evaluateAll((nodes) => nodes
+          .map((node) => (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""))
+          .filter(Boolean));
+        const laneNames = fixtureLaneNames.length === this.config.expectedLaneCount
+          ? fixtureLaneNames
+          : renderedLaneNames;
+        const expectedIds = expectedDashboardConnectionIds(
+          laneNames,
+          this.config.expectedCameraCount === this.config.expectedLaneCount,
+        );
+        const snapshot = () => indicators.evaluateAll((nodes) => nodes.map((node) => ({
+          testId: node.getAttribute("data-testid") ?? "",
           state: node.getAttribute("data-state"),
           label: node.getAttribute("aria-label") ?? "",
-        }))));
-        const online = states.filter(({state}) => state === "online").length;
-        const passed = states.length === expected && online === expected &&
-          states.every(({label}) => /online/i.test(label));
-        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-live-connections");
-        return {passed, observed: `${online}/${expected} Online with accessible labels`, evidence};
+        })));
+        const states = await poll(
+          snapshot,
+          (values) => assessDashboardConnectionResolution(values, expectedIds).passed,
+          {timeoutMs: 45_000, intervalMs: 1_000, description: "every exact dashboard RPM and camera indicator to resolve online"},
+        ).catch(snapshot);
+        const assessment = assessDashboardConnectionResolution(states, expectedIds);
+        const evidence = assessment.passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-live-connections");
+        return {
+          passed: assessment.passed,
+          observed: `${assessment.online}/${expectedIds.length} exact indicators Online; missing=${assessment.missing.join("|") || "none"}; unexpected=${assessment.unexpected.join("|") || "none"}; duplicates=${assessment.duplicates.join("|") || "none"}; unresolved=${assessment.unresolved.join("|") || "none"}`,
+          evidence,
+        };
       });
 
       await poll(
@@ -993,17 +1008,17 @@ export class RegressionScenarios {
       probeEnabled = false;
       await this.check({
         scenario: "dashboard-health", category: "performance", action: "bound shared dashboard health polling",
-        target: "latest observation requests", expected: "shared batches contain at most 50 streams with at most two requests in flight and do not fan out one REST request per lane",
+        target: "latest observation requests", expected: `shared batches contain at most ${DASHBOARD_HEALTH_MAX_BATCH_STREAMS} streams with at most ${DASHBOARD_HEALTH_MAX_IN_FLIGHT} requests in flight and do not fan out one REST request per lane`,
       }, async () => {
         const uniqueBatches = new Map(batches.map((batch) => [batch.streamIds.join(","), batch]));
         const values = [...uniqueBatches.values()];
-        const validSizes = values.every((batch) => batch.streamIds.length > 0 &&
-          batch.streamIds.length <= 50 && batch.limit === batch.streamIds.length);
-        const shared = this.config.expectedLaneCount <= 1 ||
-          (values.length < this.config.expectedLaneCount && values.some((batch) => batch.streamIds.length > 1));
-        const passed = values.length > 0 && validSizes && peakHealthRequests <= 2 && shared;
+        const assessment = assessHealthObservationBatches(
+          values,
+          this.config.expectedLaneCount,
+          peakHealthRequests,
+        );
         return {
-          passed,
+          passed: assessment.passed,
           observed: `${values.length} unique batches; sizes=${values.map((batch) => batch.streamIds.length).join("|")}; peak in flight=${peakHealthRequests}; lane count=${this.config.expectedLaneCount}`,
         };
       });

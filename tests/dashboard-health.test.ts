@@ -1,11 +1,67 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assessDashboardConnectionResolution,
+  assessHealthObservationBatches,
   connectionDataStreamIds,
+  DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
+  DASHBOARD_HEALTH_MAX_IN_FLIGHT,
+  expectedDashboardConnectionIds,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
   parseHealthObservationBatch,
 } from "../src/dashboard-health.js";
+
+test("dashboard health batches enforce the ten-stream and two-request contract", () => {
+  assert.equal(DASHBOARD_HEALTH_MAX_BATCH_STREAMS, 10);
+  assert.equal(DASHBOARD_HEALTH_MAX_IN_FLIGHT, 2);
+  const ten = Array.from({length: 10}, (_, index) => `stream-${index + 1}`);
+  assert.deepEqual(
+    assessHealthObservationBatches([{streamIds: ten, limit: 10}], 50, 2),
+    {passed: true, validSizes: true, shared: true, boundedConcurrency: true},
+  );
+  assert.deepEqual(
+    assessHealthObservationBatches([{streamIds: [...ten, "stream-11"], limit: 11}], 50, 2),
+    {passed: false, validSizes: false, shared: true, boundedConcurrency: true},
+  );
+  assert.equal(assessHealthObservationBatches([{streamIds: ten, limit: 10}], 50, 3).passed, false);
+  assert.equal(assessHealthObservationBatches([], 50, 0).passed, false);
+});
+
+test("dashboard connection oracle requires every exact expected chip to resolve accessibly", () => {
+  const expected = expectedDashboardConnectionIds(["Lane01", "Lane02"], true);
+  assert.deepEqual(expected, [
+    "lane-health-Lane01-rpm", "lane-health-Lane01-camera",
+    "lane-health-Lane02-rpm", "lane-health-Lane02-camera",
+  ]);
+  const online = expected.map((testId) => ({testId, state: "online", label: `${testId} Online`}));
+  assert.deepEqual(assessDashboardConnectionResolution(online, expected), {
+    passed: true,
+    online: 4,
+    missing: [],
+    unexpected: [],
+    duplicates: [],
+    unresolved: [],
+  });
+
+  const unresolved = online.map((snapshot) => ({...snapshot}));
+  unresolved[2] = {...unresolved[2]!, state: "unknown", label: "RPM Unknown"};
+  const unresolvedAssessment = assessDashboardConnectionResolution(unresolved, expected);
+  assert.equal(unresolvedAssessment.passed, false);
+  assert.deepEqual(unresolvedAssessment.unresolved, ["lane-health-Lane02-rpm:unknown"]);
+
+  const wrongIdentity = [...online.slice(0, -1), {
+    testId: "lane-health-Lane99-camera", state: "online", label: "Camera Online",
+  }];
+  const wrongAssessment = assessDashboardConnectionResolution(wrongIdentity, expected);
+  assert.equal(wrongAssessment.passed, false);
+  assert.deepEqual(wrongAssessment.missing, ["lane-health-Lane02-camera"]);
+  assert.deepEqual(wrongAssessment.unexpected, ["lane-health-Lane99-camera"]);
+
+  const duplicateAssessment = assessDashboardConnectionResolution([...online, online[0]!], expected);
+  assert.equal(duplicateAssessment.passed, false);
+  assert.deepEqual(duplicateAssessment.duplicates, ["lane-health-Lane01-rpm"]);
+});
 
 test("health polling parser recognizes only batched latest-observation queries", () => {
   assert.deepEqual(

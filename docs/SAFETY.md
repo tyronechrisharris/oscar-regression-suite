@@ -84,6 +84,10 @@ archive, `.env`, secrets, and TLS with a newly created backup. It uses scoped
 canaries to prove each plane returned, cleans those canaries after success, and
 leaves the verified backup plus a mode-0700 `pre-restore-ID` safety directory
 containing plaintext pre-restore deployment credentials for manual review.
+The cold-archive canary is an empty canonical observations partition/profile
+hierarchy whose components must all be owned by the OSCAR runtime UID/GID and
+owner-writable/searchable; the drill refuses a root-owned intermediate directory
+that the non-root restore helper could not replace.
 Restrict and remove that directory under the disposable site's approved policy.
 If cleanup atomically replaces either approved live credential file, it
 force-recreates the affected Compose services to guarantee file-backed secret

@@ -99,6 +99,26 @@ env_value() {
   value=$(awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' .env)
   printf '%s' "${value:-$fallback}"
 }
+ensure_restore_archive_canary_hierarchy() {
+  local expected_uid=${1:-} expected_gid=${2:-} component component_mode
+  shift 2 || fail 'Restore archive-canary ownership arguments are missing.'
+  [[ $expected_uid =~ ^[0-9]+$ && $expected_gid =~ ^[0-9]+$ && $# -gt 0 ]] ||
+    fail 'Restore archive-canary ownership or hierarchy is invalid.'
+  for component in "$@"; do
+    [[ $component == /* ]] || fail 'Restore archive-canary hierarchy must use absolute paths.'
+    if [[ ! -e $component && ! -L $component ]]; then
+      install -d -o "$expected_uid" -g "$expected_gid" -m 0750 -- "$component" ||
+        fail 'Could not create a canonical restore archive-canary directory.'
+    fi
+    [[ -d $component && ! -L $component &&
+       $(stat -c '%u:%g' -- "$component") == "$expected_uid:$expected_gid" ]] ||
+      fail 'Restore archive-canary hierarchy has unsafe ownership or type.'
+    component_mode=$(stat -c %a -- "$component")
+    [[ $component_mode =~ ^[0-7]{3,4}$ ]] &&
+      (( (8#$component_mode & 0700) == 0700 )) ||
+      fail 'Restore archive-canary hierarchy is not owner-readable, writable, and searchable.'
+  done
+}
 platform_config_fields() {
   local config_path=$1
   {
@@ -2914,7 +2934,11 @@ case $action in
     psql_admin --command "ALTER TABLE oscar_regression_fixture ADD COLUMN IF NOT EXISTS restore_marker text;
       UPDATE oscar_regression_fixture SET restore_marker='$marker' WHERE run_id='$run';" >/dev/null
     compose exec -T oscar sh -eu -c 'mkdir -p /var/lib/oscar/files/.restore-regression; printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$marker"
-    install -d -o 10001 -g 10001 -m 0750 -- "$archive_canary"
+    ensure_restore_archive_canary_hierarchy 10001 10001 \
+      "$archive_dir/datasets" \
+      "$archive_dir/datasets/observations" \
+      "$archive_canary_parent" \
+      "$archive_canary"
     printf '%s\n' "$env_canary" >>.env
 
     # Force and retain at least one source-timeline WAL object, then fingerprint every

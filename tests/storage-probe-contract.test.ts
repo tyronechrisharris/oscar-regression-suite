@@ -705,7 +705,15 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
   assert.match(block, /archive_canary_profile="restore_\$run"/);
   assert.match(block,
     /archive_canary="\$archive_canary_parent\/profile=\$archive_canary_profile"/);
-  assert.match(block, /install -d -o 10001 -g 10001 -m 0750 -- "\$archive_canary"/);
+  assert.match(block, /ensure_restore_archive_canary_hierarchy 10001 10001/);
+  for (const component of [
+    '"$archive_dir/datasets"',
+    '"$archive_dir/datasets/observations"',
+    '"$archive_canary_parent"',
+    '"$archive_canary"',
+  ]) assert.ok(block.includes(component), `missing canonical archive-canary component: ${component}`);
+  assert.doesNotMatch(block, /install -d -o 10001 -g 10001 -m 0750 -- "\$archive_canary"/,
+    "one-shot install must not leave intermediate archive-canary parents owned by root");
   assert.match(block, /rmdir -- "\$archive_canary" \|\| fail/);
   assert.match(block, /archive_restored=false; \[\[ -d \$archive_canary && ! -L \$archive_canary \]\]/);
   assert.doesNotMatch(block, /archive_dir\/[.]restore-regression-/,
@@ -797,6 +805,40 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
     "datasets/observations/date=2026-10-18/profile=restore_2026_10_18t17_43_32_227z_nimo_mme3l";
   assert.match(archiveCanaryRelative,
     /^datasets\/observations\/date=[0-9]{4}-[0-9]{2}-[0-9]{2}\/profile=[A-Za-z0-9_-]+$/u);
+});
+
+test("restore archive canary creates every hierarchy component with removable app ownership", () => {
+  const helper = probe.match(/^ensure_restore_archive_canary_hierarchy\(\) \{\n[\s\S]*?^\}/mu)?.[0];
+  assert.ok(helper, "missing restore archive-canary hierarchy helper");
+  assert.match(helper, /install -d -o "\$expected_uid" -g "\$expected_gid" -m 0750 -- "\$component"/);
+  assert.match(helper, /stat -c '%u:%g' -- "\$component"/);
+  assert.match(helper, /\(8#\$component_mode & 0700\) == 0700/);
+  if (process.platform !== "linux") return;
+  const support = `fail() { printf 'ERROR: %s\\n' "$*" >&2; exit 1; }\n${helper}`;
+  execFileSync("bash", ["-c", `set -Eeuo pipefail
+${support}
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+uid=$(id -u); gid=$(id -g)
+components=("$root/datasets" "$root/datasets/observations" \
+  "$root/datasets/observations/date=2026-10-18" \
+  "$root/datasets/observations/date=2026-10-18/profile=restore_test")
+ensure_restore_archive_canary_hierarchy "$uid" "$gid" "\${components[@]}"
+for component in "\${components[@]}"; do
+  test -d "$component" && test ! -L "$component"
+  test "$(stat -c '%u:%g' -- "$component")" = "$uid:$gid"
+  mode=$(stat -c %a -- "$component")
+  (( (8#$mode & 0700) == 0700 ))
+done`], {stdio: ["ignore", "pipe", "pipe"]});
+
+  assert.throws(() => execFileSync("bash", ["-c", `set -Eeuo pipefail
+${support}
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+mkdir "$root/datasets"
+chmod 0500 "$root/datasets"
+ensure_restore_archive_canary_hierarchy "$(id -u)" "$(id -g)" \
+  "$root/datasets" "$root/datasets/observations"`], {stdio: ["ignore", "pipe", "pipe"]}));
 });
 
 test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {

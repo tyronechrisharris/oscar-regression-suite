@@ -3,6 +3,31 @@ export interface HealthObservationBatch {
   limit: number | null;
 }
 
+export const DASHBOARD_HEALTH_MAX_BATCH_STREAMS = 10;
+export const DASHBOARD_HEALTH_MAX_IN_FLIGHT = 2;
+
+export interface HealthBatchAssessment {
+  passed: boolean;
+  validSizes: boolean;
+  shared: boolean;
+  boundedConcurrency: boolean;
+}
+
+export interface DashboardConnectionSnapshot {
+  testId: string;
+  state: string | null;
+  label: string;
+}
+
+export interface DashboardConnectionAssessment {
+  passed: boolean;
+  online: number;
+  missing: string[];
+  unexpected: string[];
+  duplicates: string[];
+  unresolved: string[];
+}
+
 export interface ConnectionRewriteSummary {
   matched: number;
   offlineMatched: number;
@@ -62,6 +87,71 @@ export function parseHealthObservationBatch(rawUrl: string): HealthObservationBa
   return {
     streamIds,
     limit: parsedLimit !== null && Number.isInteger(parsedLimit) ? parsedLimit : null,
+  };
+}
+
+/** Enforce the Viewer dashboard's bounded shared latest-observation request contract. */
+export function assessHealthObservationBatches(
+  batches: readonly HealthObservationBatch[],
+  expectedLaneCount: number,
+  peakInFlight: number,
+): HealthBatchAssessment {
+  const validSizes = batches.every((batch) => batch.streamIds.length > 0 &&
+    batch.streamIds.length <= DASHBOARD_HEALTH_MAX_BATCH_STREAMS &&
+    batch.limit === batch.streamIds.length);
+  const shared = expectedLaneCount <= 1 ||
+    (batches.length < expectedLaneCount && batches.some((batch) => batch.streamIds.length > 1));
+  const boundedConcurrency = peakInFlight <= DASHBOARD_HEALTH_MAX_IN_FLIGHT;
+  return {
+    passed: batches.length > 0 && validSizes && shared && boundedConcurrency,
+    validSizes,
+    shared,
+    boundedConcurrency,
+  };
+}
+
+/** Build the exact Dashboard connection-chip identities expected for the configured lanes. */
+export function expectedDashboardConnectionIds(
+  laneNames: readonly string[],
+  cameraPerLane: boolean,
+): string[] {
+  return laneNames.flatMap((laneName) => [
+    `lane-health-${laneName}-rpm`,
+    ...(cameraPerLane ? [`lane-health-${laneName}-camera`] : []),
+  ]);
+}
+
+/**
+ * Require every expected chip, and only those chips, to resolve to an
+ * accessible Online state. The scenario applies this oracle inside a bounded
+ * poll so a permanently Waiting/Unknown chip cannot pass on aggregate counts.
+ */
+export function assessDashboardConnectionResolution(
+  snapshots: readonly DashboardConnectionSnapshot[],
+  expectedIds: readonly string[],
+): DashboardConnectionAssessment {
+  const expected = new Set(expectedIds);
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const snapshot of snapshots) {
+    if (seen.has(snapshot.testId)) duplicates.add(snapshot.testId);
+    seen.add(snapshot.testId);
+  }
+  const missing = [...expected].filter((testId) => !seen.has(testId)).sort();
+  const unexpected = [...seen].filter((testId) => !expected.has(testId)).sort();
+  const unresolved = snapshots
+    .filter(({state, label}) => state !== "online" || !/online/i.test(label))
+    .map(({testId, state}) => `${testId}:${state ?? "missing-state"}`)
+    .sort();
+  const online = snapshots.length - unresolved.length;
+  return {
+    passed: snapshots.length === expectedIds.length && missing.length === 0 && unexpected.length === 0 &&
+      duplicates.size === 0 && unresolved.length === 0,
+    online,
+    missing,
+    unexpected,
+    duplicates: [...duplicates].sort(),
+    unresolved,
   };
 }
 

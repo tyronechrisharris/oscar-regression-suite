@@ -39,7 +39,7 @@ camera-system identity no longer matches the configured site. Live connection
 failures mean at least one latest connection observation did not resolve
 Online; compare that component with Status of Health before retrying.
 
-The performance row requires latest-observation batches of no more than 50
+The performance row requires latest-observation batches of no more than 10
 streams and no more than two requests in flight. A failure here indicates a
 Dashboard query regression, not a host CPU threshold. Offline and Unknown UI
 checks use browser-only response fixtures; they do not disconnect cameras or

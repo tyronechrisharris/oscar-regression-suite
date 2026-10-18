@@ -414,7 +414,12 @@ unique pre-backup canaries in PostgreSQL, OSCAR application state, the external
 cold archive, `.env`, secrets, and TLS, plus real switched WAL fingerprints before
 and after the backup; creates and re-verifies a
 coordinated backup; mutates every canary; and calls only the supported
-`oscar.sh restore --backup ID --confirm ID` interface. Acceptance requires all
+`oscar.sh restore --backup ID --confirm ID` interface. The cold-archive canary is an empty canonical
+`datasets/observations/date=.../profile=...` hierarchy. Every hierarchy component
+is created or validated with OSCAR's UID/GID 10001 and owner read/write/search
+permission so the non-root restore helper can replace it; a root-owned
+intermediate directory is rejected before backup.
+Acceptance requires all
 pre-backup values, promotion onto a timeline newer than the base backup, an archived
 timeline-history file and new-timeline WAL segment, byte-identical preservation of
 the fingerprinted backup-era and divergent post-backup source-timeline WAL, no

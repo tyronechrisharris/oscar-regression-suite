@@ -95,8 +95,10 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    baseline: complete lane/RPM/per-camera inventory, every emulator RPM's
    explicit `tamper_fault=false` source state, no Dashboard Tamper Unknown,
    live Online resolution, accessible browser-fixture Offline/Unknown states,
-   keyboard lane navigation, and shared latest-observation batches bounded to
-   50 streams and two in flight. Also require `lane-video` to paint live Gamma
+   keyboard lane navigation, every exact expected connection chip to resolve
+   Online with an accessible label within 45 seconds, and shared
+   latest-observation batches bounded to 10 streams and two in flight. Also
+   require `lane-video` to paint live Gamma
    and Neutron data after the real Dashboard-to-Lane Details transition.
 4. Inspect summary.md, errors.csv, failed functional rows, and screenshots. Do not
    proceed to mutation if login, target identity, emulator inventory, mapping, or
@@ -180,6 +182,8 @@ test and all documented acknowledgements are present, set both
 `STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, then run
 `npm run test:restore-drill` separately. Require pre-backup canaries to return
 across the database, application state, archive, WAL, `.env`, secrets, and TLS;
+require every component of the empty archive partition/profile canary hierarchy
+to be runtime-owned and owner-writable/searchable before backup;
 require promotion onto a timeline newer than the base backup, byte-identical
 append-only preservation of fingerprinted backup-era and post-backup source-timeline
 WAL, an archived timeline-history
