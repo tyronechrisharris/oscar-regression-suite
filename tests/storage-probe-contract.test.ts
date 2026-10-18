@@ -130,7 +130,8 @@ test("platform probe binds roots, the stable lock, and exact helper provenance a
     "isolatedBasebackupWired",
   ]) assert.ok(block.includes(required), `missing platform hardening contract: ${required}`);
   assert.match(block, /archive_object_helper copy "\\\$relative" "\\\$expected_sha" ro "\\\$partial"/);
-  assert.match(block, /archive_object_helper delete "\\\$relative" "\\\$expected_sha" rw/);
+  assert.match(block,
+    /archive_object_helper delete "\\\$relative" "\\\$expected_sha" rw <\/dev\/null/);
   assert.match(block, /if ln -- "\$partial" "\$destination"/);
   assert.match(block, /sync -d "\$partial"/);
   assert.match(block, /sync -f "\$archive_root"/);

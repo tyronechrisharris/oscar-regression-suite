@@ -90,6 +90,9 @@ The target must use the regression-only accelerated archive profile:
 `intervalMinutes=1`, `rollbackGraceDays=1`, `deleteHotAfterArchive=true`, while
 the configured hot-retention value must match `STORAGE_HOT_RETENTION_DAYS`.
 Never use those acceleration settings as the production retention policy.
+The platform preflight also requires the archive purge helper to read from
+`/dev/null`; this proves that a helper invoked inside the work-list loop cannot
+consume subsequent rows and leave a multi-object purge plan partially applied.
 
 The probe registers exactly two observations copied from an existing
 `gammaCounts` row: one beyond hot retention and one current. A temporary,

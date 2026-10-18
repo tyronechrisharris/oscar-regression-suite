@@ -321,7 +321,10 @@ case $action in
     grep -Eq '^[[:space:]]+archive_object_helper copy "\$relative" "\$expected_sha" ro "\$partial"$' oscar-storage.sh &&
       archive_export_helper_wired=true
     archive_purge_helper_wired=false
-    grep -Eq '^[[:space:]]+delete_outcome=\$\(archive_object_helper delete "\$relative" "\$expected_sha" rw\)$' oscar-storage.sh &&
+    # The purge loop reads its work list from standard input. Require the
+    # helper subprocess to detach from that stream so it cannot consume the
+    # remaining object rows and silently leave a multi-object plan partial.
+    grep -Eq '^[[:space:]]+delete_outcome=\$\(archive_object_helper delete "\$relative" "\$expected_sha" rw </dev/null\)$' oscar-storage.sh &&
       archive_purge_helper_wired=true
     wal_helper_regular=false
     compose exec -T postgres sh -c 'test -f /usr/local/bin/oscar-archive-wal && test ! -L /usr/local/bin/oscar-archive-wal && test -x /usr/local/bin/oscar-archive-wal' && wal_helper_regular=true
