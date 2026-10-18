@@ -167,7 +167,7 @@ test("private backup diagnostics resist the former fixed /tmp symlink clobber pa
     assert.ok(allocation, "missing private backup workspace allocation");
     const result = spawnSync("bash", ["-ceu", `umask 077
 ${allocation.trim()}
-test "$(stat -f %Lp "$backup_work" 2>/dev/null || stat -c %a "$backup_work")" = 700
+test "$(stat -c %a "$backup_work" 2>/dev/null || stat -f %Lp "$backup_work")" = 700
 printf 'private diagnostic\n' >"$backup_work/backup-verify.log"
 rm -rf -- "$backup_work"`], {encoding: "utf8"});
     assert.equal(result.status, 0, String(result.stderr));
