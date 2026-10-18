@@ -520,6 +520,7 @@ export interface StoragePlatformProbe {
     queryPeriodMinutes: number | null;
     frameCount: number | null;
     jpegQuality: number | null;
+    sourceRollbackGraceHours: number | null;
   };
 }
 
@@ -782,6 +783,7 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         queryPeriodMinutes: nullableNumber(retention.queryPeriodMinutes),
         frameCount: nullableNumber(retention.frameCount),
         jpegQuality: nullableNumber(retention.jpegQuality),
+        sourceRollbackGraceHours: nullableNumber(retention.sourceRollbackGraceHours),
       };
     })(),
   };

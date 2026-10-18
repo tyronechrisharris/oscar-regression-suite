@@ -765,6 +765,7 @@ case $action in
     media_query_period=$(printf '%s' "$config_text" | sed -n 's/.*"videoQueryPeriod"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
     media_frame_count=$(printf '%s' "$config_text" | sed -n 's/.*"frameRetentionCount"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
     media_jpeg_quality=$(printf '%s' "$config_text" | sed -n 's/.*"jpegQuality"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    media_source_grace=$(printf '%s' "$config_text" | sed -n 's/.*"sourceRollbackGraceHours"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
     media_enabled=null; config_text_matches "$config_text" '"enableFrameRetention"[[:space:]]*:[[:space:]]*true' && media_enabled=true || true
     config_text_matches "$config_text" '"enableFrameRetention"[[:space:]]*:[[:space:]]*false' && media_enabled=false || true
     delete_hot=null; config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true' && delete_hot=true || true
@@ -839,9 +840,9 @@ case $action in
       "$marker_present" "$marker_exact" "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"
     printf '"batchRewriteConfigured":%s,"dailyJournalConfigured":%s,"archiveIntervalMinutes":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
       "$batch" "$journal" "${interval:-null}" "$delete_hot" "${grace:-null}"
-    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"frameCount":%s,"jpegQuality":%s}}\n' \
+    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"frameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s}}\n' \
       "$media_enabled" "${media_retention:-null}" "${media_query_period:-null}" \
-      "${media_frame_count:-null}" "${media_jpeg_quality:-null}"
+      "${media_frame_count:-null}" "${media_jpeg_quality:-null}" "${media_source_grace:-null}"
     ;;
 
   snapshot)

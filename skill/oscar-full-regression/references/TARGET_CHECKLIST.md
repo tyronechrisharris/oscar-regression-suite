@@ -78,10 +78,13 @@
 - no second runner/operator is controlling that RPM
 - storage lifecycle uses one-minute archive cadence/one-day grace only on the
   disposable target; an overnight rotation produced daily CSV/manifest pairs;
-  retained and legacy media event IDs were reviewed; backup capacity is adequate
+  smoke/read-only uses a reviewed retained-media event ID, while a full run may
+  self-seed that proof from its exact generated alarm UUIDs; a legacy-media event
+  ID is optional compatibility coverage; backup capacity is adequate
 - the persisted live OSCAR service, not only a packaged template, uses the
   regression-only media profile `timeToRetention=0`, `videoQueryPeriod=1`,
-  `enableFrameRetention=true`, `frameRetentionCount=5`, and `jpegQuality=85`;
+  `enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
+  `sourceRollbackGraceHours=24`;
   other media settings are preserved and the packaged production default remains
   seven days
 - the disposable lifecycle's controlled stale-activation race, exact-row retry,

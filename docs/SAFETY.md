@@ -38,9 +38,11 @@ that must be preserved.
 
 The same disposable target must explicitly use `timeToRetention=0`,
 `videoQueryPeriod=1`, `enableFrameRetention=true`, `frameRetentionCount=5`, and
-`jpegQuality=85` for the generated-alarm media check. The suite verifies those
+`jpegQuality=85`, with `sourceRollbackGraceHours=24`, for the generated-alarm
+media check. The suite verifies those
 live values before it polls or creates the archive fixture; it never edits the
-configuration. OSCAR's packaged and production age default remains seven days.
+configuration. The 24-hour source grace keeps the exact generated MP4s available
+for the final forensic comparison. OSCAR's packaged and production age default remains seven days.
 Never copy the zero-day test setting into production.
 
 The only restore coverage is the separately selected `restore-drill` profile.

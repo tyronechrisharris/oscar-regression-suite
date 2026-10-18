@@ -94,13 +94,16 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 
 For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
 `STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
-rotation and with retained/legacy media fixture IDs, then run the full
-`storage-lifecycle` only on its separately acknowledged disposable database.
+rotation and a configured retained-media fixture for smoke/read-only coverage,
+then run the full `storage-lifecycle` only on its separately acknowledged
+disposable database. A full run can self-seed its retained-media proof from the
+exact alarm UUIDs it generates; a legacy-media fixture is optional compatibility
+coverage, not a release prerequisite.
 Before mutation, require the running OSCAR service's persisted
 `videoRetentionConfig` to contain exactly the regression-only acceleration
 values `timeToRetention=0`, `videoQueryPeriod=1`,
-`enableFrameRetention=true`, `frameRetentionCount=5`, and `jpegQuality=85` while
-preserving its other fields. Require the archive test profile documented by the
+`enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
+`sourceRollbackGraceHours=24` while preserving its other fields. Require the archive test profile documented by the
 suite (`intervalMinutes=1`, `rollbackGraceDays=1`,
 `deleteHotAfterArchive=true`). Do not edit the packaged defaults to satisfy this
 gate: production media aging remains seven days and the production archive

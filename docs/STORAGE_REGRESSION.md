@@ -91,7 +91,7 @@ The target must use the regression-only accelerated archive profile:
 the configured hot-retention value must match `STORAGE_HOT_RETENTION_DAYS`.
 Never use those acceleration settings as the production retention policy.
 
-The disposable configuration must also override only these fields in the
+The disposable configuration must also set these fields in the
 existing OSCAR service `videoRetentionConfig` before OSCAR starts:
 
 ```json
@@ -100,14 +100,16 @@ existing OSCAR service `videoRetentionConfig` before OSCAR starts:
   "videoQueryPeriod": 1,
   "enableFrameRetention": true,
   "frameRetentionCount": 5,
-  "jpegQuality": 85
+  "jpegQuality": 85,
+  "sourceRollbackGraceHours": 24
 }
 ```
 
 This is regression-only acceleration: zero days makes alarms from the current
-run eligible on the next one-minute query. Preserve the other
-`videoRetentionConfig` fields. Full-profile preflight reads the persisted live
-config and requires all five values before retained-media polling or cold-fixture
+run eligible on the next one-minute query, while 24 hours keeps each exact source
+MP4 available for the end-of-run ownership/decodability oracle. Preserve all
+other `videoRetentionConfig` fields. Full-profile preflight reads the persisted live
+config and requires all six values before retained-media polling or cold-fixture
 creation, so a normal seven-day deployment fails early instead of timing out.
 Do not change the packaged default; use `timeToRetention=7` in production.
 The platform preflight also requires the archive purge helper to read from

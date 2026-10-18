@@ -137,12 +137,15 @@ test("generated alarm-media scenario binds public observations, MP4 metadata, ma
     "/sensorhub/api/observations/",
     "/sensorhub/api/systems?searchMembers=true",
     "cameraUidsForSystemComponents",
+    "laneUidForSystemName",
     "assessAlarmVideoObservation",
+    "assertAlarmVideoAssociationUnique",
     "loadedmetadata",
     "alarm-media-source-status",
     "/sensorhub/buckets/videos/media/",
     "assessRetainedMediaResponse",
     "sourceByCamera.get(mediaSet.cameraUid) !== mediaSet.sourceObjectKey",
+    "mediaSet.laneUid !== expectedLaneUid",
     "alarm-media-ledger",
     'ledger.attempts === 1',
     'ledger.failure === ""',
@@ -151,7 +154,9 @@ test("generated alarm-media scenario binds public observations, MP4 metadata, ma
   ]) assert.ok(block.includes(required), `missing generated alarm-media assertion: ${required}`);
   assert.match(block, /Buffer\.from\(item\.association\.eventId, "utf8"\)\.toString\("base64url"\)/);
   assert.match(block, /generated\.flatMap\(item =>[\s\S]*item\.association\.paths/);
+  assert.doesNotMatch(block, /new Set\(generated\.flatMap/);
   assert.match(block, /"alarm-media-baseline", \[this\.alarmMediaRunKey\(\)\]\)/);
+  assert.match(block, /if \(!this\.selected\("storage-lifecycle"\)/);
   assert.doesNotMatch(block, /baselineCreated:[\s\S]{0,120}cameras:/);
   assert.doesNotMatch(block, /originalRpmConfig\?\.camera_ids/);
 });
@@ -300,6 +305,7 @@ test("platform config probes remain pipefail-safe for a large persisted configur
   assert.doesNotMatch(block, /printf[^\n]*\$config_text[^\n]*\|[^\n]*grep/);
   for (const field of [
     "timeToRetention", "videoQueryPeriod", "enableFrameRetention", "frameRetentionCount", "jpegQuality",
+    "sourceRollbackGraceHours",
   ]) assert.ok(block.includes(field), `missing retained-media preflight field: ${field}`);
 
   const largeConfig = [
@@ -549,6 +555,7 @@ test("storage lifecycle refuses mutation when exact release/profile preflight fa
   assert.match(block, /media\.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION\.queryPeriodMinutes/);
   assert.match(block, /media\.frameCount === REGRESSION_MEDIA_RETENTION\.frameCount/);
   assert.match(block, /media\.jpegQuality === REGRESSION_MEDIA_RETENTION\.jpegQuality/);
+  assert.match(block, /media\.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION\.sourceRollbackGraceHours/);
   assert.ok(block.indexOf("verifyGeneratedAlarmRetention") > block.indexOf("if (!profileAccepted)"));
 });
 

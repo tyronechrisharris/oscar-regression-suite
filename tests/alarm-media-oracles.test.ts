@@ -3,9 +3,11 @@ import test from "node:test";
 import {
   alarmCameraToken,
   alarmMediaForensicsPassed,
+  assertAlarmVideoAssociationUnique,
   assessAlarmMediaForensics,
   assessAlarmVideoObservation,
   cameraUidsForSystemComponents,
+  laneUidForSystemName,
 } from "../src/alarm-media-oracles.js";
 
 const eventId = "0abcdef";
@@ -32,6 +34,19 @@ test("camera identities come from the OSH systems catalog, not emulator stream I
     cameraUidsForSystemComponents({features: catalog.items}, ["camera-resource-b"]),
     [cameras[1]],
   );
+});
+
+test("lane identity comes from exactly one authoritative OSH lane system", () => {
+  const catalog = {items: [
+    {id: "lane-resource", properties: {properties: {uid: "urn:osh:system:lane:50", name: "Lane50"}}},
+    {id: "camera-resource", properties: {properties: {uid: cameras[0], name: "Lane50"}}},
+  ]};
+  assert.equal(laneUidForSystemName(catalog, "Lane50"), "urn:osh:system:lane:50");
+  assert.throws(() => laneUidForSystemName({items: []}, "Lane50"), /resolved 0/);
+  assert.throws(() => laneUidForSystemName({items: [
+    {properties: {properties: {uid: "urn:osh:system:lane:a", name: "Lane50"}}},
+    {properties: {properties: {uid: "urn:osh:system:lane:b", name: "Lane50"}}},
+  ]}, "Lane50"), /resolved 2/);
 });
 
 test("camera catalog oracle rejects missing, duplicate, unsafe, and ambiguous identities", () => {
@@ -87,6 +102,21 @@ test("alarm video oracle requires the exact selected event and collision-free ca
     /same clip token/);
   assert.throws(() => assessAlarmVideoObservation(observation(), eventId, ["camera/unsafe"]),
     /unsupported path characters/);
+});
+
+test("alarm video run oracle rejects duplicate event UUIDs and cross-event clip reuse", () => {
+  const first = assessAlarmVideoObservation(observation(), eventId, cameras);
+  const second = assessAlarmVideoObservation({
+    ...observation([
+      "videos/clips/urn-osh-sensor-camera-50-a/2026-10-18_07-32-52_004-g8.mp4",
+      "videos/clips/urn-osh-sensor-camera-50-b/2026-10-18_07-32-52_004-g8.mp4",
+    ]),
+    id: "1abcdef",
+  }, "1abcdef", cameras);
+  assert.doesNotThrow(() => assertAlarmVideoAssociationUnique(second, [first]));
+  assert.throws(() => assertAlarmVideoAssociationUnique(first, [first]), /generated more than once/);
+  assert.throws(() => assertAlarmVideoAssociationUnique({...second, paths: first.paths}, [first]),
+    /reuses video path/);
 });
 
 test("alarm-media forensic oracle gates only new generated files and new partials", () => {

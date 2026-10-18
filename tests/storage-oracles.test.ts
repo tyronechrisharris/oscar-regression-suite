@@ -254,14 +254,14 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     batchRewriteConfigured: true, dailyJournalConfigured: true, archiveIntervalMinutes: 1,
     deleteHotAfterArchive: true, rollbackGraceDays: 1,
     videoRetention: {enabled: true, timeToRetentionDays: 0, queryPeriodMinutes: 1,
-      frameCount: 5, jpegQuality: 85}});
+      frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24}});
   assert.equal(platform.schemaVersion, 4);
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
   assert.equal(platform.storageRoots.walArchive.rootKind, "wal-archive");
   assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
   assert.deepEqual(platform.videoRetention, {enabled: true, timeToRetentionDays: 0,
-    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85});
+    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24});
   assert.equal(storagePlatformHasExactReleaseIdentity(platform, "3.9.2"), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, configuredRelease: "4.0.0"},

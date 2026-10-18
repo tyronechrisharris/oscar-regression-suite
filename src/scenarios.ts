@@ -6,9 +6,11 @@ import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {
   alarmMediaForensicsPassed,
+  assertAlarmVideoAssociationUnique,
   assessAlarmMediaForensics,
   assessAlarmVideoObservation,
   cameraUidsForSystemComponents,
+  laneUidForSystemName,
   type AlarmVideoAssociation,
 } from "./alarm-media-oracles.js";
 import {
@@ -102,6 +104,7 @@ const REGRESSION_MEDIA_RETENTION = {
   queryPeriodMinutes: 1,
   frameCount: 5,
   jpegQuality: 85,
+  sourceRollbackGraceHours: 24,
 } as const;
 
 function isVisible(locator: Locator): Promise<boolean> {
@@ -116,6 +119,7 @@ export class RegressionScenarios {
   private alarmMediaBaselineCreated = false;
   private alarmMediaProbe: StorageProbeClient | undefined;
   private alarmCameraUids: string[] | undefined;
+  private alarmLaneUid: string | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
   private retainedMediaProofDeferred = false;
   private stopRequested: () => boolean = () => false;
@@ -2158,7 +2162,9 @@ export class RegressionScenarios {
       ));
       try {
         if (!response.ok()) throw new Error(`camera systems catalog returned HTTP ${response.status()}`);
-        this.alarmCameraUids = cameraUidsForSystemComponents(await response.json(), componentIds);
+        const catalog = await response.json();
+        this.alarmCameraUids = cameraUidsForSystemComponents(catalog, componentIds);
+        this.alarmLaneUid = laneUidForSystemName(catalog, this.config.testLaneLabel);
         return this.alarmCameraUids;
       } finally {
         await response.dispose();
@@ -2168,8 +2174,15 @@ export class RegressionScenarios {
     }
   }
 
+  private async configuredAlarmLaneUid(): Promise<string> {
+    if (!this.alarmLaneUid) await this.configuredAlarmCameraUids();
+    if (!this.alarmLaneUid) throw new Error("the reserved lane has no authoritative OSH lane UID");
+    return this.alarmLaneUid;
+  }
+
   private async ensureAlarmMediaBaseline(scenario: string): Promise<void> {
-    if (this.alarmMediaBaselineCreated || this.config.storageWorkflow === "disabled") return;
+    if (!this.selected("storage-lifecycle") || this.alarmMediaBaselineCreated ||
+        this.config.storageWorkflow === "disabled") return;
     if (!this.config.oscarSshTarget || !this.config.oscarReleaseDirectory) {
       if (this.config.storageWorkflow === "required") {
         throw new Error("Required alarm-media forensics need OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR");
@@ -2307,6 +2320,10 @@ export class RegressionScenarios {
         intervalMs: 1_000,
         description: `${type} alarm ${eventId} to persist authoritative videoPaths`,
       });
+      assertAlarmVideoAssociationUnique(
+        value,
+        [...this.generatedAlarmMedia.values()].map(item => item.association),
+      );
       return {
         passed: true,
         value,
@@ -3123,6 +3140,7 @@ export class RegressionScenarios {
       return;
     }
     const generated = [...this.generatedAlarmMedia.values()];
+    const expectedLaneUid = await this.configuredAlarmLaneUid();
     const page = await this.browser.oscarPage();
     try {
       await this.goto(page, "/");
@@ -3147,6 +3165,7 @@ export class RegressionScenarios {
               const sourceByCamera = new Map(item.association.paths.map(path => [path.cameraUid, path.path]));
               if (assessment.mediaSetCount !== sourceByCamera.size || assessment.frameCount !== sourceByCamera.size * 5 ||
                   assessment.jpegQualities.some(quality => quality !== 85) ||
+                  assessment.mediaSets.some(mediaSet => mediaSet.laneUid !== expectedLaneUid) ||
                   assessment.mediaSets.some(mediaSet => sourceByCamera.get(mediaSet.cameraUid) !== mediaSet.sourceObjectKey) ||
                   assessment.mediaSets.some(mediaSet => !sourceByCamera.has(mediaSet.cameraUid))) {
                 throw new Error(`retained manifests do not bind exactly to alarm ${eventId} videoPaths`);
@@ -3236,13 +3255,14 @@ export class RegressionScenarios {
                 };
               }>("alarm-media-ledger", [
                 Buffer.from(item.association.eventId, "utf8").toString("base64url"),
-                Buffer.from(mediaSet.laneUid, "utf8").toString("base64url"),
+                Buffer.from(expectedLaneUid, "utf8").toString("base64url"),
                 Buffer.from(mediaSet.cameraUid, "utf8").toString("base64url"),
               ]);
               const ledger = value.ledger;
               const expectedSource = sourceByCamera.get(mediaSet.cameraUid);
               const valid = value.exists === true && ledger?.eventId === item.association.eventId &&
-                ledger.laneUid === mediaSet.laneUid && ledger.cameraUid === mediaSet.cameraUid &&
+                mediaSet.laneUid === expectedLaneUid && ledger.laneUid === expectedLaneUid &&
+                ledger.cameraUid === mediaSet.cameraUid &&
                 ledger.sourceObjectKey?.replaceAll("\\", "/") === expectedSource &&
                 (ledger.state === "PUBLISHED" || ledger.state === "SOURCE_DELETED") &&
                 ledger.attempts === 1 && ledger.failure === "";
@@ -3277,8 +3297,7 @@ export class RegressionScenarios {
         target: this.config.testLaneLabel,
         expected: "since the scoped run baseline, every new finalized MP4 is UUID-bound, no new partial exists, and no generated path predates the run",
       }, async () => {
-        const expectedPaths = [...new Set(generated.flatMap(item =>
-          item.association.paths.map(({path}) => path)))];
+        const expectedPaths = generated.flatMap(item => item.association.paths.map(({path}) => path));
         const value = assessAlarmMediaForensics(
           await probe.runJson("alarm-media-forensics", [this.alarmMediaRunKey(), ...expectedPaths]),
           expectedPaths.length,
@@ -3562,7 +3581,8 @@ export class RegressionScenarios {
             media.timeToRetentionDays === REGRESSION_MEDIA_RETENTION.timeToRetentionDays &&
             media.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION.queryPeriodMinutes &&
             media.frameCount === REGRESSION_MEDIA_RETENTION.frameCount &&
-            media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality;
+            media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality &&
+            media.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION.sourceRollbackGraceHours;
         return {
           passed,
           value: passed,

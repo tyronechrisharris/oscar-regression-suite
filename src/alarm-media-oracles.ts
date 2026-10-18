@@ -39,6 +39,42 @@ export interface AlarmVideoAssociation {
   paths: AlarmVideoPath[];
 }
 
+function systemCatalogItems(value: unknown): unknown[] {
+  const collection = record(value, "systems catalog");
+  const candidates = Array.isArray(collection.items)
+    ? collection.items
+    : Array.isArray(collection.features) ? collection.features : undefined;
+  if (!candidates) throw new Error("systems catalog must contain an items array");
+  return candidates;
+}
+
+/** Resolves one lane's authoritative OSH UID from the authenticated systems catalog. */
+export function laneUidForSystemName(value: unknown, laneName: string): string {
+  const expectedName = requiredText(laneName, "lane name");
+  const matches: string[] = [];
+  for (const [index, rawCandidate] of systemCatalogItems(value).entries()) {
+    const candidate = record(rawCandidate, `systems catalog item ${index}`);
+    const properties = candidate.properties && typeof candidate.properties === "object"
+      ? record(candidate.properties, `systems catalog item ${index} properties`)
+      : {};
+    const nested = properties.properties && typeof properties.properties === "object"
+      ? record(properties.properties, `systems catalog item ${index} nested properties`)
+      : {};
+    const nameValue = candidate.name ?? properties.name ?? nested.name;
+    if (typeof nameValue !== "string" || nameValue.trim() !== expectedName) continue;
+    const uid = requiredText(
+      candidate.uid ?? candidate.uniqueId ?? properties.uid ?? properties.uniqueId ?? nested.uid ?? nested.uniqueId,
+      `systems catalog lane ${expectedName} UID`,
+    );
+    if (!uid.startsWith("urn:osh:system:lane:")) continue;
+    matches.push(uid);
+  }
+  if (matches.length !== 1) {
+    throw new Error(`systems catalog resolved ${matches.length} lane UIDs for ${expectedName}; expected exactly one`);
+  }
+  return matches[0]!;
+}
+
 /**
  * Resolves the camera system UIDs that back the selected lane's Viewer camera
  * components.  Component IDs come from the lane card, while UIDs come from the
@@ -49,11 +85,7 @@ export function cameraUidsForSystemComponents(
   value: unknown,
   componentIds: readonly string[],
 ): string[] {
-  const collection = record(value, "systems catalog");
-  const candidates = Array.isArray(collection.items)
-    ? collection.items
-    : Array.isArray(collection.features) ? collection.features : undefined;
-  if (!candidates) throw new Error("systems catalog must contain an items array");
+  const candidates = systemCatalogItems(value);
 
   const requested = componentIds.map((id, index) => requiredText(id, `camera component ID ${index}`));
   if (requested.length < 1) throw new Error("the reserved lane has no camera components");
@@ -169,6 +201,34 @@ export function assessAlarmVideoObservation(
     throw new Error("occupancy result.videoPaths does not contain exactly one path per configured camera");
   }
   return {eventId, paths};
+}
+
+/** Rejects event-ID or source-object reuse across alarms generated in one run. */
+export function assertAlarmVideoAssociationUnique(
+  candidate: AlarmVideoAssociation,
+  existing: readonly AlarmVideoAssociation[],
+): void {
+  const eventId = requiredText(candidate.eventId, "candidate alarm event ID");
+  const ownerByPath = new Map<string, string>();
+  for (const association of existing) {
+    const existingEventId = requiredText(association.eventId, "existing alarm event ID");
+    if (existingEventId === eventId) {
+      throw new Error(`alarm event UUID ${eventId} was generated more than once`);
+    }
+    for (const item of association.paths) {
+      const path = requiredText(item.path, `alarm ${existingEventId} video path`).replaceAll("\\", "/");
+      const owner = ownerByPath.get(path);
+      if (owner && owner !== existingEventId) {
+        throw new Error(`video path ${path} is already shared by alarm events ${owner} and ${existingEventId}`);
+      }
+      ownerByPath.set(path, existingEventId);
+    }
+  }
+  for (const item of candidate.paths) {
+    const path = requiredText(item.path, `alarm ${eventId} video path`).replaceAll("\\", "/");
+    const owner = ownerByPath.get(path);
+    if (owner) throw new Error(`alarm event ${eventId} reuses video path ${path} from alarm event ${owner}`);
+  }
 }
 
 export interface AlarmMediaForensics {
