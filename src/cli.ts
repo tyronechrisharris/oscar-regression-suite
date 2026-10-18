@@ -35,6 +35,26 @@ function acquireFullRunLock(emulatorUrl: string, rpmId: string): {path: string; 
   return {path, release: () => rmSync(path, {recursive: true, force: true})};
 }
 
+function acquireRestoreRunLock(target: string, releaseDirectory: string): {path: string; release: () => void} {
+  const identity = createHash("sha256").update(`${target}\n${releaseDirectory}`).digest("hex").slice(0, 16);
+  const path = join(tmpdir(), `oscar-restore-drill-${identity}.lock`);
+  try {
+    mkdirSync(path);
+    writeFileSync(join(path, "owner.json"), `${JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      target,
+      releaseDirectory,
+    }, null, 2)}\n`);
+  } catch {
+    throw new Error(
+      `Another destructive restore drill may own ${target}:${releaseDirectory}; ` +
+      `verify target state, then remove stale lock ${path}`,
+    );
+  }
+  return {path, release: () => rmSync(path, {recursive: true, force: true})};
+}
+
 function runIdentifier(): string {
   const stamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
   const host = hostname().toLowerCase().replaceAll(/[^a-z0-9-]+/g, "-").slice(0, 32);
@@ -94,9 +114,11 @@ async function main(): Promise<number> {
   const metrics = new MetricsSampler(config, reporter);
   const scenarios = new RegressionScenarios(config, reporter, browser, emulator, metrics);
   let interrupted = false;
-  const fullRunLock = config.profile === "full"
+  const mutationRunLock = config.profile === "full"
     ? acquireFullRunLock(config.rpmEmulatorUrl, config.testRpmId)
-    : undefined;
+    : config.profile === "restore-drill"
+      ? acquireRestoreRunLock(config.targetHost, config.oscarReleaseDirectory ?? "missing")
+      : undefined;
 
   const handleSignal = (signal: NodeJS.Signals) => {
     interrupted = true;
@@ -108,10 +130,14 @@ async function main(): Promise<number> {
   scenarios.setStopRequested(() => interrupted);
 
   try {
-    await browser.start();
     await metrics.start();
-    await scenarios.runReadOnly();
-    if (config.profile === "full" && !interrupted) await scenarios.runFull();
+    if (config.profile === "restore-drill") {
+      await scenarios.runRestoreDrill();
+    } else {
+      await browser.start();
+      await scenarios.runReadOnly();
+      if (config.profile === "full" && !interrupted) await scenarios.runFull();
+    }
   } catch (error) {
     reporter.error("harness", "runner", error);
     reporter.outcome(
@@ -122,7 +148,7 @@ async function main(): Promise<number> {
     if (interrupted) await scenarios.emergencyCleanup().catch((error) => reporter.error("harness", "signal-cleanup", error));
     await metrics.stop().catch((error) => reporter.error("harness", "metrics-stop", error, "", "warning"));
     await browser.stop().catch((error) => reporter.error("harness", "browser-stop", error, "", "warning"));
-    fullRunLock?.release();
+    mutationRunLock?.release();
     process.off("SIGINT", handleSignal);
     process.off("SIGTERM", handleSignal);
   }

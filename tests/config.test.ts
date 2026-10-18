@@ -21,9 +21,17 @@ const baseEnvironment = {
   ALARM_TRANSFER_CAMERA_WORKFLOW: "auto",
 };
 
+const configurationEnvironmentNames = [...readFileSync(resolve(".env.example"), "utf8")
+  .matchAll(/^(?:#\s*)?([A-Z][A-Z0-9_]*)=/gm)]
+  .map((match) => match[1])
+  .filter((name): name is string => Boolean(name));
+
 function withEnvironment(values: Record<string, string>, operation: () => void): void {
-  const names = Object.keys(values);
+  const names = [...new Set([...configurationEnvironmentNames, ...Object.keys(values)])];
   const original = new Map(names.map((name) => [name, process.env[name]]));
+  // Keep every documented key defined-but-empty so loadConfig() cannot refill
+  // test state from a runner's private .env file.
+  for (const name of names) process.env[name] = "";
   Object.assign(process.env, values);
   try { operation(); } finally {
     for (const [name, value] of original) {
@@ -101,6 +109,69 @@ test("full storage lifecycle requires an exact disposable-storage acknowledgemen
     assert.doesNotThrow(() => assertMutationAllowed(config));
     assert.throws(() => assertMutationAllowed({...config, storageTargetAcknowledgement: "wrong"}),
       /OSCAR_STORAGE_TARGET_ACK/);
+  });
+});
+
+test("3.9.2 storage defaults to required while explicit auto may skip an unconfigured target", () => {
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: " "}, () => {
+    const config = loadConfig(["--profile", "full"]);
+    assert.equal(config.storageWorkflow, "required");
+    assert.throws(() => assertMutationAllowed(config), /OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "auto"}, () => {
+    const config = loadConfig(["--profile", "full"]);
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+  });
+});
+
+test("restore drill is isolated from ordinary profiles and requires exact target, data-loss, and path acknowledgements", () => {
+  const restoreEnvironment = {
+    ...baseEnvironment,
+    STORAGE_WORKFLOW: "required",
+    OSCAR_SSH_TARGET: "tester@192.0.2.10",
+    OSCAR_RELEASE_DIR: "/opt/oscar-restore-test",
+    OSCAR_STORAGE_TARGET_ACK: "192.0.2.10:/opt/oscar-restore-test:DISPOSABLE-STORAGE",
+    OSCAR_RESTORE_TARGET_ACK: "192.0.2.10|tester@192.0.2.10|/opt/oscar-restore-test|ISOLATED-RESTORE",
+    OSCAR_RESTORE_DISPOSABLE_ACK: "192.0.2.10:DISPOSABLE-NO-PRODUCTION-DATA",
+    OSCAR_RESTORE_DATA_LOSS_ACK: "I-ACCEPT-DESTRUCTIVE-RESTORE",
+    OSCAR_RESTORE_ARCHIVE_DIR: "/srv/oscar-restore/archive",
+    OSCAR_RESTORE_WAL_ARCHIVE_DIR: "/srv/oscar-restore/wal-archive",
+    OSCAR_RESTORE_BACKUP_DIR: "/srv/oscar-restore/backups",
+    OSCAR_RESTORE_PATHS_ACK: "/srv/oscar-restore/archive|/srv/oscar-restore/wal-archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS",
+  };
+  withEnvironment(restoreEnvironment, () => {
+    const config = loadConfig(["--profile", "restore-drill"]);
+    assert.equal(config.profile, "restore-drill");
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+    for (const [field, expected] of [
+      ["restoreTargetAcknowledgement", /OSCAR_RESTORE_TARGET_ACK/],
+      ["restoreDisposableAcknowledgement", /OSCAR_RESTORE_DISPOSABLE_ACK/],
+      ["restoreDataLossAcknowledgement", /OSCAR_RESTORE_DATA_LOSS_ACK/],
+      ["restorePathsAcknowledgement", /OSCAR_RESTORE_PATHS_ACK/],
+    ] as const) {
+      assert.throws(() => assertMutationAllowed({...config, [field]: "wrong"}), expected);
+    }
+    assert.throws(
+      () => loadConfig(["--profile", "restore-drill", "--scenario", "storage-health"]),
+      /may run only storage-restore-drill/,
+    );
+    assert.throws(
+      () => loadConfig(["--profile", "full", "--scenario", "storage-restore-drill"]),
+      /requires --profile restore-drill/,
+    );
+    assert.throws(
+      () => assertMutationAllowed({...config, restoreWalArchiveDirectory: config.restoreArchiveDirectory!}),
+      /distinct, non-overlapping planes/,
+    );
+  });
+});
+
+test("restore drill rejects noncanonical or root storage planes", () => {
+  withEnvironment({...baseEnvironment, OSCAR_RESTORE_ARCHIVE_DIR: "/srv/oscar/../archive"}, () => {
+    assert.throws(() => loadConfig(["--profile", "restore-drill"]), /parent-directory|canonical, non-root/);
+  });
+  withEnvironment({...baseEnvironment, OSCAR_RESTORE_BACKUP_DIR: "/"}, () => {
+    assert.throws(() => loadConfig(["--profile", "restore-drill"]), /canonical, non-root/);
   });
 });
 

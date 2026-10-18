@@ -29,8 +29,8 @@ fi
 profile=${1:-smoke}
 shift || true
 case "$profile" in
-  smoke|full) ;;
-  *) echo "Usage: $0 [smoke|full] [--scenario name[,name...]]" >&2; exit 2 ;;
+  smoke|full|restore-drill) ;;
+  *) echo "Usage: $0 [smoke|full|restore-drill] [--scenario name[,name...]]" >&2; exit 2 ;;
 esac
 
 npm run "test:$profile" -- "$@"

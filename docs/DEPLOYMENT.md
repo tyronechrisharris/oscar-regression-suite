@@ -36,9 +36,12 @@ Provision every canonical 50-lane regression build with
 same tracked file so the UI assertions are derived from the deployed source of
 truth rather than duplicated expectations.
 
-## Strict SSH for performance data
+## Strict SSH for performance and storage validation
 
-Performance sampling is optional. Before setting `OSCAR_SSH_TARGET`:
+SSH is optional only for an explicit non-storage/legacy run with
+`STORAGE_WORKFLOW=auto` or `disabled`. The default OSCAR 3.9.2
+`STORAGE_WORKFLOW=required` gate needs SSH both for performance evidence and for
+the target-side storage probe. Before setting `OSCAR_SSH_TARGET`:
 
 1. obtain the OSCAR host's SSH fingerprint through a trusted channel
 2. scan the host key and compare the fingerprint exactly
@@ -48,16 +51,20 @@ Performance sampling is optional. Before setting `OSCAR_SSH_TARGET`:
 5. verify noninteractive access with `BatchMode=yes` and
    `StrictHostKeyChecking=yes`
 
-If SSH sampling is not configured, functional tests and runner metrics still run;
-container/host fields are simply absent.
+If SSH is not configured, non-storage functional tests and runner metrics can
+still run only after selecting an explicit non-storage workflow; container/host
+fields are absent. A required 3.9.2 storage gate fails closed instead of silently
+omitting those checks.
 
 For OSCAR 3.9.2 storage validation, use an isolated checkout or release directory
 and a fresh disposable database. Pin the same SSH host key, configure
 passwordless noninteractive sudo only for the authorized test account, set
 `OSCAR_BUILD_LABEL` to the exact 3.9.2 artifact and component SHAs, and apply the
 variables described in [STORAGE_REGRESSION.md](STORAGE_REGRESSION.md). The
-canonical 50-lane operational-view fixture remains mandatory. Do not deploy or
-reconfigure OSCAR as part of updating this suite checkout.
+probe independently gates the exact Compose tags, local/running immutable image
+IDs, available repository digests, OCI labels, and storage marker. The canonical
+50-lane operational-view fixture remains mandatory. Do not deploy or reconfigure
+OSCAR as part of updating this suite checkout.
 
 ## Run
 
@@ -79,6 +86,9 @@ OPERATIONAL_VIEW_WORKFLOW=required OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane
 STORAGE_WORKFLOW=required ./scripts/run-regression.sh smoke --scenario storage-health
 # Separately acknowledged disposable lifecycle (never production):
 STORAGE_WORKFLOW=required ./scripts/run-regression.sh full --scenario storage-lifecycle
+# Destructive isolated restore qualification. Set every documented storage and
+# restore path/acknowledgement first; never place these values on a normal runner.
+STORAGE_WORKFLOW=required ./scripts/run-regression.sh restore-drill
 ```
 
 Review `summary.md`, `functional-results.csv`, `errors.csv`, and cleanup rows

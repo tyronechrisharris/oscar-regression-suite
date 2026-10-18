@@ -4,6 +4,12 @@ import type {StorageMetricSample} from "./types.js";
 export const RETAINED_FRAME_POSITIONS = [
   "FIRST", "QUARTER", "MIDDLE", "THREE_QUARTERS", "LAST",
 ] as const;
+export const MAX_RETAINED_MEDIA_SETS = 8;
+export const MAX_RETAINED_FRAME_BYTES = 12 * 1024 * 1024;
+export const MAX_RETAINED_FRAME_DIMENSION = 6000;
+export const MAX_RETAINED_FRAME_PIXELS = 20_000_000;
+export const MAX_RETAINED_EVENT_BYTES = 64 * 1024 * 1024;
+export const MAX_RETAINED_EVENT_PIXELS = 120_000_000;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -20,9 +26,9 @@ function text(value: unknown, field: string): string {
   return value;
 }
 
-function integer(value: unknown, field: string, minimum = 0): number {
-  if (!Number.isSafeInteger(value) || Number(value) < minimum) {
-    throw new Error(`${field} must be an integer >= ${minimum}`);
+function integer(value: unknown, field: string, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
   }
   return Number(value);
 }
@@ -49,8 +55,18 @@ export interface RetainedMediaAssessment {
   mediaSetCount: number;
   frameCount: number;
   cameraUids: string[];
+  jpegQualities: number[];
   paths: string[];
-  assets: Array<{path: string; bytes: number; sha256: string}>;
+  assets: Array<{
+    path: string;
+    bytes: number;
+    sha256: string;
+    width: number;
+    height: number;
+    contentType: "image/jpeg";
+  }>;
+  declaredBytes: number;
+  declaredPixels: number;
 }
 
 /** Strictly validates the authenticated event-scoped retained-media contract. */
@@ -61,15 +77,20 @@ export function assessRetainedMediaResponse(
   const response = object(value, "retained-media response");
   if (response.schemaVersion !== 1) throw new Error("retained-media schemaVersion must be 1");
   if (response.eventId !== expectedEventId) throw new Error("retained-media eventId does not match");
-  if (!Array.isArray(response.mediaSets) || response.mediaSets.length < 1 || response.mediaSets.length > 32) {
-    throw new Error("retained-media response must contain 1-32 media sets");
+  if (!Array.isArray(response.mediaSets) || response.mediaSets.length < 1 ||
+      response.mediaSets.length > MAX_RETAINED_MEDIA_SETS) {
+    throw new Error(`retained-media response must contain 1-${MAX_RETAINED_MEDIA_SETS} media sets`);
   }
 
   const setIds = new Set<string>();
+  const cameraUidSet = new Set<string>();
   const cameraUids: string[] = [];
+  const jpegQualities: number[] = [];
   const paths: string[] = [];
-  const assets: Array<{path: string; bytes: number; sha256: string}> = [];
+  const assets: RetainedMediaAssessment["assets"] = [];
   let frameCount = 0;
+  let declaredBytes = 0;
+  let declaredPixels = 0;
   response.mediaSets.forEach((rawSet, setIndex) => {
     const mediaSet = object(rawSet, `mediaSets[${setIndex}]`);
     const manifest = object(mediaSet.manifest, `mediaSets[${setIndex}].manifest`);
@@ -82,8 +103,22 @@ export function assessRetainedMediaResponse(
     }
     setIds.add(mediaSetId);
     const cameraUid = text(manifest.cameraUid, `mediaSets[${setIndex}].manifest.cameraUid`);
+    if (cameraUidSet.has(cameraUid)) {
+      throw new Error(`mediaSets[${setIndex}] has an invalid or duplicate cameraUid`);
+    }
+    cameraUidSet.add(cameraUid);
     cameraUids.push(cameraUid);
-    integer(manifest.jpegQuality, `mediaSets[${setIndex}].manifest.jpegQuality`, 1);
+    const cameraToken = Buffer.from(cameraUid, "utf8").toString("base64url");
+    const manifestPath = text(mediaSet.manifestPath, `mediaSets[${setIndex}].manifestPath`);
+    if (manifestPath !== `media/${expectedEventId}/${cameraToken}/manifest.json`) {
+      throw new Error(`mediaSets[${setIndex}] manifest path does not match its cameraUid`);
+    }
+    jpegQualities.push(integer(
+      manifest.jpegQuality,
+      `mediaSets[${setIndex}].manifest.jpegQuality`,
+      1,
+      100,
+    ));
     const source = object(manifest.source, `mediaSets[${setIndex}].manifest.source`);
     sha256(source.sha256, `mediaSets[${setIndex}].manifest.source.sha256`);
     integer(source.bytes, `mediaSets[${setIndex}].manifest.source.bytes`, 1);
@@ -94,7 +129,13 @@ export function assessRetainedMediaResponse(
     }
     const positions = new Set<string>();
     const ordinals = new Set<number>();
-    const assetHashes = new Map<string, string>();
+    const canonicalAssets = new Map<string, {
+      sourceFrameOrdinal: number;
+      sha256: string;
+      bytes: number;
+      width: number;
+      height: number;
+    }>();
     manifest.assets.forEach((rawAsset, assetIndex) => {
       const asset = object(rawAsset, `mediaSets[${setIndex}].manifest.assets[${assetIndex}]`);
       const position = text(asset.position, `asset ${assetIndex} position`);
@@ -102,25 +143,41 @@ export function assessRetainedMediaResponse(
         throw new Error(`mediaSets[${setIndex}] has an unsupported frame position`);
       }
       positions.add(position);
-      ordinals.add(integer(asset.sourceFrameOrdinal, `asset ${assetIndex} ordinal`));
+      const sourceFrameOrdinal = integer(asset.sourceFrameOrdinal, `asset ${assetIndex} ordinal`);
+      ordinals.add(sourceFrameOrdinal);
       if (asset.contentType !== "image/jpeg" || asset.state !== "PUBLISHED") {
         throw new Error(`mediaSets[${setIndex}] asset ${assetIndex} is not a published JPEG`);
       }
-      integer(asset.bytes, `asset ${assetIndex} bytes`, 1);
-      integer(asset.width, `asset ${assetIndex} width`, 1);
-      integer(asset.height, `asset ${assetIndex} height`, 1);
+      const bytes = integer(asset.bytes, `asset ${assetIndex} bytes`, 1, MAX_RETAINED_FRAME_BYTES);
+      const width = integer(asset.width, `asset ${assetIndex} width`, 1, MAX_RETAINED_FRAME_DIMENSION);
+      const height = integer(asset.height, `asset ${assetIndex} height`, 1, MAX_RETAINED_FRAME_DIMENSION);
+      const pixels = width * height;
+      if (pixels > MAX_RETAINED_FRAME_PIXELS) {
+        throw new Error(`mediaSets[${setIndex}] asset ${assetIndex} exceeds the decoded-pixel budget`);
+      }
       const digest = sha256(asset.sha256, `asset ${assetIndex} sha256`);
-      assetHashes.set(position, digest);
+      canonicalAssets.set(position, {sourceFrameOrdinal, sha256: digest, bytes, width, height});
+      declaredBytes += bytes;
+      declaredPixels += pixels;
     });
     if (positions.size !== 5 || ordinals.size !== 5 ||
         RETAINED_FRAME_POSITIONS.some(position => !positions.has(position))) {
       throw new Error(`mediaSets[${setIndex}] does not contain five distinct canonical frames`);
     }
+    const responsePositions = new Set<string>();
     mediaSet.assets.forEach((rawAsset, assetIndex) => {
       const responseAsset = object(rawAsset, `mediaSets[${setIndex}].assets[${assetIndex}]`);
       const asset = object(responseAsset.asset, `mediaSets[${setIndex}].assets[${assetIndex}].asset`);
       const position = text(asset.position, `response asset ${assetIndex} position`);
-      if (assetHashes.get(position) !== asset.sha256) {
+      if (responsePositions.has(position)) {
+        throw new Error(`mediaSets[${setIndex}] response assets contain a duplicate frame position`);
+      }
+      responsePositions.add(position);
+      const canonical = canonicalAssets.get(position);
+      if (!canonical || canonical.sourceFrameOrdinal !== asset.sourceFrameOrdinal ||
+          canonical.sha256 !== asset.sha256 || canonical.bytes !== asset.bytes ||
+          canonical.width !== asset.width || canonical.height !== asset.height ||
+          asset.contentType !== "image/jpeg" || asset.state !== "PUBLISHED") {
         throw new Error(`mediaSets[${setIndex}] response asset does not match its manifest`);
       }
       const path = text(responseAsset.path, `mediaSets[${setIndex}].assets[${assetIndex}].path`);
@@ -129,8 +186,7 @@ export function assessRetainedMediaResponse(
       ) + 1}.jpg`;
       const segments = path.split("/");
       if (segments.length !== 4 || segments[0] !== "media" || segments[1] !== expectedEventId ||
-          segments[3] !== expectedName || !/^[A-Za-z0-9._-]+$/.test(segments[2] ?? "") ||
-          segments[2] === "." || segments[2] === "..") {
+          segments[2] !== cameraToken || segments[3] !== expectedName) {
         throw new Error(`mediaSets[${setIndex}] response asset path escapes the event whitelist`);
       }
       paths.push(path);
@@ -138,19 +194,148 @@ export function assessRetainedMediaResponse(
         path,
         bytes: integer(asset.bytes, `response asset ${assetIndex} bytes`, 1),
         sha256: sha256(asset.sha256, `response asset ${assetIndex} sha256`),
+        width: integer(asset.width, `response asset ${assetIndex} width`, 1),
+        height: integer(asset.height, `response asset ${assetIndex} height`, 1),
+        contentType: "image/jpeg",
       });
       frameCount++;
     });
+    if (responsePositions.size !== RETAINED_FRAME_POSITIONS.length ||
+        RETAINED_FRAME_POSITIONS.some(position => !responsePositions.has(position))) {
+      throw new Error(`mediaSets[${setIndex}] response assets do not contain five distinct canonical frames`);
+    }
   });
   if (new Set(paths).size !== paths.length) throw new Error("retained-media response has duplicate paths");
-  return {mediaSetCount: response.mediaSets.length, frameCount, cameraUids, paths, assets};
+  if (declaredBytes > MAX_RETAINED_EVENT_BYTES) {
+    throw new Error("retained-media response exceeds the event-wide byte budget");
+  }
+  if (declaredPixels > MAX_RETAINED_EVENT_PIXELS) {
+    throw new Error("retained-media response exceeds the event-wide decoded-pixel budget");
+  }
+  return {mediaSetCount: response.mediaSets.length, frameCount, cameraUids, jpegQualities, paths, assets,
+    declaredBytes, declaredPixels};
 }
 
-export function assessJpeg(bytes: Buffer, expectedBytes: number, expectedSha256: string): boolean {
-  return bytes.length === expectedBytes && bytes.length > 4 &&
-    bytes[0] === 0xff && bytes[1] === 0xd8 &&
-    bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9 &&
-    createHash("sha256").update(bytes).digest("hex") === expectedSha256;
+export interface BaselineJpegInfo {
+  width: number;
+  height: number;
+  components: number;
+  scans: number;
+}
+
+function isStartOfFrame(marker: number): boolean {
+  return marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
+}
+
+/**
+ * Parses only the bounded structure needed by OSCAR's retained-frame contract.
+ * It rejects progressive/lossless/arithmetic JPEGs, malformed segment lengths,
+ * truncated entropy data, multiple scans, trailing bytes, and oversized decoded
+ * dimensions. Actual codec decodability is checked separately in Chromium.
+ */
+export function parseBaselineJpeg(bytes: Buffer): BaselineJpegInfo {
+  if (bytes.length < 12 || bytes.length > MAX_RETAINED_FRAME_BYTES) {
+    throw new Error("JPEG byte length is outside the retained-frame budget");
+  }
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("JPEG has no SOI marker");
+
+  let offset = 2;
+  let frame: BaselineJpegInfo | undefined;
+  let hasQuantizationTable = false;
+  let hasHuffmanTable = false;
+  let scans = 0;
+  let foundEnd = false;
+
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0xff) throw new Error("JPEG marker prefix is missing");
+    while (offset < bytes.length && bytes[offset] === 0xff) offset++;
+    if (offset >= bytes.length) throw new Error("JPEG ends in marker padding");
+    const marker = bytes[offset] ?? 0;
+    offset++;
+    if (marker === 0x00) throw new Error("JPEG has stuffed data outside a scan");
+    if (marker === 0xd9) {
+      foundEnd = true;
+      if (offset !== bytes.length) throw new Error("JPEG has trailing bytes after EOI");
+      break;
+    }
+    if (marker === 0xd8) throw new Error("JPEG contains a nested SOI marker");
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > bytes.length) throw new Error("JPEG segment length is truncated");
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) {
+      throw new Error("JPEG segment exceeds the bounded input");
+    }
+    const payloadStart = offset + 2;
+    const payloadEnd = offset + segmentLength;
+
+    if (isStartOfFrame(marker)) {
+      if (marker !== 0xc0) throw new Error("JPEG is not baseline sequential DCT");
+      if (frame) throw new Error("JPEG contains multiple frame headers");
+      if (segmentLength < 8) throw new Error("JPEG baseline frame header is truncated");
+      const precision = bytes[payloadStart] ?? 0;
+      const height = bytes.readUInt16BE(payloadStart + 1);
+      const width = bytes.readUInt16BE(payloadStart + 3);
+      const components = bytes[payloadStart + 5] ?? 0;
+      if (precision !== 8) throw new Error("JPEG baseline precision must be 8 bits");
+      if (components !== 3 || segmentLength !== 8 + components * 3) {
+        throw new Error("JPEG must contain one three-component baseline frame");
+      }
+      if (width < 1 || height < 1 || width > MAX_RETAINED_FRAME_DIMENSION ||
+          height > MAX_RETAINED_FRAME_DIMENSION || width * height > MAX_RETAINED_FRAME_PIXELS) {
+        throw new Error("JPEG decoded dimensions exceed the retained-frame budget");
+      }
+      frame = {width, height, components, scans: 0};
+    } else if (marker === 0xdb) {
+      hasQuantizationTable = true;
+    } else if (marker === 0xc4) {
+      hasHuffmanTable = true;
+    } else if (marker === 0xcc) {
+      throw new Error("JPEG arithmetic coding is not permitted");
+    }
+
+    offset = payloadEnd;
+    if (marker !== 0xda) continue;
+    scans++;
+    if (scans !== 1) throw new Error("JPEG must contain exactly one baseline scan");
+    while (offset < bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset++;
+        continue;
+      }
+      let markerOffset = offset + 1;
+      while (markerOffset < bytes.length && bytes[markerOffset] === 0xff) markerOffset++;
+      if (markerOffset >= bytes.length) throw new Error("JPEG entropy data is truncated");
+      const scanMarker = bytes[markerOffset] ?? 0;
+      if (scanMarker === 0x00 || (scanMarker >= 0xd0 && scanMarker <= 0xd7)) {
+        offset = markerOffset + 1;
+        continue;
+      }
+      offset = markerOffset - 1;
+      break;
+    }
+  }
+  if (!foundEnd || !frame || scans !== 1 || !hasQuantizationTable || !hasHuffmanTable) {
+    throw new Error("JPEG is missing required baseline structure");
+  }
+  return {...frame, scans};
+}
+
+export function assessJpeg(
+  bytes: Buffer,
+  expectedBytes: number,
+  expectedSha256: string,
+  expectedWidth?: number,
+  expectedHeight?: number,
+): boolean {
+  if (bytes.length !== expectedBytes ||
+      createHash("sha256").update(bytes).digest("hex") !== expectedSha256) return false;
+  try {
+    const parsed = parseBaselineJpeg(bytes);
+    return (expectedWidth === undefined || parsed.width === expectedWidth) &&
+      (expectedHeight === undefined || parsed.height === expectedHeight);
+  } catch {
+    return false;
+  }
 }
 
 export interface DailyFileManifest {
@@ -194,11 +379,48 @@ export function assessDailyFilePublication(
 }
 
 export interface StoragePlatformProbe {
+  expectedRelease: string;
+  configuredRelease: string;
+  templateRelease: string;
+  deploymentId: string;
+  storageRoots: {
+    archive: StorageRootIdentity;
+    backup: StorageRootIdentity;
+    walArchive: StorageRootIdentity;
+  };
+  storageLock: {
+    directory: string;
+    file: string;
+    stablePath: boolean;
+    private: boolean;
+    behaviorTested: boolean;
+    concurrentRejected: boolean;
+  };
+  walArchive: {
+    archiveMode: string;
+    archiveCommandExact: boolean;
+    publicationContractExact: boolean;
+    helper: StorageHelperIdentity;
+  };
+  archiveObjectHelper: StorageHelperIdentity & {
+    cliExportIntegrated: boolean;
+    cliPurgeIntegrated: boolean;
+  };
+  appImage: StorageImageIdentity;
+  postgisImage: StorageImageIdentity;
+  gatewayImage: StorageImageIdentity;
   dataChecksums: string;
   pgStatStatementsInstalled: boolean;
   pgStatStatementsPreloaded: boolean;
   schemaVersion: number;
-  archiveMarkerPresent: boolean;
+  archiveMarker: {
+    present: boolean;
+    exact: boolean;
+    format: string;
+    version: string;
+    dataChecksums: string;
+    initializedAt: string;
+  };
   batchRewriteConfigured: boolean;
   dailyJournalConfigured: boolean;
   archiveIntervalMinutes: number | null;
@@ -206,14 +428,154 @@ export interface StoragePlatformProbe {
   rollbackGraceDays: number | null;
 }
 
+export interface StorageRootIdentity {
+  format: string;
+  version: string;
+  deploymentId: string;
+  rootKind: string;
+  adoption: string;
+  claimedAt: string;
+  adoptedAt: string;
+  adoptedBy: string;
+  markerOwner: number;
+  markerGroup: number;
+  markerMode: string;
+  rootOwner: number;
+  rootGroup: number;
+  rootMode: string;
+  exact: boolean;
+}
+
+export interface StorageHelperIdentity {
+  helperPath: string;
+  packagedSha256: string;
+  deployedSha256: string;
+  regularExecutable: boolean;
+}
+
+export interface StorageImageIdentity {
+  reference: string;
+  imageId: string;
+  containerImageId: string;
+  repoDigests: string[];
+  versionLabel: string;
+  storageProfileLabel: string;
+}
+
+function rootIdentity(value: unknown, field: string): StorageRootIdentity {
+  const marker = object(value, field);
+  return {
+    format: text(marker.format, `${field}.format`),
+    version: text(marker.version, `${field}.version`),
+    deploymentId: text(marker.deploymentId, `${field}.deploymentId`),
+    rootKind: text(marker.rootKind, `${field}.rootKind`),
+    adoption: text(marker.adoption, `${field}.adoption`),
+    claimedAt: text(marker.claimedAt, `${field}.claimedAt`),
+    adoptedAt: text(marker.adoptedAt, `${field}.adoptedAt`),
+    adoptedBy: text(marker.adoptedBy, `${field}.adoptedBy`),
+    markerOwner: integer(marker.markerOwner, `${field}.markerOwner`),
+    markerGroup: integer(marker.markerGroup, `${field}.markerGroup`),
+    markerMode: text(marker.markerMode, `${field}.markerMode`),
+    rootOwner: integer(marker.rootOwner, `${field}.rootOwner`),
+    rootGroup: integer(marker.rootGroup, `${field}.rootGroup`),
+    rootMode: text(marker.rootMode, `${field}.rootMode`),
+    exact: marker.exact === true,
+  };
+}
+
+function helperIdentity(value: unknown, field: string): StorageHelperIdentity {
+  const helper = object(value, field);
+  return {
+    helperPath: text(helper.helperPath, `${field}.helperPath`),
+    packagedSha256: sha256(helper.packagedSha256, `${field}.packagedSha256`),
+    deployedSha256: sha256(helper.deployedSha256, `${field}.deployedSha256`),
+    regularExecutable: helper.regularExecutable === true,
+  };
+}
+
+function stringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some(item => typeof item !== "string")) {
+    throw new Error(`${field} must be an array of strings`);
+  }
+  return value as string[];
+}
+
+function imageIdentity(value: unknown, field: string): StorageImageIdentity {
+  const image = object(value, field);
+  const imageId = text(image.imageId, `${field}.imageId`);
+  const containerImageId = text(image.containerImageId, `${field}.containerImageId`);
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageId) || !/^sha256:[0-9a-f]{64}$/.test(containerImageId)) {
+    throw new Error(`${field} image IDs must be immutable SHA-256 identities`);
+  }
+  const repoDigests = stringArray(image.repoDigests, `${field}.repoDigests`);
+  if (repoDigests.some(digest => !/^[A-Za-z0-9._/:@+-]+@sha256:[0-9a-f]{64}$/.test(digest))) {
+    throw new Error(`${field}.repoDigests contains a non-immutable digest`);
+  }
+  return {
+    reference: text(image.reference, `${field}.reference`),
+    imageId,
+    containerImageId,
+    repoDigests,
+    versionLabel: typeof image.versionLabel === "string" ? image.versionLabel : "",
+    storageProfileLabel: typeof image.storageProfileLabel === "string" ? image.storageProfileLabel : "",
+  };
+}
+
 export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
   const probe = object(value, "storage platform probe");
+  const roots = object(probe.storageRoots, "storageRoots");
+  const lock = object(probe.storageLock, "storageLock");
+  const wal = object(probe.walArchive, "walArchive");
   return {
+    expectedRelease: text(probe.expectedRelease, "expectedRelease"),
+    configuredRelease: text(probe.configuredRelease, "configuredRelease"),
+    templateRelease: text(probe.templateRelease, "templateRelease"),
+    deploymentId: text(probe.deploymentId, "deploymentId"),
+    storageRoots: {
+      archive: rootIdentity(roots.archive, "storageRoots.archive"),
+      backup: rootIdentity(roots.backup, "storageRoots.backup"),
+      walArchive: rootIdentity(roots.walArchive, "storageRoots.walArchive"),
+    },
+    storageLock: {
+      directory: text(lock.directory, "storageLock.directory"),
+      file: text(lock.file, "storageLock.file"),
+      stablePath: lock.stablePath === true,
+      private: lock.private === true,
+      behaviorTested: lock.behaviorTested === true,
+      concurrentRejected: lock.concurrentRejected === true,
+    },
+    walArchive: {
+      archiveMode: text(wal.archiveMode, "walArchive.archiveMode"),
+      archiveCommandExact: wal.archiveCommandExact === true,
+      publicationContractExact: wal.publicationContractExact === true,
+      helper: helperIdentity(wal, "walArchive"),
+    },
+    archiveObjectHelper: (() => {
+      const helper = object(probe.archiveObjectHelper, "archiveObjectHelper");
+      return {
+        ...helperIdentity(helper, "archiveObjectHelper"),
+        cliExportIntegrated: helper.cliExportIntegrated === true,
+        cliPurgeIntegrated: helper.cliPurgeIntegrated === true,
+      };
+    })(),
+    appImage: imageIdentity(probe.appImage, "appImage"),
+    postgisImage: imageIdentity(probe.postgisImage, "postgisImage"),
+    gatewayImage: imageIdentity(probe.gatewayImage, "gatewayImage"),
     dataChecksums: text(probe.dataChecksums, "dataChecksums"),
     pgStatStatementsInstalled: probe.pgStatStatementsInstalled === true,
     pgStatStatementsPreloaded: probe.pgStatStatementsPreloaded === true,
     schemaVersion: integer(probe.schemaVersion, "schemaVersion"),
-    archiveMarkerPresent: probe.archiveMarkerPresent === true,
+    archiveMarker: (() => {
+      const marker = object(probe.archiveMarker, "archiveMarker");
+      return {
+        present: marker.present === true,
+        exact: marker.exact === true,
+        format: typeof marker.format === "string" ? marker.format : "",
+        version: typeof marker.version === "string" ? marker.version : "",
+        dataChecksums: typeof marker.dataChecksums === "string" ? marker.dataChecksums : "",
+        initializedAt: typeof marker.initializedAt === "string" ? marker.initializedAt : "",
+      };
+    })(),
     batchRewriteConfigured: probe.batchRewriteConfigured === true,
     dailyJournalConfigured: probe.dailyJournalConfigured === true,
     archiveIntervalMinutes: nullableNumber(probe.archiveIntervalMinutes),
@@ -221,6 +583,59 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
       ? probe.deleteHotAfterArchive : null,
     rollbackGraceDays: nullableNumber(probe.rollbackGraceDays),
   };
+}
+
+export function storagePlatformHasExactReleaseIdentity(
+  value: StoragePlatformProbe,
+  release: string,
+): boolean {
+  const deploymentPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const roots: Array<[StorageRootIdentity, string, number, string]> = [
+    [value.storageRoots.archive, "archive", 10001, "1770"],
+    [value.storageRoots.backup, "backup", 0, "700"],
+    [value.storageRoots.walArchive, "wal-archive", 999, "1770"],
+  ];
+  const rootsExact = roots.every(([root, kind, group, mode]) => root.exact &&
+    root.format === "oscar-storage-root-identity" && root.version === "1" &&
+    root.deploymentId === value.deploymentId && root.rootKind === kind &&
+    ["new", "explicit-existing"].includes(root.adoption) &&
+    Number.isFinite(Date.parse(root.claimedAt)) &&
+    ((root.adoption === "new" && root.adoptedAt === "none" && root.adoptedBy === "none") ||
+      (root.adoption === "explicit-existing" && Number.isFinite(Date.parse(root.adoptedAt)) &&
+        root.adoptedBy !== "none")) &&
+    root.markerOwner === 0 && root.markerGroup === 0 && root.markerMode === "600" &&
+    root.rootOwner === 0 && root.rootGroup === group && root.rootMode === mode);
+  const helperExact = (helper: StorageHelperIdentity, path: string) =>
+    helper.helperPath === path && helper.regularExecutable &&
+    helper.packagedSha256 === helper.deployedSha256;
+  return value.expectedRelease === release &&
+    value.configuredRelease === release &&
+    value.templateRelease === release &&
+    deploymentPattern.test(value.deploymentId) &&
+    rootsExact &&
+    value.storageLock.file === `${value.storageLock.directory}/${value.deploymentId}.lock` &&
+    value.storageLock.stablePath && value.storageLock.private &&
+    value.storageLock.behaviorTested && value.storageLock.concurrentRejected &&
+    value.walArchive.archiveMode === "on" && value.walArchive.archiveCommandExact &&
+    value.walArchive.publicationContractExact &&
+    helperExact(value.walArchive.helper, "/usr/local/bin/oscar-archive-wal") &&
+    helperExact(value.archiveObjectHelper, "/usr/local/bin/oscar-archive-object") &&
+    value.archiveObjectHelper.cliExportIntegrated && value.archiveObjectHelper.cliPurgeIntegrated &&
+    value.appImage.reference === `oscar:${release}` &&
+    value.postgisImage.reference === `oscar-postgis:${release}` &&
+    value.gatewayImage.reference === "nginxinc/nginx-unprivileged:1.28.1-alpine" &&
+    value.appImage.imageId === value.appImage.containerImageId &&
+    value.postgisImage.imageId === value.postgisImage.containerImageId &&
+    value.gatewayImage.imageId === value.gatewayImage.containerImageId &&
+    value.appImage.versionLabel === release &&
+    value.postgisImage.versionLabel === release &&
+    value.postgisImage.storageProfileLabel === release &&
+    value.archiveMarker.present &&
+    value.archiveMarker.exact &&
+    value.archiveMarker.format === "oscar-storage-profile" &&
+    value.archiveMarker.version === release &&
+    value.archiveMarker.dataChecksums === "on" &&
+    Number.isFinite(Date.parse(value.archiveMarker.initializedAt));
 }
 
 export interface ArchiveHealthProbe {
@@ -232,6 +647,8 @@ export interface ArchiveHealthProbe {
   parityFailures: number;
   activeHolds: number;
   incompleteActiveObjects: number;
+  archivePartialArtifacts: number;
+  walPartialArtifacts: number;
   checksumVerificationPassed: boolean;
 }
 
@@ -246,6 +663,8 @@ export function assessArchiveHealth(value: unknown): ArchiveHealthProbe {
     parityFailures: integer(probe.parityFailures, "parityFailures"),
     activeHolds: integer(probe.activeHolds, "activeHolds"),
     incompleteActiveObjects: integer(probe.incompleteActiveObjects, "incompleteActiveObjects"),
+    archivePartialArtifacts: integer(probe.archivePartialArtifacts, "archivePartialArtifacts"),
+    walPartialArtifacts: integer(probe.walPartialArtifacts, "walPartialArtifacts"),
     checksumVerificationPassed: probe.checksumVerificationPassed === true,
   };
 }

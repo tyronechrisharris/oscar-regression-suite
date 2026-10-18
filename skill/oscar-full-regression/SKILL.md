@@ -28,6 +28,14 @@ checks. Preserve its evidence and restore the reserved RPM even when a test fail
   disposable-storage acknowledgement, a fresh 3.9.2 test database, and the
   probe's one-generation purge guard. Never run it on production/physical lanes
   and never add a restore step to the ordinary regression run.
+- Treat `restore-drill` as a distinct destructive profile. It is never part of
+  smoke/full and requires the exact target/storage acknowledgements plus the
+  restore-specific path binding documented in `docs/STORAGE_REGRESSION.md`.
+  Require the three canonical archive/WAL/backup paths and exact path
+  acknowledgement, and run it only on an isolated disposable deployment whose
+  PostgreSQL, OSCAR state, archive, WAL, and credentials may all be overwritten.
+  Preserve its backup, permission-restricted plaintext safety directory, and
+  failure logs.
 - Keep result bundles private; they may contain operational and vehicle data.
 
 Read references/TARGET_CHECKLIST.md before deploying to a new runner or target.
@@ -66,9 +74,12 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 2. Validate suite static checks, unit tests, dependency audit, and the selected
    lane fixture.
 3. Run ./scripts/run-regression.sh smoke. Require the `dashboard-health`
-   baseline: complete lane/RPM/per-camera inventory, live Online resolution,
-   accessible browser-fixture Offline/Unknown states, keyboard lane navigation,
-   and shared latest-observation batches bounded to 50 streams and two in flight.
+   baseline: complete lane/RPM/per-camera inventory, every emulator RPM's
+   explicit `tamper_fault=false` source state, no Dashboard Tamper Unknown,
+   live Online resolution, accessible browser-fixture Offline/Unknown states,
+   keyboard lane navigation, and shared latest-observation batches bounded to
+   50 streams and two in flight. Also require `lane-video` to paint live Gamma
+   and Neutron data after the real Dashboard-to-Lane Details transition.
 4. Inspect summary.md, errors.csv, failed functional rows, and screenshots. Do not
    proceed to mutation if login, target identity, emulator inventory, mapping, or
    connectivity is uncertain.
@@ -85,16 +96,41 @@ For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
 `STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
 rotation and with retained/legacy media fixture IDs, then run the full
 `storage-lifecycle` only on its separately acknowledged disposable database.
-Require exact-five hash-valid JPEGs, gallery/fallback behavior, journal restart
+Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
+frame/event resource budgets, bounded baseline structure plus Chromium decode
+and exact dimensions for every quality-85 frame, lazy gallery requests with bounded concurrency,
+fallback behavior, journal restart
 recovery, archive parity/export and mixed-tier queries, hold/dry-run/token
-safety, verified backup retention, checksums/pg_stat, and storage/resource
-metrics. Restore testing remains a coordinated isolated drill.
+safety, authenticated HMAC/epoch/regular backup markers, supported re-verification,
+daily-journal confirmation receipts, exact tags/running image IDs/OCI labels and
+checksum plus all three deployment-bound storage-root markers, stable private
+deployment lock rejection, exact WAL command and packaged/running helper hashes,
+atomic no-replace hard-link WAL publication, no archive/WAL partial artifacts,
+controlled stale-activation rollback with
+exact-row retry ownership, deployed archive/WAL helper behavior,
+checksums/pg_stat, and storage/resource metrics.
+
+Only when the user has explicitly authorized a destructive isolated recovery
+test and all documented acknowledgements are present, run
+`npm run test:restore-drill` separately. Require pre-backup canaries to return
+across the database, application state, archive, WAL, `.env`, secrets, and TLS;
+require healthy services, archive verification, and unchanged immutable image
+IDs. The acknowledged storage planes must resolve exactly and remain distinct
+and non-overlapping. Never reinterpret a smoke/full request as restore
+authorization.
 
 The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
 they do not disconnect cameras or mutate SensorHub. The full profile separately
 requires real Dashboard transitions during reserved-RPM stop/restart, fault
 injection/clear, in-place tamper clear, and extended occupancy. Do not describe
 this as live camera disconnect/reconnect coverage.
+
+The live smoke Tamper baseline is not a response fixture. It requires each
+emulator RPM to explicitly model `tamper_fault=false` and the Dashboard to
+resolve every lane without Tamper Unknown after OSCAR's Rapiscan driver publishes
+its required initial clear observation for each newly established connection,
+before processing later `TT`/`TC` messages. Never infer Tamper clear from an
+Online icon or bulk toggle Tamper to seed observations.
 
 For diagnosis, pass a scenario filter such as:
 ./scripts/run-regression.sh full --scenario rpm-faults,adjudication

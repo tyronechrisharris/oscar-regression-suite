@@ -32,6 +32,7 @@ import {
   assessStoragePlatform,
   encodeOshBigId,
   parseCollectionIds,
+  storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
 } from "./storage-oracles.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
@@ -314,6 +315,10 @@ export class RegressionScenarios {
       await this.restoreReservedLane();
     }
     await this.scenario("storage-lifecycle", () => this.storageLifecycle());
+  }
+
+  async runRestoreDrill(): Promise<void> {
+    await this.scenario("storage-restore-drill", () => this.storageRestoreDrill());
   }
 
   async emergencyCleanup(): Promise<void> {
@@ -2850,23 +2855,26 @@ export class RegressionScenarios {
       const platform = await this.check({
         scenario: "storage-health", category: "storage-platform", action: "verify PostgreSQL and storage controls",
         target: this.config.targetHost,
-        expected: "the 3.9.2 storage profile has checksums, pg_stat_statements, schema v4, checksum marker, batched inserts, and daily journal enabled",
+        expected: "the running images, deployment/root identities, stable lock, exact WAL command, packaged helpers, and complete 3.9.2 storage profile match",
       }, async () => {
         const value = assessStoragePlatform(await probe.runJson("platform"));
-        const passed = value.dataChecksums === "on" && value.pgStatStatementsInstalled &&
-          value.pgStatStatementsPreloaded && value.schemaVersion >= 4 && value.archiveMarkerPresent &&
-          value.batchRewriteConfigured && value.dailyJournalConfigured;
+        const release = this.config.storageExpectedRelease;
+        const passed = storagePlatformHasExactReleaseIdentity(value, release) && value.dataChecksums === "on" &&
+          value.pgStatStatementsInstalled && value.pgStatStatementsPreloaded &&
+          value.schemaVersion >= 4 && value.batchRewriteConfigured &&
+          value.dailyJournalConfigured;
         return {passed, value, observed: JSON.stringify(value)};
       });
 
       await this.check({
         scenario: "storage-health", category: "cold-archive", action: "verify archive catalog and object checksums",
         target: this.config.targetHost,
-        expected: "archive catalog has no failed jobs, parity failures, incomplete objects, or checksum errors",
+        expected: "archive catalog has no failed jobs, parity failures, incomplete objects, checksum errors, or archive/WAL partial artifacts",
       }, async () => {
         const value = assessArchiveHealth(await probe.runJson("archive-health"));
         return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
-          value.incompleteActiveObjects === 0 && value.checksumVerificationPassed,
+          value.incompleteActiveObjects === 0 && value.archivePartialArtifacts === 0 &&
+          value.walPartialArtifacts === 0 && value.checksumVerificationPassed,
         observed: JSON.stringify(value)};
       });
 
@@ -2896,32 +2904,121 @@ export class RegressionScenarios {
       } else {
         const page = await this.browser.oscarPage();
         try {
+          // Establish a same-origin authenticated document before exercising
+          // browser-native fetch/createImageBitmap. A blank about:blank page
+          // would otherwise turn the decode into a cross-origin CORS probe.
+          await this.goto(page, "/dashboard");
           await this.check({scenario: "storage-health", category: "retained-media",
             action: "verify exact-five retained JPEG API", target: eventId,
-            expected: "each retained camera has exactly five canonical, hash-valid JPEG frames"}, async () => {
+            expected: "each retained camera has five quality-85, bounded baseline JPEGs whose hashes, dimensions, content types, and Chromium decodes match"}, async () => {
             const response = await page.context().request.get(this.viewerUrl(
               `/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`));
-            if (!response.ok()) throw new Error(`retained-media API returned HTTP ${response.status()}`);
-            const assessment = assessRetainedMediaResponse(await response.json(), eventId);
+            let assessment: ReturnType<typeof assessRetainedMediaResponse>;
+            try {
+              if (!response.ok()) throw new Error(`retained-media API returned HTTP ${response.status()}`);
+              assessment = assessRetainedMediaResponse(await response.json(), eventId);
+            } finally {
+              await response.dispose();
+            }
             let valid = 0;
             for (const asset of assessment.assets) {
-              const image = await page.context().request.get(this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`));
-              const bytes = Buffer.from(await image.body());
-              if (image.ok() && assessJpeg(bytes, asset.bytes, asset.sha256)) valid++;
-              await image.dispose();
+              const imageUrl = this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`);
+              const image = await page.context().request.get(imageUrl);
+              try {
+                const bytes = Buffer.from(await image.body());
+                const contentType = (image.headers()["content-type"] ?? "").split(";", 1)[0]?.trim();
+                const structureValid = image.ok() && contentType === asset.contentType &&
+                  assessJpeg(bytes, asset.bytes, asset.sha256, asset.width, asset.height);
+                const decoded = structureValid ? await page.evaluate(async ({url, width, height}) => {
+                  const decodedResponse = await fetch(url, {credentials: "include", cache: "no-store"});
+                  if (!decodedResponse.ok) return {valid: false, status: decodedResponse.status};
+                  const blob = await decodedResponse.blob();
+                  if (blob.type !== "image/jpeg") return {valid: false, status: decodedResponse.status};
+                  try {
+                    const bitmap = await createImageBitmap(blob);
+                    const dimensionsMatch = bitmap.width === width && bitmap.height === height;
+                    bitmap.close();
+                    return {valid: dimensionsMatch, status: decodedResponse.status};
+                  } catch {
+                    return {valid: false, status: decodedResponse.status};
+                  }
+                }, {url: imageUrl, width: asset.width, height: asset.height}) : {valid: false, status: image.status()};
+                if (structureValid && decoded.valid) valid++;
+              } finally {
+                await image.dispose();
+              }
             }
-            return {passed: valid === assessment.frameCount,
-              observed: `${assessment.mediaSetCount} camera set(s), ${assessment.frameCount} frames, ${valid} valid JPEGs`};
+            const qualitiesValid = assessment.jpegQualities.every(quality => quality === 85);
+            return {passed: qualitiesValid && valid === assessment.frameCount,
+              observed: `${assessment.mediaSetCount} camera set(s), ${assessment.frameCount} frames, ` +
+                `${valid} statically and browser-decodable JPEGs; qualities=${assessment.jpegQualities.join(",")}`};
           });
           await this.check({scenario: "storage-health", category: "viewer", action: "render retained-media gallery",
-            target: eventId, expected: "Event Details renders a five-frame gallery per retained camera"}, async () => {
+            target: eventId, expected: "Event Details renders five choices per camera while lazily fetching only selected frames"}, async () => {
+            const framePattern = /\/media\/[^/]+\/[^/]+\/frame-0[1-5]\.jpg(?:\?|$)/;
+            const frameRequests: string[] = [];
+            let inFlightFrameRequests = 0;
+            let peakInFlightFrameRequests = 0;
+            await page.route(framePattern, async route => {
+              frameRequests.push(route.request().url());
+              inFlightFrameRequests++;
+              peakInFlightFrameRequests = Math.max(peakInFlightFrameRequests, inFlightFrameRequests);
+              try {
+                // Hold the request briefly so the scheduler's real in-flight
+                // bound is observable even on a fast local test network.
+                await sleep(150);
+                await route.continue();
+              } finally {
+                inFlightFrameRequests--;
+              }
+            });
             const node = this.config.storageEventNodeId ? `&nodeId=${encodeURIComponent(this.config.storageEventNodeId)}` : "";
             await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}${node}`);
             await page.getByTestId("retained-media-gallery").waitFor({timeout: this.config.eventTimeoutMs});
             const cameras = await page.getByTestId("retained-media-camera").count();
             const thumbnails = await page.getByTestId("retained-media-thumbnail").count();
-            return {passed: cameras > 0 && thumbnails === cameras * 5,
-              observed: `${cameras} camera group(s), ${thumbnails} thumbnails`,
+            if (cameras > 0) {
+              await poll(
+                () => page.getByTestId("retained-media-main-image").evaluateAll((images, expected) =>
+                  images.length === expected && images.every(image =>
+                    image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0 &&
+                    image.naturalHeight > 0), cameras),
+                Boolean,
+                {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100,
+                  description: "initial retained frames to load and decode in the gallery"},
+              );
+            }
+            const initialRequests = frameRequests.length;
+            let selectedFrameLoaded = false;
+            let selectedFrameRequested = false;
+            if (thumbnails >= 5) {
+              const firstCamera = page.getByTestId("retained-media-camera").first();
+              const mainImage = firstCamera.getByTestId("retained-media-main-image");
+              const initialSource = await mainImage.getAttribute("src");
+              const initialMetadata = await firstCamera.getByTestId("retained-media-frame-metadata").innerText();
+              await firstCamera.getByTestId("retained-media-thumbnail").nth(4).click();
+              const selected = await poll(async () => {
+                const source = await mainImage.getAttribute("src").catch(() => null);
+                const metadata = await firstCamera.getByTestId("retained-media-frame-metadata").innerText();
+                const loaded = await mainImage.evaluate(image => image instanceof HTMLImageElement &&
+                  image.complete && image.naturalWidth > 0 && image.naturalHeight > 0).catch(() => false);
+                return {source, metadata, loaded};
+              }, value => Boolean(value.loaded && value.source && value.source !== initialSource &&
+                  value.metadata !== initialMetadata),
+              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100,
+                description: "selected retained frame content to load and replace the initial image"});
+              selectedFrameLoaded = Boolean(selected.loaded);
+              selectedFrameRequested = frameRequests.slice(initialRequests)
+                .some(url => /\/frame-05\.jpg(?:\?|$)/.test(url));
+            }
+            return {passed: cameras > 0 && thumbnails === cameras * 5 &&
+                initialRequests === cameras && peakInFlightFrameRequests > 0 &&
+                peakInFlightFrameRequests <= 3 && frameRequests.length === initialRequests + 1 &&
+                selectedFrameRequested && selectedFrameLoaded,
+              observed: `${cameras} camera group(s), ${thumbnails} choices, ` +
+                `${initialRequests} initial frame request(s), ${frameRequests.length} after selection, ` +
+                `peak in-flight=${peakInFlightFrameRequests}, selected requested=${selectedFrameRequested}, ` +
+                `selected loaded=${selectedFrameLoaded}`,
               evidence: await this.browser.screenshot(page, "retained-media-five-frame-gallery")};
           });
         } finally { await page.close(); }
@@ -2963,29 +3060,52 @@ export class RegressionScenarios {
     let apiPage: Page | undefined;
     try {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
-      await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
+      const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
-        expected: "archive deletion is enabled with a one-day rollback grace only on this disposable test deployment"}, async () => ({
-          passed: platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
-            platform.archiveIntervalMinutes === 1,
+        expected: "the exact OSCAR 3.9.2 release is running and archive deletion is enabled with a one-day rollback grace only on this disposable test deployment"}, async () => {
+        const passed = storagePlatformHasExactReleaseIdentity(platform, this.config.storageExpectedRelease) &&
+            platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
+            platform.archiveIntervalMinutes === 1;
+        return {
+          passed,
+          value: passed,
           observed: JSON.stringify(platform),
-        }));
+        };
+      });
+      if (!profileAccepted) {
+        throw new Error("Storage lifecycle mutation refused because the exact accelerated 3.9.2 profile failed");
+      }
       this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
       const fixture = await probe.runJson<{coldId: number; hotId: number; datastreamId: number;
-        coldTime: string; hotTime: string}>("fixture-create", [fixtureRun, String(this.config.storageHotRetentionDays)]);
+        coldTime: string; hotTime: string; activationBlocked: boolean; sourceMutated: boolean;
+        staleActivationRejected: boolean; staleRowUnmarked: boolean}>(
+          "fixture-create-race", [fixtureRun, String(this.config.storageHotRetentionDays)]);
       fixtureCreated = true;
+      await this.check({scenario: "storage-lifecycle", category: "cold-archive",
+        action: "reject concurrent source change during archive activation", target: String(fixture.coldId),
+        expected: "a controlled source-row change after export makes activation roll back without marking the stale row"}, async () => ({
+        passed: fixture.activationBlocked && fixture.sourceMutated && fixture.staleActivationRejected &&
+          fixture.staleRowUnmarked,
+        observed: JSON.stringify(fixture),
+      }));
       const archived = await poll(
         () => probe.runJson<{generationId: string | null; generationState: string | null;
-          parityVerified: boolean; generationRows: number}>(
+          parityVerified: boolean; generationRows: number; generationMinId: number | null;
+          generationMaxId: number | null; markedRows: number; fixtureColdMarked: boolean;
+          fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
           "fixture-status", [fixtureRun]),
         value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
-          value.parityVerified && value.generationRows === 1),
+          value.parityVerified && value.generationRows === 1 && value.markedRows === 1 &&
+          value.fixtureColdMarked && value.fixtureHotUnmarked && value.exactRowOwnership),
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "synthetic cold observation to enter a parity-verified archive generation"},
+          description: "the retried exact source row to enter one parity-verified archive generation"},
       );
       await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
-        target: String(fixture.coldId), expected: "the cold fixture is in an ACTIVE parity-verified generation"}, async () => ({
-          passed: Boolean(archived.generationId && archived.parityVerified), observed: JSON.stringify(archived),
+        target: String(fixture.coldId),
+        expected: "only the exact exported cold row is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
+          passed: Boolean(archived.generationId && archived.parityVerified && archived.exactRowOwnership &&
+            archived.markedRows === 1 && archived.generationMinId === fixture.coldId &&
+            archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
         }));
       await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
         target: archived.generationId ?? "fixture generation",
@@ -2993,6 +3113,22 @@ export class RegressionScenarios {
         const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
         return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
           value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
+      });
+      await this.check({scenario: "storage-lifecycle", category: "portability",
+        action: "exercise deployed archive-object helper", target: archived.generationId ?? "fixture generation",
+        expected: "the image helper verifies and copies a cataloged object by hash and rejects checksum mismatch and traversal"}, async () => {
+        const value = await probe.runJson<Record<string, unknown>>("archive-helper-check", [fixtureRun]);
+        const passed = ["verified", "copied", "copyChecksumValid", "mismatchRejected", "traversalRejected"]
+          .every(field => value[field] === true);
+        return {passed, observed: JSON.stringify(value)};
+      });
+      await this.check({scenario: "storage-lifecycle", category: "wal-archive",
+        action: "exercise deployed WAL publication helper", target: this.config.targetHost,
+        expected: "a synthetic disposable history file publishes durably, retries idempotently, rejects different bytes, leaves no partial, and is removed"}, async () => {
+        const value = await probe.runJson<Record<string, unknown>>("wal-helper-check", [fixtureRun]);
+        const passed = ["published", "idempotentRetry", "mismatchRejected", "originalPreserved", "fixtureRemoved"]
+          .every(field => value[field] === true) && value.partialArtifacts === 0;
+        return {passed, observed: JSON.stringify(value)};
       });
 
       apiPage = await this.browser.oscarPage();
@@ -3033,6 +3169,15 @@ export class RegressionScenarios {
           .every(key => value[key] === true);
         return {passed, observed: JSON.stringify(value)};
       });
+      await this.check({scenario: "storage-lifecycle", category: "cold-archive",
+        action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
+        expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
+        const value = assessArchiveHealth(await probe.runJson("archive-health"));
+        return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
+          value.incompleteActiveObjects === 0 && value.archivePartialArtifacts === 0 &&
+          value.walPartialArtifacts === 0 && value.checksumVerificationPassed,
+        observed: JSON.stringify(value)};
+      });
       await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
         target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
         const value = await probe.runJson<{healthy: boolean; partialFiles: number; recoveryErrors: number}>("journal-restart");
@@ -3042,9 +3187,12 @@ export class RegressionScenarios {
       if (this.config.storageBackupWorkflow !== "disabled") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
-          expected: "backup is created, verified, cataloged, and retention-limited without attempting restore"}, async () => {
+          expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
           const value = await probe.runJson<Record<string, unknown>>("backup-check");
-          return {passed: value.automaticVerification === true && value.verifiedEpoch === true &&
+          return {passed: value.automaticVerification === true && value.supportedVerification === true &&
+            value.authenticatedManifest === true && value.regularMarkers === true && value.epochValid === true &&
+            value.verifiedEpoch === true && Number(value.journalReceipts) > 0 &&
+            value.journalReceiptReferencesValid === true &&
             value.retentionRespected === true && value.restoreAttempted === false, observed: JSON.stringify(value)};
         });
       }
@@ -3055,6 +3203,86 @@ export class RegressionScenarios {
       if (apiPage) await apiPage.close().catch(() => undefined);
       if (fixtureCreated) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
         this.reporter.error("storage-lifecycle", "fixture-cleanup", error));
+      await probe.cleanup();
+    }
+  }
+
+  private async storageRestoreDrill(): Promise<void> {
+    if (this.storageUnavailable("storage-restore-drill")) return;
+    const probe = new StorageProbeClient(this.config, this.reporter.runId);
+    const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
+    try {
+      const before = assessStoragePlatform(await probe.runJson("platform"));
+      const identityAccepted = await this.check({
+        scenario: "storage-restore-drill",
+        category: "restore",
+        action: "verify exact release identity before destructive restore",
+        target: this.config.targetHost,
+        expected: "the isolated target is running exact OSCAR/PostGIS 3.9.2 images and the pinned gateway",
+      }, async () => {
+        const release = this.config.storageExpectedRelease;
+        const passed = storagePlatformHasExactReleaseIdentity(before, release);
+        return {passed, value: passed, observed: JSON.stringify(before)};
+      });
+      if (!identityAccepted) throw new Error("Destructive restore refused because exact 3.9.2 identity failed");
+
+      await this.check({
+        scenario: "storage-restore-drill",
+        category: "restore",
+        action: "restore authenticated backup over isolated deployment",
+        target: this.config.targetHost,
+        expected: "database, OSCAR state, cold archive, WAL, credentials/TLS, service health, and archive verification all return to the pre-backup canaries",
+      }, async () => {
+        const value = await probe.runJson<Record<string, unknown>>(
+          "restore-drill",
+          [
+            fixtureRun,
+            `${fixtureRun}:DESTRUCTIVE-RESTORE`,
+            this.config.restoreArchiveDirectory ?? "missing",
+            this.config.restoreWalArchiveDirectory ?? "missing",
+            this.config.restoreBackupDirectory ?? "missing",
+          ],
+        );
+        const passed = [
+          "databaseRestored", "applicationStateRestored", "archiveRestored", "walRestored",
+          "credentialsRestored", "servicesHealthy", "archiveVerified", "allCanariesRestored",
+        ].every(field => value[field] === true) &&
+          typeof value.backupId === "string" && typeof value.preRestoreSafetyDirectory === "string";
+        return {passed, observed: JSON.stringify(value)};
+      });
+
+      const after = assessStoragePlatform(await probe.runJson("platform"));
+      await this.check({
+        scenario: "storage-restore-drill",
+        category: "restore",
+        action: "verify immutable image identity after restore",
+        target: this.config.targetHost,
+        expected: "restore restarts the exact same immutable application, PostGIS, and gateway image IDs",
+      }, async () => ({
+        passed: storagePlatformHasExactReleaseIdentity(
+          after,
+          this.config.storageExpectedRelease,
+        ) && after.appImage.containerImageId === before.appImage.containerImageId &&
+          after.postgisImage.containerImageId === before.postgisImage.containerImageId &&
+          after.gatewayImage.containerImageId === before.gatewayImage.containerImageId,
+        observed: JSON.stringify({
+          before: {
+            app: before.appImage.containerImageId,
+            postgis: before.postgisImage.containerImageId,
+            gateway: before.gatewayImage.containerImageId,
+          },
+          after: {
+            app: after.appImage.containerImageId,
+            postgis: after.postgisImage.containerImageId,
+            gateway: after.gatewayImage.containerImageId,
+          },
+        }),
+      }));
+      this.reporter.storageMetric(storageMetricFromProbe(
+        "storage-restore-drill-after",
+        await probe.runJson("snapshot"),
+      ));
+    } finally {
       await probe.cleanup();
     }
   }

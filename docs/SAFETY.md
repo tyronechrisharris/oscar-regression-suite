@@ -36,6 +36,31 @@ verified backups according to the target's configured count; restore is never
 attempted. Do not enable this path on production or a target containing data
 that must be preserved.
 
+The only restore coverage is the separately selected `restore-drill` profile.
+It is rejected unless `STORAGE_WORKFLOW=required`, the ordinary target and
+disposable-storage acknowledgements pass, all three storage-plane directories
+are canonical, dedicated, and non-overlapping, and all additional values match:
+
+```text
+OSCAR_RESTORE_TARGET_ACK=test-host|tester@test-host|/absolute/disposable/release|ISOLATED-RESTORE
+OSCAR_RESTORE_DISPOSABLE_ACK=test-host:DISPOSABLE-NO-PRODUCTION-DATA
+OSCAR_RESTORE_DATA_LOSS_ACK=I-ACCEPT-DESTRUCTIVE-RESTORE
+OSCAR_RESTORE_ARCHIVE_DIR=/srv/oscar-restore/archive
+OSCAR_RESTORE_WAL_ARCHIVE_DIR=/srv/oscar-restore/wal-archive
+OSCAR_RESTORE_BACKUP_DIR=/srv/oscar-restore/backups
+OSCAR_RESTORE_PATHS_ACK=/srv/oscar-restore/archive|/srv/oscar-restore/wal-archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS
+```
+
+These are interlocks, not permission to use real data. The drill deliberately
+overwrites the current PostgreSQL cluster, OSCAR state, cold archive, WAL
+archive, `.env`, secrets, and TLS with a newly created backup. It uses scoped
+canaries to prove each plane returned, cleans those canaries after success, and
+leaves the verified backup plus a mode-0700 `pre-restore-ID` safety directory
+containing plaintext pre-restore deployment credentials for manual review.
+Restrict and remove that directory under the disposable site's approved policy.
+Never place those acknowledgements in a normal runner `.env`.
+Never run the profile against a target whose loss would matter.
+
 The lane CSV is read-only during a suite run. Apply it only while provisioning
 the authorized disposable regression system. OSCAR's spreadsheet import is
 additive: rows whose `UniqueID` already exists are skipped, not updated. On a

@@ -1,6 +1,6 @@
 import type {LaneConfigOracle} from "./lane-config.js";
 
-export type Profile = "smoke" | "full";
+export type Profile = "smoke" | "full" | "restore-drill";
 
 export type CapabilityMode = "auto" | "required" | "disabled";
 
@@ -40,6 +40,13 @@ export interface SuiteConfig {
   storageExpectedRelease: "3.9.2";
   storageBackupWorkflow: CapabilityMode;
   storageTargetAcknowledgement: string;
+  restoreTargetAcknowledgement: string;
+  restoreDisposableAcknowledgement: string;
+  restoreDataLossAcknowledgement: string;
+  restorePathsAcknowledgement: string;
+  restoreArchiveDirectory?: string;
+  restoreWalArchiveDirectory?: string;
+  restoreBackupDirectory?: string;
   oscarReleaseDirectory?: string;
   storageRetainedEventId?: string;
   storageLegacyEventId?: string;

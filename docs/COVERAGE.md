@@ -31,12 +31,14 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Extended occupancy | duration over configured threshold faults, then clears on Status of Health and the Dashboard | full | reserved RPM only |
 | Adjudication report | one-lane PDF is generated and validated | full | report bucket write |
 | Performance | runner plus optional host/container time series and aggregates | both | read-only SSH |
-| Storage platform | OSCAR 3.9.2 data checksums, pg_stat_statements, schema v4, initialization marker, batch rewrite, archive checksum/catalog/parity health, and storage counters | smoke | read-only SSH |
-| Retained media | exact five canonical, independently decodable and hash-valid JPEGs per camera; Viewer gallery; legacy-video fallback on retained API 404 | smoke | none |
+| Storage platform | exact 3.9.2 app/PostGIS tags and OCI labels, pinned gateway tag, running/local immutable image IDs and available digests, exact checksum marker plus three deployment/kind-bound storage-root v1 markers and modes, stable private deployment lock with concurrent-command rejection, packaged/running app and WAL helper hash parity, exact PostgreSQL `archive_command`, no archive/WAL partial artifacts, data checksums, pg_stat_statements, schema v4, batch rewrite, archive checksum/catalog/parity health, and storage counters | smoke | read-only SSH |
+| Retained media | exact five quality-85 canonical, hash-valid bounded baseline JPEGs per camera; every frame independently decodes in Chromium at its declared dimensions; strict streaming catalog/frame and event resource budgets; lazy selected-frame Viewer loading with a measured three-request concurrency ceiling and decoded content replacement; legacy-video fallback on retained API 404 | smoke | none |
 | Daily files | publication/manifest completeness with no partials; restart recovery in full | both | OSCAR restart in full |
-| Tiered archive | deterministic cold fixture, parity, portable export, cold-by-ID and mixed hot/cold query, grace/seal/hot deletion | full | registered disposable rows only |
+| Tiered archive | deterministic cold fixture; controlled post-export source-row race with stale activation rollback and exact one-row retry ownership; parity; packaged CLI export/purge helper wiring plus deployed helper verify/copy/rejection checks; portable export; cold-by-ID and mixed hot/cold query; grace/seal/hot deletion | full | registered disposable rows only |
+| WAL publication | packaged flushed-temp atomic no-replace hard-link contract; deployed helper first publish, byte-identical retry, different-byte hard rejection, partial cleanup, and exact synthetic-file removal | full | collision-checked disposable history fixture only |
 | Retention safety | hold create/list/release; dry run; wrong-token immutability; exact-plan purge, tombstone, ledger, replay rejection | full | one guarded fixture generation only |
-| Backup | coordinated creation, automatic verification/catalog epoch, count retention; no restore | full | backup creation/pruning only |
+| Backup | coordinated creation; regular authenticated HMAC/checksum/epoch/VERIFIED markers; exact 3.9.2 epoch; supported re-verification; VERIFIED catalog row; daily-journal receipts bound to the authenticated app-state checksum; count retention; no restore | full | backup creation/pruning only |
+| Restore drill | exact-release preflight; pre-backup and post-mutation canaries across database, application state, archive, WAL, `.env`, secrets, and TLS; supported destructive restore; service/archive/image postchecks | restore-drill only | overwrites the isolated deployment from a new backup |
 
 ## Deliberate exclusions
 
@@ -61,8 +63,10 @@ external, or depend on nondeterministic operating-system UI:
 - applying operational-view metadata inside a run; the tracked 50-lane CSV must
   be applied while provisioning the disposable site, then the suite reads that
   same file as its membership oracle
-- destructive backup restore (run it separately on another isolated target),
-  production retention changes, broad archive purge, and physical/production data
+- destructive backup restore in smoke/full (the separately path-bound,
+  four-acknowledgement `restore-drill` profile covers only an isolated
+  disposable target), production retention changes, broad archive purge, and
+  physical/production data
 
 These require a disposable deployment and a separate, explicit test plan.
 
@@ -72,7 +76,8 @@ These require a disposable deployment and a separate, explicit test plan.
 `status-of-health`, `dashboard-health`, `lane-video`, `event-filtering`, `operational-views`,
 `reporting`, `alarm-transfer`, `alarm-transfer-camera`, `rpm-connection`,
 `rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `extended-occupancy`,
-`adjudication-report`, `storage-health`, and `storage-lifecycle`.
+`adjudication-report`, `storage-health`, `storage-lifecycle`, and the isolated
+`storage-restore-drill` scenario selected only by `--profile restore-drill`.
 
 `dashboard-health` is a read-only browser scenario. It verifies the complete
 lane/RPM/camera inventory and live Online state, then intercepts only the

@@ -6,8 +6,9 @@ faults and alarms; validates adjudication and reporting; and emits machine-reada
 correctness and performance results.
 
 The harness was first validated against OSCAR 3.9.1 and the 50-lane emulator
-site. It is configuration-driven so later builds can be tested without changing
-source.
+site. General target and workflow selection is configuration-driven. Each new
+storage release contract remains deliberately version-pinned and requires a
+source review before the suite can certify that version.
 
 > **Test environments only.** The `full` profile stops and restarts the reserved
 > RPM, temporarily replaces its configuration, forces connection and fault
@@ -46,10 +47,19 @@ source.
   Health-navigation query persistence, and malformed/unassigned inputs failing closed
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
-- OSCAR 3.9.2 exact-five retained JPEG API/gallery and legacy-video fallback;
+- OSCAR 3.9.2 exact-five retained JPEG API/gallery, bounded catalog/frame
+  transfers and event resource budgets, baseline-JPEG structure plus Chromium
+  decode/dimension checks for every frame, lazy selected-frame requests, and
+  legacy-video fallback;
   durable daily-file publications and restart recovery; archive catalog,
   checksum, parity, portable export, hot/cold query, hold, tokenized purge, and
-  coordinated-backup controls; PostgreSQL checksums, `pg_stat_statements`, and
+  authenticated coordinated-backup controls and daily-journal receipts;
+  exact application/PostGIS/gateway tags, immutable running image IDs,
+  available repository digests, OCI labels, checksum and all three deployment-bound
+  storage-root markers, stable lock rejection, exact WAL command, atomic no-replace
+  hard-link publication, and packaged helper hashes/behavior, no archive/WAL
+  partial artifacts, exact-row activation under a
+  controlled source-change race, PostgreSQL checksums, `pg_stat_statements`, and
   observation batch/resource counters
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
@@ -83,8 +93,9 @@ Read [docs/SAFETY.md](docs/SAFETY.md) before the first full run.
 - Chrome/Chromium, or a Playwright-managed Chromium installation
 - network access to OSCAR and the RPM emulator
 - an OSCAR test account
-- optional: strict-key-checked SSH access to the OSCAR Docker host for container
-  performance sampling
+- strict-key-checked SSH access to the OSCAR Docker host when the default
+  `STORAGE_WORKFLOW=required` release gate is used; it is optional only for an
+  explicit legacy/non-storage run with `STORAGE_WORKFLOW=auto` or `disabled`
 
 ## Quick start
 
@@ -108,6 +119,16 @@ Then run the configured full profile on an acknowledged test target:
 
 ```bash
 npm run test:full
+```
+
+The destructive restore drill is deliberately not part of either command. It
+has its own profile, target lock, storage acknowledgement, three explicit
+canonical storage-plane paths, and four additional exact acknowledgements. Run
+it only after reviewing
+[docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md):
+
+```bash
+npm run test:restore-drill
 ```
 
 Run one or more named scenarios with a comma-separated filter:
@@ -135,7 +156,7 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_LANE_CONFIG_PATH` | current-schema lane CSV used both to provision the test site and as the membership oracle |
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
 | `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
-| `STORAGE_WORKFLOW` | `auto`, `required`, or `disabled` for the OSCAR 3.9.2 storage profile |
+| `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.9.2 storage profile |
 | `OSCAR_RELEASE_DIR` | absolute release path on the disposable OSCAR SSH target |
 | `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>:<release-dir>:DISPOSABLE-STORAGE` lifecycle interlock |
 
@@ -171,7 +192,8 @@ view query through the real Status of Health navigation link—as a release fail
 The explicit `auto` mode remains compatible with older Viewers by recording a
 skip only when the workflow itself is absent.
 
-`OSCAR_SSH_TARGET` enables read-only Docker/host performance sampling.
+`OSCAR_SSH_TARGET` enables Docker/host performance sampling and is required by
+the OSCAR 3.9.2 storage-health and storage-lifecycle gates.
 `OSCAR_SSH_IDENTITY_FILE` may point to a dedicated least-privilege key.
 `BROWSER_EXECUTABLE_PATH` can select a preinstalled Chrome binary on a runner.
 
@@ -183,6 +205,18 @@ does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture; backup verification can be disabled separately
 with `STORAGE_BACKUP_WORKFLOW=disabled`. See
 [docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md).
+
+`restore-drill` is a separate destructive profile and cannot be selected by a
+smoke/full scenario filter. In addition to the ordinary target and storage
+acknowledgements, it requires exact `OSCAR_RESTORE_TARGET_ACK`,
+`OSCAR_RESTORE_DISPOSABLE_ACK`, `OSCAR_RESTORE_DATA_LOSS_ACK`, and
+`OSCAR_RESTORE_PATHS_ACK` values. The last binds three supplied canonical,
+non-overlapping archive, WAL, and backup directories to the authorization. It
+creates an authenticated 3.9.2 backup, mutates isolated canaries across the
+database, application state, archive, WAL, `.env`, secrets, and TLS, invokes the
+supported restore command, and requires every canary plus all service health,
+archive verification, and immutable image identities to return. The test backup
+and `pre-restore-<backup-id>` safety directory are preserved for operator review.
 
 ## Results
 
