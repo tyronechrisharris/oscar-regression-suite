@@ -549,6 +549,21 @@ journal_prefix_matches "$1" "$2" "$3"`, "prefix", digest, String(original.length
   }
 });
 
+test("journal restart exercises dependency-ordered launcher shutdown", () => {
+  const block = probe.slice(
+    probe.indexOf("  journal-restart)"),
+    probe.indexOf("  fixture-create)", probe.indexOf("  journal-restart)")),
+  );
+  assert.match(block, /sudo bash oscar[.]sh restart/);
+  assert.doesNotMatch(block, /compose restart oscar/);
+  assert.match(block, /compose logs --since "\$restart_started" oscar postgres/);
+  for (const required of [
+    "BasicEventHandler", "DataStreamTransactionHandler", "DatabasePurger",
+    "ModuleRegistry", "terminating connection due to administrator command",
+    '"shutdownErrors":%s',
+  ]) assert.ok(block.includes(required), `missing ordered-restart oracle: ${required}`);
+});
+
 test("media metadata probe validates compact checkpoint and exact binary indexes", () => {
   const start = probe.indexOf("media_metadata_health_json()");
   const end = probe.indexOf("\n}\n", start);

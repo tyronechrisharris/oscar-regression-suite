@@ -1812,7 +1812,12 @@ case $action in
     segments_before=$(wc -l <"$before_inventory" | tr -d '[:space:]')
     [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 512 ]] ||
       fail 'Pre-restart segment inventory is empty or exceeds its bound.'
-    compose restart oscar >/dev/null
+    restart_started=$(date --iso-8601=seconds)
+    restart_log=$restart_work/supported-restart.log
+    if ! sudo bash oscar.sh restart >"$restart_log" 2>&1; then
+      emit_command_diagnostics 'Supported OSCAR restart' "$restart_log"
+      fail 'The supported whole-deployment restart failed.'
+    fi
     deadline=$((SECONDS+180)); healthy=false
     while ((SECONDS < deadline)); do
       state=$(compose ps --format json oscar 2>/dev/null | grep -o '"Health":"[^"]*"' | head -n1 || true)
@@ -1858,9 +1863,15 @@ case $action in
       else segment_failures=$((segment_failures+1)); fi
     done <"$before_inventory"
     partial=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) 2>/dev/null | wc -l')
-    recovery_errors=$(compose logs --since 5m oscar 2>&1 | grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' || true)
-    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s}\n' \
-      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors"
+    restart_service_log=$restart_work/restart-services.log
+    if ! compose logs --since "$restart_started" oscar postgres >"$restart_service_log" 2>&1; then
+      emit_command_diagnostics 'Supported restart service-log collection' "$restart_service_log"
+      fail 'Could not collect the exact supported-restart service log window.'
+    fi
+    recovery_errors=$(grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' "$restart_service_log" || true)
+    shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)|FATAL:.*terminating connection due to administrator command' "$restart_service_log" || true)
+    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s}\n' \
+      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors"
     cleanup_journal_restart
     trap - EXIT
     ;;

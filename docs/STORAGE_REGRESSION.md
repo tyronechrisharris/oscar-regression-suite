@@ -246,14 +246,19 @@ derives the journal directory from the full canonical lane UID, and requires
 that lane's direct
 `{lane-directory}/{configured-zone-date}/{six-digit}.open|seg` bytes to
 advance. Those bytes and safe layout
-must survive the OSCAR restart. This is evidence of direct live journal capture,
+must survive the supported whole-deployment launcher restart. That restart also
+requires PostgreSQL to remain available through OSCAR's bounded shutdown: the
+post-start log window must contain no `BasicEventHandler`, transaction-handler,
+database-purger, module-timeout, or PostgreSQL administrator-termination failure.
+This is evidence of direct live journal capture,
 not a renamed or fabricated publication.
 
 The smoke check requires either eligible published CSV/manifest pairs or the
 strict durable-current-day state described above, and no partial artifacts;
 archive health also rejects `*.partial`, `*.partial.*`, `*.tmp`, and `*.tmp.*`
-artifacts anywhere below the external archive or WAL roots. The full run restarts
-OSCAR and rejects recovery errors or partial publications, then repeats the
+artifacts anywhere below the external archive or WAL roots. The full run uses the
+supported launcher to restart gateway, OSCAR, and PostgreSQL in dependency order
+and rejects shutdown/recovery errors or partial publications, then repeats the
 archive/WAL partial scan after helper, export, and purge coverage.
 Do not fabricate or rename production daily files for this test.
 

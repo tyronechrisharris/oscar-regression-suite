@@ -142,7 +142,9 @@ MiB memory, two-thread, 4,096 MiB spill, two-session process-wide admission,
 `/var/lib/oscar/duckdb-tmp`; prove the scratch is excluded from backup. Require
 the exact direct-daily-file config, a reserved-lane UID append caused by a real
 emulator transition, exact bounded 12-key publication manifests, and byte
-durability after restart.
+durability after the supported whole-deployment restart. The restart gate must
+also report zero database/module shutdown errors so a concurrent PostgreSQL stop
+cannot pass merely because services later become healthy.
 
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode

@@ -4057,6 +4057,7 @@ export class RegressionScenarios {
           segmentFailures: number;
           partialFiles: number;
           recoveryErrors: number;
+          shutdownErrors: number;
         }>("journal-restart", [directJournalLaneUid!]);
         const lane = await probe.runJson<DirectJournalLaneState>(
           "journal-lane-state",
@@ -4070,7 +4071,8 @@ export class RegressionScenarios {
           value.segmentsChecked > 0 && value.segmentsPreserved === value.segmentsChecked &&
           value.segmentFailures === 0;
         return {passed: value.healthy && exactRestartPreservation &&
-          value.partialFiles === 0 && value.recoveryErrors === 0 && laneDurable,
+          value.partialFiles === 0 && value.recoveryErrors === 0 &&
+          value.shutdownErrors === 0 && laneDurable,
           observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
       });
       if (this.config.storageBackupWorkflow !== "disabled") {

@@ -116,7 +116,8 @@
 - the schema-2 media checkpoint and `%019d-%02d.idx` (00..11) processed indexes
   pass exact header/36-byte-record checks with no legacy markers or tombstones;
   a real reserved-lane transition advances direct journal bytes and those bytes
-  survive restart
+  survive the supported whole-deployment restart, with zero database/module
+  shutdown errors in the exact restart log window
 - backup acceptance independently recomputes the core HMAC with the backup key,
   verifies every checksum and exact no-link payload inventory, and also includes regular `VERIFIED`, `JOURNAL_CONFIRMED`, `SHA256SUMS`,
   `SHA256SUMS.hmac`, `epoch.json`, `image-inventory.txt`, and
