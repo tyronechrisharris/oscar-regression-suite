@@ -1519,11 +1519,40 @@ case $action in
     ;;
 
   journal-status)
+    journal_metadata=$(compose exec -T oscar sh -eu -c '
+      path=/var/lib/oscar/files/.dailyfile-journal/journal-metadata.v1.json
+      [ -f "$path" ] && [ ! -L "$path" ] || exit 20
+      size=$(stat -c %s -- "$path")
+      [ "$size" -gt 0 ] && [ "$size" -le 65536 ] || exit 21
+      openssl base64 -A -in "$path"
+    ' journal-metadata) || fail 'Daily-file journal metadata is missing, linked, empty, or over 64 KiB.'
+    [[ $journal_metadata =~ ^[A-Za-z0-9+/]+=*$ && ${#journal_metadata} -le 87384 ]] ||
+      fail 'Daily-file journal metadata is not bounded canonical base64.'
+    journal_metadata_result=$(scalar "WITH source AS (
+        SELECT convert_from(decode('$journal_metadata','base64'),'UTF8') AS text),
+      doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source)
+      SELECT (jsonb_typeof(value)='object'
+        AND (SELECT count(*) FROM json_object_keys(raw))=2
+        AND value ?& ARRAY['schemaVersion','zoneId']
+        AND value->'schemaVersion'='1'::jsonb
+        AND jsonb_typeof(value->'zoneId')='string'
+        AND length(value->>'zoneId') BETWEEN 1 AND 128)::text
+        ||'|'||coalesce(value->>'zoneId','') FROM doc;")
+    IFS='|' read -r journal_metadata_valid journal_zone <<<"$journal_metadata_result"
+    [[ $journal_metadata_valid == true &&
+       $journal_zone =~ ^[A-Za-z0-9._+/-]{1,128}$ ]] ||
+      fail 'Daily-file journal metadata is not the exact schema-1 configured-zone contract.'
+    journal_today=$(scalar "SELECT to_char(current_timestamp AT TIME ZONE '$journal_zone','YYYY-MM-DD');")
+    [[ $journal_today =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+      fail 'Could not resolve the current daily-file date in the configured journal zone.'
     inventory=$(compose exec -T oscar sh -eu -c '
+      today=$1
       root=/var/lib/oscar/files; pubs="$root/dailyfiles"; journal="$root/.dailyfile-journal"
       for path in "$root" "$pubs" "$journal"; do
         [ -d "$path" ] && [ ! -L "$path" ] || exit 20
       done
+      segments_root="$journal/segments"
+      [ -d "$segments_root" ] && [ ! -L "$segments_root" ] || exit 22
     total=$(find "$pubs" "$journal" -mindepth 1 -print | wc -l | tr -d "[:space:]")
     [ "$total" -le 100000 ] || exit 21
     partial=$(find "$pubs" "$journal" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
@@ -1537,10 +1566,66 @@ case $action in
     publication_bad_names=$(find "$pubs" -mindepth 1 -maxdepth 1 -type f -printf "%f\n" |
       grep -Evc "^[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}[.]csv([.]manifest[.]v1[.]json)?$" || true)
     unsafe=$((publication_nonfiles+publication_nested+publication_bad_names))
-    printf "%s|%s|%s|%s|%s|%s|%s\n" "$publications" "$manifests" "$partial" "$open" "$segments" "$links" "$unsafe"
-  ' journal-inventory) || fail 'Daily-file roots are missing, linked, or exceed the 100,000-entry safety bound.'
-    IFS='|' read -r publications manifests partial open segments unsafe_links unsafe_entries <<<"$inventory"
-    for value in "$publications" "$manifests" "$partial" "$open" "$segments" "$unsafe_links" "$unsafe_entries"; do
+
+    lane_non_dirs=$(find "$segments_root" -mindepth 1 -maxdepth 1 ! -type d -print | wc -l | tr -d "[:space:]")
+    invalid_days=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -printf "%f\n" |
+      grep -Evc "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" || true)
+    eligible_days=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -printf "%f\n" |
+      awk -v today="$today" '$0 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && $0 < today { count++ } END { print count+0 }')
+    future_days=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -printf "%f\n" |
+      awk -v today="$today" '$0 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && $0 > today { count++ } END { print count+0 }')
+    current_dirs=$(find "$segments_root" -mindepth 2 -maxdepth 2 -type d -name "$today" -print |
+      wc -l | tr -d "[:space:]")
+    current_open=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -type f \
+      -name "[0-9][0-9][0-9][0-9][0-9][0-9].open" -print | wc -l | tr -d "[:space:]")
+    current_sealed=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -type f \
+      -name "[0-9][0-9][0-9][0-9][0-9][0-9].seg" -print | wc -l | tr -d "[:space:]")
+    current_bytes=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -type f \
+      \( -name "[0-9][0-9][0-9][0-9][0-9][0-9].open" -o \
+         -name "[0-9][0-9][0-9][0-9][0-9][0-9].seg" \) -printf "%s\n" |
+      awk '{ total += $1 } END { printf "%.0f\n", total+0 }')
+    current_entries=$(find "$segments_root" -mindepth 3 -maxdepth 3 -path "*/$today/*" -print |
+      wc -l | tr -d "[:space:]")
+    current_expected=$((current_open+current_sealed))
+    current_unexpected=$((current_entries-current_expected))
+    [ "$current_unexpected" -ge 0 ] || current_unexpected=1
+    empty_current_dirs=0
+    for directory in "$segments_root"/*/"$today"; do
+      [ -e "$directory" ] || [ -L "$directory" ] || continue
+      [ -d "$directory" ] && [ ! -L "$directory" ] || continue
+      count=$(find "$directory" -mindepth 1 -maxdepth 1 -type f \
+        \( -name "[0-9][0-9][0-9][0-9][0-9][0-9].open" -o \
+           -name "[0-9][0-9][0-9][0-9][0-9][0-9].seg" \) -print | wc -l | tr -d "[:space:]")
+      [ "$count" -gt 0 ] || empty_current_dirs=$((empty_current_dirs+1))
+    done
+    header_failures=0
+    for path in "$segments_root"/*/"$today"/*; do
+      [ -e "$path" ] || [ -L "$path" ] || continue
+      name=${path##*/}
+      case $name in
+        [0-9][0-9][0-9][0-9][0-9][0-9].open|[0-9][0-9][0-9][0-9][0-9][0-9].seg) ;;
+        *) continue ;;
+      esac
+      size=$(stat -c %s -- "$path" 2>/dev/null || printf 0)
+      header=$(od -An -tx1 -N8 -- "$path" 2>/dev/null | tr -d "[:space:]")
+      if [ ! -f "$path" ] || [ -L "$path" ] || [ "$size" -lt 16 ] ||
+         [ "$header" != 444a4e4c00000001 ]; then
+        header_failures=$((header_failures+1))
+      fi
+    done
+    journal_integrity_failures=$((lane_non_dirs+invalid_days+future_days+current_unexpected+empty_current_dirs+header_failures))
+    printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+      "$publications" "$manifests" "$partial" "$open" "$segments" "$links" "$unsafe" \
+      "$eligible_days" "$current_dirs" "$current_open" "$current_sealed" "$current_bytes" \
+      "$journal_integrity_failures" "$total"
+  ' journal-inventory "$journal_today") ||
+      fail 'Daily-file roots are missing, linked, malformed, or exceed the 100,000-entry safety bound.'
+    IFS='|' read -r publications manifests partial open segments unsafe_links unsafe_entries \
+      eligible_prior_days current_day_directories current_day_open current_day_sealed current_day_bytes \
+      journal_integrity_failures inventory_entries <<<"$inventory"
+    for value in "$publications" "$manifests" "$partial" "$open" "$segments" "$unsafe_links" \
+      "$unsafe_entries" "$eligible_prior_days" "$current_day_directories" "$current_day_open" \
+      "$current_day_sealed" "$current_day_bytes" "$journal_integrity_failures" "$inventory_entries"; do
       [[ $value =~ ^[0-9]+$ ]] || fail 'Daily-file inventory returned a nonnumeric field.'
     done
     manifest_listing=$(compose exec -T oscar find /var/lib/oscar/files/dailyfiles \
@@ -1587,14 +1672,14 @@ case $action in
           AND value->'schemaVersion'='1'::jsonb
           AND value->>'format'='OSCAR_LEGACY_DAILY_CSV'
           AND jsonb_typeof(value->'laneId')='string' AND length(value->>'laneId') BETWEEN 1 AND 256
-          AND value->>'zoneId'='UTC'
+          AND value->>'zoneId'='$journal_zone'
           AND value->>'windowStartInclusive' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
           AND value->>'windowEndExclusive' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
           AND (value->>'windowStartInclusive')::timestamptz < (value->>'windowEndExclusive')::timestamptz
           AND (value->>'windowStartInclusive')::timestamptz =
-            ('$csv_day'::date::timestamp AT TIME ZONE 'UTC')
+            ('$csv_day'::date::timestamp AT TIME ZONE '$journal_zone')
           AND (value->>'windowEndExclusive')::timestamptz =
-            ((('$csv_day'::date + 1)::timestamp) AT TIME ZONE 'UTC')
+            ((('$csv_day'::date + 1)::timestamp) AT TIME ZONE '$journal_zone')
           AND jsonb_typeof(value->'recordCount')='number' AND value->>'recordCount' ~ '^(0|[1-9][0-9]*)$'
           AND (value->>'recordCount')::bigint=$actual_records
           AND jsonb_typeof(value->'byteCount')='number' AND value->>'byteCount' ~ '^(0|[1-9][0-9]*)$'
@@ -1610,8 +1695,11 @@ case $action in
         FROM doc;")
       if [[ $manifest_valid == t ]]; then validated=$((validated+1)); else failures=$((failures+1)); fi
     done <<<"$manifest_listing"
-    printf '{"publications":%s,"manifests":%s,"validatedManifests":%s,"manifestFailures":%s,"partialFiles":%s,"unsafeLinks":%s,"unsafeEntries":%s,"bounded":true,"openSegments":%s,"sealedSegments":%s}\n' \
-      "$publications" "$manifests" "$validated" "$failures" "$partial" "$unsafe_links" "$unsafe_entries" "$open" "$segments"
+    printf '{"publications":%s,"manifests":%s,"validatedManifests":%s,"manifestFailures":%s,"partialFiles":%s,"unsafeLinks":%s,"unsafeEntries":%s,"bounded":true,"inventoryEntries":%s,"zoneId":"%s","currentDate":"%s","eligiblePriorDayDirectories":%s,"currentDayDirectories":%s,"currentDayOpenSegments":%s,"currentDaySealedSegments":%s,"currentDayBytes":%s,"journalIntegrityFailures":%s,"openSegments":%s,"sealedSegments":%s}\n' \
+      "$publications" "$manifests" "$validated" "$failures" "$partial" "$unsafe_links" "$unsafe_entries" \
+      "$inventory_entries" "$journal_zone" "$journal_today" "$eligible_prior_days" \
+      "$current_day_directories" "$current_day_open" "$current_day_sealed" "$current_day_bytes" \
+      "$journal_integrity_failures" "$open" "$segments"
     ;;
 
   journal-lane-state)

@@ -424,7 +424,10 @@ test("journal status validates exact bounded v1 manifests and direct lane state"
     "unsafeEntries",
     "bounded", "journal-lane-state)", "urn:osh:system:lane:", "directory_id",
     "sha256sum | cut -c1-12", "lane.id", "-mindepth 2 -maxdepth 2",
-    "openSegments", "sealedSegments", "unsafeEntries",
+    "openSegments", "sealedSegments", "unsafeEntries", "journal-metadata.v1.json",
+    "eligiblePriorDayDirectories", "currentDayDirectories", "currentDayOpenSegments",
+    "currentDaySealedSegments", "currentDayBytes", "journalIntegrityFailures",
+    "444a4e4c00000001", "journal_zone", "journal_today",
   ]) assert.ok(block.includes(required), `missing direct-journal validation contract: ${required}`);
   assert.ok(block.includes(
     "^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}",
@@ -444,7 +447,7 @@ test("journal status validates exact bounded v1 manifests and direct lane state"
   assert.match(block, /\(value->>'byteCount'\)::bigint=\$actual_bytes/);
   assert.match(block, /value->>'sha256'='\$actual_sha'/);
   assert.match(block, /value->>'dataFile'='\$csv_name'/);
-  assert.match(block, /'\$csv_day'::date::timestamp AT TIME ZONE 'UTC'/);
+  assert.match(block, /'\$csv_day'::date::timestamp AT TIME ZONE '\$journal_zone'/);
   assert.match(block, /publishedAt'\)::timestamptz >=/);
   assert.doesNotMatch(block, /for manifest in \$\(find/);
 });

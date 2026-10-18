@@ -1,6 +1,7 @@
 import {createHash} from "node:crypto";
 import type {StorageMetricSample} from "./types.js";
-import {canonicalProductUuid, isCanonicalProductUuid} from "./product-uuid.js";
+import {isCanonicalProductUuid} from "./product-uuid.js";
+import {publicObservationId} from "./public-observation-id.js";
 
 export const RETAINED_FRAME_POSITIONS = [
   "FIRST", "QUARTER", "MIDDLE", "THREE_QUARTERS", "LAST",
@@ -86,10 +87,10 @@ export function assessRetainedMediaResponse(
   value: unknown,
   expectedEventId: string,
 ): RetainedMediaAssessment {
-  const eventId = canonicalProductUuid(expectedEventId, "retained-media event UUID");
+  const eventId = publicObservationId(expectedEventId, "retained-media public observation ID");
   const response = object(value, "retained-media response");
   if (response.schemaVersion !== 1) throw new Error("retained-media schemaVersion must be 1");
-  if (canonicalProductUuid(response.eventId, "retained-media response event UUID") !== eventId) {
+  if (publicObservationId(response.eventId, "retained-media response public observation ID") !== eventId) {
     throw new Error("retained-media eventId does not match");
   }
   if (!Array.isArray(response.mediaSets) || response.mediaSets.length < 1 ||
@@ -111,7 +112,10 @@ export function assessRetainedMediaResponse(
     const mediaSet = object(rawSet, `mediaSets[${setIndex}]`);
     const manifest = object(mediaSet.manifest, `mediaSets[${setIndex}].manifest`);
     if (manifest.schemaVersion !== 1 ||
-        canonicalProductUuid(manifest.eventId, `mediaSets[${setIndex}] manifest event UUID`) !== eventId) {
+        publicObservationId(
+          manifest.eventId,
+          `mediaSets[${setIndex}] manifest public observation ID`,
+        ) !== eventId) {
       throw new Error(`mediaSets[${setIndex}] manifest identity is invalid`);
     }
     const laneUid = text(manifest.laneUid, `mediaSets[${setIndex}].manifest.laneUid`);

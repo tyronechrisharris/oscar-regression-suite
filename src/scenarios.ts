@@ -52,7 +52,11 @@ import {
   storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
 } from "./storage-oracles.js";
-import {isCanonicalProductUuid} from "./product-uuid.js";
+import {isPublicObservationId} from "./public-observation-id.js";
+import {
+  assessDailyJournalStatus,
+  type DailyJournalStatus,
+} from "./daily-journal-oracle.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
 
@@ -2312,7 +2316,7 @@ export class RegressionScenarios {
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
       const eventId = (await uuidValue.innerText()).trim();
       const url = new URL(page.url());
-      const passed = isCanonicalProductUuid(eventId) && url.searchParams.get("eventId") === eventId;
+      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId;
       return {
         passed,
         value: passed ? eventId : undefined,
@@ -2615,7 +2619,7 @@ export class RegressionScenarios {
         await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
         const uuid = (await uuidValue.innerText()).trim();
         const current = new URL(page.url());
-        const validIdentity = isCanonicalProductUuid(uuid);
+        const validIdentity = isPublicObservationId(uuid);
         const canonical = current.searchParams.get("eventId") === uuid &&
           Boolean(current.searchParams.get("nodeId"));
         const passed = validIdentity && canonical;
@@ -2973,7 +2977,7 @@ export class RegressionScenarios {
           parsed.payload.version === 1 &&
           parsed.payload.source?.laneId === this.config.testLaneLabel &&
           exportedOccupancyId === String(occupancyCount) &&
-          isCanonicalProductUuid(observationId) &&
+          isPublicObservationId(observationId) &&
           parsed.integrity?.algorithm === "SHA-256" &&
           /^[a-f0-9]{64}$/i.test(parsed.integrity.digest ?? "") &&
           parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
@@ -3632,16 +3636,14 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "storage-health", category: "daily-file", action: "verify durable journal publications",
-        target: "dailyfiles", expected: "bounded regular CSV files have exact 12-key v1 manifests, matching hashes/counts, and no links or partial artifacts",
+        target: "dailyfiles", expected: "each eligible completed day has an exact 12-key v1 CSV/manifest pair, or a not-yet-eligible current day has durable header-valid journal segments; neither state has links, partials, or unsafe entries",
       }, async () => {
-        const value = await probe.runJson<{publications: number; manifests: number; validatedManifests: number;
-          partialFiles: number; manifestFailures: number; unsafeLinks: number;
-          unsafeEntries: number; bounded: boolean}>("journal-status");
-        const published = value.publications > 0 && value.publications === value.manifests;
-        return {passed: published && value.validatedManifests === value.manifests &&
-          value.partialFiles === 0 && value.manifestFailures === 0 && value.unsafeLinks === 0 &&
-          value.unsafeEntries === 0 && value.bounded,
-          observed: JSON.stringify(value)};
+        const value = await probe.runJson<DailyJournalStatus>("journal-status");
+        const assessment = assessDailyJournalStatus(value);
+        return {
+          passed: assessment.passed,
+          observed: `${assessment.explanation}; ${JSON.stringify(value)}`,
+        };
       });
 
       const snapshot = await probe.runJson<unknown>("snapshot");

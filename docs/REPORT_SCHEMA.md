@@ -21,16 +21,23 @@ filtering `category`/`action` and counting `status`. `summary.csv` also provides
 ready-to-chart totals by category.
 
 Generated media checks use `category=alarm-media` or `retained-media`. Their
-`target` is the exact public event UUID where applicable; `observed` records
+`target` is the exact public observation ID where applicable. Viewer calls this
+field “Event UUID”, but the value is an opaque normalized 1–128-character OSH
+identity and need not be RFC 4122-shaped. `observed` records
 normalized source paths, OSH camera UIDs, metadata, manifest/frame counts,
 exact-ledger results, or run-scoped orphan/partial totals. Reviewers can
-therefore correlate the UUID-bound MP4 with its exact-five representation
+therefore correlate the identity-bound MP4 with its exact-five representation
 without depending on PostgreSQL table details.
 For an unfiltered full run without `STORAGE_RETAINED_EVENT_ID`, the early
 storage-health row is `skipped` with an explicit self-seeding reason; the later
-storage-lifecycle rows for that generated UUID are the authoritative API,
+storage-lifecycle rows for that generated public observation ID are the authoritative API,
 decode, manifest, ledger, and Viewer-gallery proof. A missing generated event is
 reported as `incorrect`, so deferral cannot hide absent coverage.
+For `category=daily-file`, `observed` also records the configured zone, current
+date, eligible-prior-day count, current-day segment counts/bytes, and integrity
+failures. `publication not yet eligible` is a correct result only when there is
+no completed configured-zone day and the current-day durable segment oracle
+passes; otherwise exact published CSV/manifest pairs are mandatory.
 
 ## `performance.csv`
 

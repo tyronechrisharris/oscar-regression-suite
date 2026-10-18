@@ -73,6 +73,10 @@ test("alarm video oracle binds one strict generation-qualified clip to each conf
     "2026-10-18_07-31-52_004",
   ]);
   assert.ok(result.paths.every(({path}) => !path.includes("\\")));
+
+  const shortId = "0i4d0ko";
+  const shortResult = assessAlarmVideoObservation({...observation(), id: shortId}, shortId, cameras);
+  assert.equal(shortResult.eventId, shortId);
 });
 
 test("alarm video oracle rejects missing, duplicate, foreign, blank, and stale clip paths", () => {
@@ -101,8 +105,8 @@ test("alarm video oracle requires the exact selected event and collision-free ca
     id: "00000000-0000-4000-8000-000000000099",
   }, eventId, cameras),
     /does not match/);
-  assert.throws(() => assessAlarmVideoObservation({...observation(), id: "other"}, eventId, cameras),
-    /canonical lowercase/);
+  assert.throws(() => assessAlarmVideoObservation({...observation(), id: " "}, eventId, cameras),
+    /public observation ID/);
   assert.throws(() => assessAlarmVideoObservation(observation(), eventId, ["camera:a", "camera-a"]),
     /same clip token/);
   assert.throws(() => assessAlarmVideoObservation(observation(), eventId, ["camera/unsafe"]),

@@ -220,21 +220,37 @@ archive rows.
 
 ## Daily files and retained media
 
-Daily publication is a rotation boundary behavior. Keep the canonical 50-lane
-fixture running across a local-midnight boundary before a 3.9.2 release gate.
-The smoke check bounds the publication/journal inventory to 100,000 entries,
-rejects links and every `.partial*`/`.tmp*` spelling, and requires every regular
-flat `{lane-suffix}-{12-hex-full-UID-hash}_{UTC-date}.csv` to have an exact
-12-key v1 `OSCAR_LEGACY_DAILY_CSV` manifest no larger than 1 MiB.
-Lane/window/UTC/filename/timestamp fields and current SHA-256, byte, and record
+Daily publication is a configured-zone rotation-boundary behavior; it is not
+eligible while only the current calendar day exists. The probe validates the
+exact two-key schema-1 journal metadata, derives “today” in its persisted zone,
+and counts completed lane/day directories. When at least one prior day is
+eligible (or any publication artifact exists), the gate still requires one or
+more exact validated CSV/manifest pairs. When no prior day is eligible and no
+publication artifact exists, that is reported explicitly as
+`publication not yet eligible` and passes only if current-day lane directories
+contain nonempty regular six-digit `.open`/`.seg` files with the exact 16-byte
+minimum and `DJNL` v1 magic/version header. Unsafe layout, future-day entries,
+links, partials, or a missing current-day segment still fail. A release gate
+therefore does not require waiting through midnight merely to fabricate data.
+
+Keep the canonical 50-lane fixture running across a configured-zone midnight
+when published-file coverage is specifically desired. Once that boundary is
+present, the not-yet-eligible branch is unavailable. The smoke check bounds the
+publication/journal inventory to 100,000 entries, rejects links and every
+`.partial*`/`.tmp*` spelling, and requires every regular flat
+`{lane-suffix}-{12-hex-full-UID-hash}_{configured-zone-date}.csv` to have an
+exact 12-key v1 `OSCAR_LEGACY_DAILY_CSV` manifest no larger than 1 MiB.
+Lane/window/zone/filename/timestamp fields and current SHA-256, byte, and record
 counts must agree. The lifecycle also toggles the reserved emulator RPM,
 derives the journal directory from the full canonical lane UID, and requires
-that lane's direct `{lane-directory}/{UTC-date}/{six-digit}.open|seg` bytes to
+that lane's direct
+`{lane-directory}/{configured-zone-date}/{six-digit}.open|seg` bytes to
 advance. Those bytes and safe layout
 must survive the OSCAR restart. This is evidence of direct live journal capture,
 not a renamed or fabricated publication.
 
-The smoke check requires published CSV/manifest pairs and no partial artifacts;
+The smoke check requires either eligible published CSV/manifest pairs or the
+strict durable-current-day state described above, and no partial artifacts;
 archive health also rejects `*.partial`, `*.partial.*`, `*.tmp`, and `*.tmp.*`
 artifacts anywhere below the external archive or WAL roots. The full run restarts
 OSCAR and rejects recovery errors or partial publications, then repeats the
@@ -244,8 +260,8 @@ Do not fabricate or rename production daily files for this test.
 For smoke/non-lifecycle validation, provide `STORAGE_RETAINED_EVENT_ID` for an alarm
 already reduced to the new format. An unfiltered full run does not need a
 pre-existing retained event: its early storage-health pass explicitly defers
-this one proof, generates exact alarm UUIDs, and runs the same gallery proof
-after their accelerated retention. A scenario-filtered full run that omits
+this one proof, generates exact public observation IDs, and runs the same
+gallery proof after their accelerated retention. A scenario-filtered full run that omits
 either `storage-lifecycle` or every alarm-producing scenario must still provide
 `STORAGE_RETAINED_EVENT_ID` when `storage-health` is selected. Every camera set
 must expose exactly FIRST, QUARTER, MIDDLE,
@@ -264,10 +280,16 @@ responses to measure at most three requests in flight, then requires the newly
 selected frame to load, decode, and replace the initial image. Optionally provide
 `STORAGE_LEGACY_EVENT_ID` to prove a retained-media 404 still renders the legacy
 video. `STORAGE_EVENT_NODE_ID` is included in Event Details links when needed.
+Both event variables carry OSCAR's durable public OSH observation ID. The Viewer
+labels it “Event UUID”, but the encoded ID is opaque, normalized to 1–128
+characters, and is not required to use RFC 4122 punctuation. The suite compares
+the exact string across the observation API, Event Details, retained endpoint,
+manifest paths, PDF/QR exports, and Viewer gallery; it never fabricates an RFC
+UUID alias.
 
 The full profile additionally tests every gamma/neutron alarm it generates; it
 does not rely on `STORAGE_RETAINED_EVENT_ID` for this path. The exact generated
-UUID remains in run state through retention, and one of those UUIDs must also
+public observation ID remains in run state through retention, and one of those IDs must also
 pass the Event Details five-choice lazy-gallery and three-request concurrency
 proof after its source-bound manifests and JPEGs validate. Failure to generate
 an event after the early proof was deferred is an explicit incorrect result,

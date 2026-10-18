@@ -73,7 +73,7 @@ all-lane query.
 
 `STORAGE_RETAINED_EVENT_ID` remains required for a required smoke/non-lifecycle
 retained-media proof. A normal unfiltered full run intentionally reports the
-early check as deferred, then uses an exact UUID produced by `rpm-alarms`,
+early check as deferred, then uses an exact public observation ID produced by `rpm-alarms`,
 `event-uuid`, or `adjudication` and runs the API/decode and Viewer gallery proof
 after `storage-lifecycle` retains it. If a scenario filter selects
 `storage-health` but omits `storage-lifecycle` or all three alarm-producing
@@ -81,6 +81,20 @@ scenarios, configure an already-retained event ID or expand the filter. A
 `self-seed retained-media proof` failure means the run promised this generated
 fixture but no exact alarm association reached retention; inspect the earlier
 alarm-media outcomes rather than substituting an unrelated historical event.
+The field is the opaque durable OSH ID displayed by Viewer as “Event UUID”; short
+encoded values such as `0i4d0ko` are valid. Do not translate one into a synthetic
+RFC 4122 UUID. The suite requires the configured string to match the observation,
+retained-media response, manifest, asset paths, and Viewer result exactly.
+
+## Daily-file publication is empty on a fresh same-day install
+
+Read the `daily-file` result's `zoneId`, `currentDate`, and
+`eligiblePriorDayDirectories`. Zero CSVs is correct only when no completed day
+exists in that configured zone and the probe reports
+`publication not yet eligible` after validating durable current-day `DJNL` v1
+segments. If any prior lane/day directory is eligible, the suite requires valid
+12-key v1 CSV/manifest pairs and fails an empty publication directory. Never
+rename current segments or create synthetic daily files to satisfy this gate.
 
 ## Generated alarm media association fails
 

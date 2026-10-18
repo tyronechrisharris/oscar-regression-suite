@@ -1,4 +1,4 @@
-import {canonicalProductUuid} from "./product-uuid.js";
+import {publicObservationId} from "./public-observation-id.js";
 
 const SAFE_CAMERA_UID = /^[A-Za-z0-9._:-]+$/;
 const CAMERA_TOKEN = /^[A-Za-z0-9._-]+$/;
@@ -140,14 +140,14 @@ export function assessAlarmVideoObservation(
   expectedEventId: string,
   configuredCameraUids: readonly string[],
 ): AlarmVideoAssociation {
-  const eventId = canonicalProductUuid(expectedEventId, "expected event UUID");
+  const eventId = publicObservationId(expectedEventId, "expected public observation ID");
   const observation = record(value, "occupancy observation");
   const properties = observation.properties && typeof observation.properties === "object"
     ? record(observation.properties, "occupancy observation properties")
     : observation;
-  const actualEventId = canonicalProductUuid(
+  const actualEventId = publicObservationId(
     observation.id ?? properties.id,
-    "occupancy observation UUID",
+    "occupancy public observation ID",
   );
   if (actualEventId !== eventId) throw new Error("occupancy observation ID does not match the selected alarm UUID");
 
@@ -211,12 +211,12 @@ export function assertAlarmVideoAssociationUnique(
   candidate: AlarmVideoAssociation,
   existing: readonly AlarmVideoAssociation[],
 ): void {
-  const eventId = canonicalProductUuid(candidate.eventId, "candidate alarm event UUID");
+  const eventId = publicObservationId(candidate.eventId, "candidate alarm public observation ID");
   const ownerByPath = new Map<string, string>();
   for (const association of existing) {
-    const existingEventId = canonicalProductUuid(
+    const existingEventId = publicObservationId(
       association.eventId,
-      "existing alarm event UUID",
+      "existing alarm public observation ID",
     );
     if (existingEventId === eventId) {
       throw new Error(`alarm event UUID ${eventId} was generated more than once`);

@@ -1,7 +1,7 @@
 import {mkdirSync, readFileSync} from "node:fs";
 import {isAbsolute, posix, resolve} from "node:path";
 import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane-config.js";
-import {canonicalProductUuid} from "./product-uuid.js";
+import {publicObservationId} from "./public-observation-id.js";
 import type {CapabilityMode, Profile, SuiteConfig} from "./types.js";
 
 function loadDotEnv(path = resolve(".env")): void {
@@ -226,8 +226,8 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
 
   const retainedEventId = process.env.STORAGE_RETAINED_EVENT_ID?.trim();
   const legacyEventId = process.env.STORAGE_LEGACY_EVENT_ID?.trim();
-  if (retainedEventId) canonicalProductUuid(retainedEventId, "STORAGE_RETAINED_EVENT_ID");
-  if (legacyEventId) canonicalProductUuid(legacyEventId, "STORAGE_LEGACY_EVENT_ID");
+  if (retainedEventId) publicObservationId(retainedEventId, "STORAGE_RETAINED_EVENT_ID");
+  if (legacyEventId) publicObservationId(legacyEventId, "STORAGE_LEGACY_EVENT_ID");
 
   return {
     profile,

@@ -199,19 +199,15 @@ test("3.9.2 release certification is unfiltered and requires every release gate"
   });
 });
 
-test("UUID configuration accepts only canonical lowercase RFC 4122 product identities", () => {
+test("retained-media configuration accepts bounded OSCAR public observation identities", () => {
   withEnvironment({...baseEnvironment,
-    STORAGE_RETAINED_EVENT_ID: "123e4567-e89b-42d3-a456-426614174000",
-    STORAGE_LEGACY_EVENT_ID: "123e4567-e89b-52d3-b456-426614174001"}, () => {
-    assert.equal(loadConfig([]).storageRetainedEventId,
-      "123e4567-e89b-42d3-a456-426614174000");
+    STORAGE_RETAINED_EVENT_ID: "0i4d0ko",
+    STORAGE_LEGACY_EVENT_ID: "obs/legacy"}, () => {
+    assert.equal(loadConfig([]).storageRetainedEventId, "0i4d0ko");
+    assert.equal(loadConfig([]).storageLegacyEventId, "obs/legacy");
   });
-  for (const value of [
-    "123E4567-E89B-42D3-A456-426614174000",
-    "123e4567-e89b-02d3-a456-426614174000",
-    "123e4567-e89b-42d3-7456-426614174000",
-  ]) withEnvironment({...baseEnvironment, STORAGE_RETAINED_EVENT_ID: value}, () => {
-    assert.throws(() => loadConfig([]), /canonical lowercase RFC 4122 UUID/);
+  withEnvironment({...baseEnvironment, STORAGE_RETAINED_EVENT_ID: "x".repeat(129)}, () => {
+    assert.throws(() => loadConfig([]), /public observation ID/);
   });
 });
 

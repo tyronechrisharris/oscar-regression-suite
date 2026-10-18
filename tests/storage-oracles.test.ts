@@ -20,8 +20,7 @@ import {
 
 const digest = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 
-function retainedResponse() {
-  const eventId = "00000000-0000-4000-8000-000000000001";
+function retainedResponse(eventId = "00000000-0000-4000-8000-000000000001") {
   const laneUid = "lane-01";
   const cameraUid = "camera-01";
   const cameraToken = Buffer.from(cameraUid).toString("base64url");
@@ -50,6 +49,13 @@ test("retained-media oracle requires exactly five canonical JPEG assets", () => 
     "videos/clips/camera-01/2026-10-18_00-00-00_000-g1.mp4");
   fixture.response.mediaSets[0]!.manifest.assets.pop();
   assert.throws(() => assessRetainedMediaResponse(fixture.response, fixture.eventId), /exactly five/);
+});
+
+test("retained-media oracle preserves a short OSCAR public observation ID exactly", () => {
+  const fixture = retainedResponse("0i4d0ko");
+  const result = assessRetainedMediaResponse(fixture.response, fixture.eventId);
+  assert.equal(result.frameCount, 5);
+  assert.ok(result.paths.every(path => path.startsWith("media/0i4d0ko/")));
 });
 
 test("retained-media oracle exposes only source-bound available manifests", () => {

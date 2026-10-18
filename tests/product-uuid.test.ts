@@ -5,7 +5,7 @@ import {
   isCanonicalProductUuid,
 } from "../src/product-uuid.js";
 
-test("product UUID accepts canonical RFC 4122 versions and variants", () => {
+test("storage deployment UUID accepts canonical RFC 4122 versions and variants", () => {
   for (const value of [
     "123e4567-e89b-12d3-a456-426614174000",
     "123e4567-e89b-22d3-8456-426614174000",
@@ -15,7 +15,7 @@ test("product UUID accepts canonical RFC 4122 versions and variants", () => {
   ]) assert.equal(isCanonicalProductUuid(value), true);
 });
 
-test("product UUID rejects shape-only, uppercase, nil, unsupported version, and variant", () => {
+test("storage deployment UUID rejects shape-only, uppercase, nil, unsupported version, and variant", () => {
   for (const value of [
     "123e4567-e89b-42d3-7456-426614174000",
     "123e4567-e89b-62d3-a456-426614174000",

@@ -32,13 +32,13 @@ source review before the suite can certify that version.
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
   extended-occupancy detection and recovery
 - live HLS camera playback, decoded dimensions, and advancing playback time
-- alarm ingestion and full-database event filtering; exact generated occupancy
-  UUID-to-video association with one unique generation-qualified MP4 per
+- alarm ingestion and full-database event filtering; exact generated public
+  observation-ID-to-video association with one unique generation-qualified MP4 per
   authoritative OSH lane-camera UID, nonzero source objects, and browser-loaded
   MP4 metadata
-- occupancy UUID display, search, fresh direct links, not-found handling,
+- occupancy “Event UUID” display, search, fresh direct links, not-found handling,
   operational-view-preserving member lookup and non-member fail-closed behavior,
-  and exact UUID preservation in printable PDFs and truncated QR exports
+  and exact public observation ID preservation in printable PDFs and truncated QR exports
 - offline alarm JSON export/import and SHA-256 validation, including visible
   series-color chart redraw and canonical payload/integrity/transport validation
   when the received package is downloaded again
@@ -51,7 +51,7 @@ source review before the suite can certify that version.
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
 - OSCAR 3.9.2 exact-five retained JPEG API/gallery, including generated-alarm
-  self-seeding by exact UUID in a full run, manifest/source binding,
+  self-seeding by exact public observation ID in a full run, manifest/source binding,
   one-attempt successful retention ledgers, and
   run-baselined orphan/partial rejection; bounded catalog/frame
   transfers and event resource budgets, baseline-JPEG structure plus Chromium
@@ -198,9 +198,14 @@ missing, linked, or non-regular `oscar.sh` are refused. The acknowledgement is
 rechecked before every subsequent probe action.
 
 Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
-the occupancy UUID workflow. The default `auto` mode records one skipped check
+the occupancy UUID workflow. “Event UUID” is the operator-facing label for
+OSCAR's durable public OSH observation ID. It is an opaque, normalized 1–128
+character identity and is not required to have RFC 4122 punctuation. The suite
+preserves and compares it exactly across Event Details, direct API lookup,
+links, PDF/QR export, alarm video metadata, and retained-media manifests. The
+default `auto` mode records one skipped check
 instead of failing when the controls are absent from an older deployment. When
-operational views are enabled, the same scenario searches the known UUID from
+operational views are enabled, the same scenario searches the known identity from
 one fixture-assigned view, requires the canonical Event Details URL to retain
 that view, and proves a populated non-member view cannot resolve the occupancy.
 
