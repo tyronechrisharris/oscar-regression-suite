@@ -32,7 +32,10 @@ source review before the suite can certify that version.
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
   extended-occupancy detection and recovery
 - live HLS camera playback, decoded dimensions, and advancing playback time
-- alarm ingestion and full-database event filtering
+- alarm ingestion and full-database event filtering; exact generated occupancy
+  UUID-to-video association with one unique generation-qualified MP4 per
+  authoritative OSH lane-camera UID, nonzero source objects, and browser-loaded
+  MP4 metadata
 - occupancy UUID display, search, fresh direct links, not-found handling,
   operational-view-preserving member lookup and non-member fail-closed behavior,
   and exact UUID preservation in printable PDFs and truncated QR exports
@@ -47,7 +50,9 @@ source review before the suite can certify that version.
   Health-navigation query persistence, and malformed/unassigned inputs failing closed
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
-- OSCAR 3.9.2 exact-five retained JPEG API/gallery, bounded catalog/frame
+- OSCAR 3.9.2 exact-five retained JPEG API/gallery, including generated-alarm
+  manifest/source binding, one-attempt successful retention ledgers, and
+  run-baselined orphan/partial rejection; bounded catalog/frame
   transfers and event resource budgets, baseline-JPEG structure plus Chromium
   decode/dimension checks for every frame, lazy selected-frame requests, and
   legacy-video fallback;
@@ -203,7 +208,9 @@ Storage smoke checks are read-only except for normal Viewer authentication. The
 full `storage-lifecycle` scenario uses a separately acknowledged disposable
 3.9.2 database, registers two synthetic copied observations, and refuses any
 cold purge whose plan includes data outside its unique fixture generation. It
-does not restore a backup. Daily-file publication verification requires an
+also requires the documented zero-day, one-minute-query alarm-media profile on
+that disposable test deployment; the packaged and production age default stays
+seven days. It does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture; backup verification can be disabled separately
 with `STORAGE_BACKUP_WORKFLOW=disabled`. See
 [docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md).

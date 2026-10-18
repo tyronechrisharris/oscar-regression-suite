@@ -90,6 +90,26 @@ The target must use the regression-only accelerated archive profile:
 `intervalMinutes=1`, `rollbackGraceDays=1`, `deleteHotAfterArchive=true`, while
 the configured hot-retention value must match `STORAGE_HOT_RETENTION_DAYS`.
 Never use those acceleration settings as the production retention policy.
+
+The disposable configuration must also override only these fields in the
+existing OSCAR service `videoRetentionConfig` before OSCAR starts:
+
+```json
+{
+  "timeToRetention": 0,
+  "videoQueryPeriod": 1,
+  "enableFrameRetention": true,
+  "frameRetentionCount": 5,
+  "jpegQuality": 85
+}
+```
+
+This is regression-only acceleration: zero days makes alarms from the current
+run eligible on the next one-minute query. Preserve the other
+`videoRetentionConfig` fields. Full-profile preflight reads the persisted live
+config and requires all five values before retained-media polling or cold-fixture
+creation, so a normal seven-day deployment fails early instead of timing out.
+Do not change the packaged default; use `timeToRetention=7` in production.
 The platform preflight also requires the archive purge helper to read from
 `/dev/null`; this proves that a helper invoked inside the work-list loop cannot
 consume subsequent rows and leave a multi-object purge plan partially applied.
@@ -161,6 +181,35 @@ responses to measure at most three requests in flight, then requires the newly
 selected frame to load, decode, and replace the initial image. Optionally provide
 `STORAGE_LEGACY_EVENT_ID` to prove a retained-media 404 still renders the legacy
 video. `STORAGE_EVENT_NODE_ID` is included in Event Details links when needed.
+
+The full profile additionally tests every gamma/neutron alarm it generates; it
+does not rely on `STORAGE_RETAINED_EVENT_ID` for this path. Before the first
+trigger, the target probe writes a private no-replace baseline of finalized MP4
+and partial/temp clip names across the videos bucket. Camera relationships come
+from the reserved lane's Viewer components and authenticated OSH systems
+catalog—emulator `camera_ids` are opaque stream IDs and are never used as OSCAR
+camera identities.
+
+For each selected Event Log row, the suite resolves the exact Event Details UUID
+and fetches that exact observation. `result.videoPaths` must contain exactly one
+nonblank unique path per configured lane camera, in normalized form
+`videos/clips/<camera-UID-with-colons-replaced>/<yyyy-MM-dd_HH-mm-ss_SSS>-g<positive-generation>.mp4`.
+Each camera token must own its path. The target requires every source to be a
+regular, non-symlink, nonzero object, and Chromium must load positive MP4
+duration and dimensions.
+
+After the accelerated cycle, each exact event UUID must return one retained
+manifest per source camera. Its `source.objectKey` must equal the already
+validated observation path, and its five quality-85 JPEGs must still pass size,
+hash, baseline-structure, dimension, and Chromium decode checks. The exact
+event/lane/camera `.job.json` ledger must be `PUBLISHED` or `SOURCE_DELETED`,
+have `attempts=1`, and have no failure. Finally, the probe derives only the
+authoritative camera tokens from this run's paths and compares those directories
+with the pre-trigger baseline: all expected sources are accounted for, with no
+additional finalized MP4 or new partial/temp artifact. Historical failures and
+partials present before the run therefore do not falsely fail the gate. The
+marker is removed after comparison and through the validated privileged failure
+cleanup path.
 
 ## Backup and performance
 

@@ -68,3 +68,46 @@ Inspect the Viewer message and OSCAR service logs, then retry the individual
 `reporting` or `adjudication-report` scenario. Lane/adjudication reports are
 intentionally scoped to the reserved lane to avoid an unnecessarily expensive
 all-lane query.
+
+## Generated alarm media association fails
+
+Start with the `alarm-media` rows in `functional-results.csv`. A camera-catalog
+failure means the reserved lane's camera `data-component-id` did not resolve to
+one unique UID in the authenticated OSH systems catalog; do not substitute the
+emulator's opaque `camera_ids`. A path failure means the exact occupancy has a
+missing, duplicate, foreign-camera, blank, or non-generation-qualified
+`result.videoPaths` value. The only accepted source form is
+`videos/clips/<camera-token>/<timestamp>-g<positive-generation>.mp4`.
+
+If source status fails, inspect only the reported paths and preserve OSCAR logs.
+If a source is nonzero but Chromium metadata fails, inspect the browser/network
+response and codec logs; file existence alone is not a valid substitute.
+
+## Generated alarm retention times out
+
+The full target must be disposable and its persisted OSCAR service config must
+have `timeToRetention=0`, `videoQueryPeriod=1`,
+`enableFrameRetention=true`, `frameRetentionCount=5`, and `jpegQuality=85`.
+Lifecycle preflight reports the observed `videoRetention` object and refuses the
+test before polling if any value differs. Seven days is the correct production
+default, but cannot retain a freshly generated alarm during this run.
+
+For a manifest/ledger failure, use the exact event and camera UIDs in the result.
+Confirm `manifest.source.objectKey` equals the earlier observation path and
+inspect only that deterministic `.job.json`. `FAILED`, a nonblank failure, or
+`attempts` other than one is a new-run failure; do not erase historical ledgers.
+
+## Alarm-media orphan or partial check fails
+
+The diff first subtracts the pre-trigger run baseline, then considers only
+camera-directory tokens bound to this run's exact generated events. Pre-existing
+files and failures do not count. Keep the reserved RPM quiet until
+`storage-lifecycle` ends and stop manual triggers for the same lane. A new extra
+MP4 usually means a camera close was not bound to a generated UUID; a new partial
+means a write was interrupted or incomplete.
+
+Normal and error cleanup remove the root-owned mode-0600
+`/tmp/oscar-alarm-media-<run-key>.baseline` through a validated privileged probe
+action. After a host/runner hard kill, preserve it with the run results until the
+cause is understood; remove only that exact run-key marker on the disposable
+target, never a broad `/tmp` pattern.

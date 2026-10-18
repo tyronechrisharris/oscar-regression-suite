@@ -66,6 +66,14 @@ export interface RetainedMediaAssessment {
   }>;
   declaredBytes: number;
   declaredPixels: number;
+  mediaSets: Array<{
+    laneUid: string;
+    cameraUid: string;
+    manifestPath: string;
+    sourceObjectKey: string;
+    sourceState: "PRESERVED_FOR_ROLLBACK" | "ELIGIBLE_FOR_DELETION" | "DELETED";
+    lifecycleState: "AVAILABLE" | "HELD";
+  }>;
 }
 
 /** Strictly validates the authenticated event-scoped retained-media contract. */
@@ -87,6 +95,7 @@ export function assessRetainedMediaResponse(
   const jpegQualities: number[] = [];
   const paths: string[] = [];
   const assets: RetainedMediaAssessment["assets"] = [];
+  const mediaSets: RetainedMediaAssessment["mediaSets"] = [];
   let frameCount = 0;
   let declaredBytes = 0;
   let declaredPixels = 0;
@@ -123,9 +132,27 @@ export function assessRetainedMediaResponse(
       100,
     ));
     const source = object(manifest.source, `mediaSets[${setIndex}].manifest.source`);
+    const sourceObjectKey = text(source.objectKey, `mediaSets[${setIndex}].manifest.source.objectKey`)
+      .replaceAll("\\", "/");
+    const sourceState = text(source.state, `mediaSets[${setIndex}].manifest.source.state`);
+    if (!["PRESERVED_FOR_ROLLBACK", "ELIGIBLE_FOR_DELETION", "DELETED"].includes(sourceState)) {
+      throw new Error(`mediaSets[${setIndex}] has an unsupported source state`);
+    }
+    const lifecycleState = text(manifest.lifecycleState, `mediaSets[${setIndex}].manifest.lifecycleState`);
+    if (!["AVAILABLE", "HELD"].includes(lifecycleState)) {
+      throw new Error(`mediaSets[${setIndex}] is not available to the authenticated media API`);
+    }
     sha256(source.sha256, `mediaSets[${setIndex}].manifest.source.sha256`);
     integer(source.bytes, `mediaSets[${setIndex}].manifest.source.bytes`, 1);
     instant(source.rollbackDeleteAfter, `mediaSets[${setIndex}].manifest.source.rollbackDeleteAfter`);
+    mediaSets.push({
+      laneUid,
+      cameraUid,
+      manifestPath,
+      sourceObjectKey,
+      sourceState: sourceState as RetainedMediaAssessment["mediaSets"][number]["sourceState"],
+      lifecycleState: lifecycleState as RetainedMediaAssessment["mediaSets"][number]["lifecycleState"],
+    });
     if (!Array.isArray(manifest.assets) || manifest.assets.length !== 5 ||
         !Array.isArray(mediaSet.assets) || mediaSet.assets.length !== 5) {
       throw new Error(`mediaSets[${setIndex}] must contain exactly five manifest and response assets`);
@@ -216,7 +243,7 @@ export function assessRetainedMediaResponse(
     throw new Error("retained-media response exceeds the event-wide decoded-pixel budget");
   }
   return {mediaSetCount: response.mediaSets.length, frameCount, cameraUids, jpegQualities, paths, assets,
-    declaredBytes, declaredPixels};
+    declaredBytes, declaredPixels, mediaSets};
 }
 
 export interface BaselineJpegInfo {
@@ -487,6 +514,13 @@ export interface StoragePlatformProbe {
   archiveIntervalMinutes: number | null;
   deleteHotAfterArchive: boolean | null;
   rollbackGraceDays: number | null;
+  videoRetention: {
+    enabled: boolean | null;
+    timeToRetentionDays: number | null;
+    queryPeriodMinutes: number | null;
+    frameCount: number | null;
+    jpegQuality: number | null;
+  };
 }
 
 export interface StorageRootIdentity {
@@ -740,6 +774,16 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
     deleteHotAfterArchive: typeof probe.deleteHotAfterArchive === "boolean"
       ? probe.deleteHotAfterArchive : null,
     rollbackGraceDays: nullableNumber(probe.rollbackGraceDays),
+    videoRetention: (() => {
+      const retention = object(probe.videoRetention, "videoRetention");
+      return {
+        enabled: typeof retention.enabled === "boolean" ? retention.enabled : null,
+        timeToRetentionDays: nullableNumber(retention.timeToRetentionDays),
+        queryPeriodMinutes: nullableNumber(retention.queryPeriodMinutes),
+        frameCount: nullableNumber(retention.frameCount),
+        jpegQuality: nullableNumber(retention.jpegQuality),
+      };
+    })(),
   };
 }
 

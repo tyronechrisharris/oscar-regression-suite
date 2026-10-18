@@ -26,9 +26,11 @@ function retainedResponse() {
     bytes: 4, width: 1, height: 1, sha256: "a".repeat(64),
   }));
   return {eventId, response: {schemaVersion: 1, eventId, mediaSets: [{
-    manifest: {schemaVersion: 1, eventId,
+    manifest: {schemaVersion: 1, eventId, lifecycleState: "AVAILABLE",
       mediaSetId: digest(`${eventId}\0${laneUid}\0${cameraUid}`), laneUid, cameraUid, jpegQuality: 85,
-      source: {sha256: "b".repeat(64), bytes: 100, rollbackDeleteAfter: "2026-10-18T00:00:00Z"}, assets},
+      source: {objectKey: "videos/clips/camera-01/2026-10-18_00-00-00_000-g1.mp4",
+        state: "PRESERVED_FOR_ROLLBACK", sha256: "b".repeat(64), bytes: 100,
+        rollbackDeleteAfter: "2026-10-18T00:00:00Z"}, assets},
     manifestPath: `media/${eventId}/${cameraToken}/manifest.json`,
     assets: assets.map((asset, index) => ({asset, path: `media/${eventId}/${cameraToken}/frame-0${index + 1}.jpg`})),
   }]}};
@@ -39,8 +41,24 @@ test("retained-media oracle requires exactly five canonical JPEG assets", () => 
   const result = assessRetainedMediaResponse(fixture.response, fixture.eventId);
   assert.equal(result.frameCount, 5);
   assert.equal(result.assets.length, 5);
+  assert.equal(result.mediaSets[0]?.sourceObjectKey,
+    "videos/clips/camera-01/2026-10-18_00-00-00_000-g1.mp4");
   fixture.response.mediaSets[0]!.manifest.assets.pop();
   assert.throws(() => assessRetainedMediaResponse(fixture.response, fixture.eventId), /exactly five/);
+});
+
+test("retained-media oracle exposes only source-bound available manifests", () => {
+  const blankSource = retainedResponse();
+  blankSource.response.mediaSets[0]!.manifest.source.objectKey = "";
+  assert.throws(() => assessRetainedMediaResponse(blankSource.response, blankSource.eventId), /objectKey/);
+
+  const failedSource = retainedResponse();
+  failedSource.response.mediaSets[0]!.manifest.source.state = "FAILED";
+  assert.throws(() => assessRetainedMediaResponse(failedSource.response, failedSource.eventId), /source state/);
+
+  const deleting = retainedResponse();
+  deleting.response.mediaSets[0]!.manifest.lifecycleState = "DELETING";
+  assert.throws(() => assessRetainedMediaResponse(deleting.response, deleting.eventId), /not available/);
 });
 
 test("retained-media oracle requires unique deterministic lowercase SHA-256 media-set IDs", () => {
@@ -234,12 +252,16 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     archiveMarker: {present: true, exact: true, format: "oscar-storage-profile", version: "3.9.2",
       dataChecksums: "on", initializedAt: "2026-10-17T12:00:00Z"},
     batchRewriteConfigured: true, dailyJournalConfigured: true, archiveIntervalMinutes: 1,
-    deleteHotAfterArchive: true, rollbackGraceDays: 1});
+    deleteHotAfterArchive: true, rollbackGraceDays: 1,
+    videoRetention: {enabled: true, timeToRetentionDays: 0, queryPeriodMinutes: 1,
+      frameCount: 5, jpegQuality: 85}});
   assert.equal(platform.schemaVersion, 4);
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
   assert.equal(platform.storageRoots.walArchive.rootKind, "wal-archive");
   assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
+  assert.deepEqual(platform.videoRetention, {enabled: true, timeToRetentionDays: 0,
+    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85});
   assert.equal(storagePlatformHasExactReleaseIdentity(platform, "3.9.2"), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, configuredRelease: "4.0.0"},

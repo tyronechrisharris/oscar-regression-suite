@@ -20,6 +20,13 @@ Correct-versus-incorrect ratios such as resolved tamper checks are obtained by
 filtering `category`/`action` and counting `status`. `summary.csv` also provides
 ready-to-chart totals by category.
 
+Generated media checks use `category=alarm-media` or `retained-media`. Their
+`target` is the exact public event UUID where applicable; `observed` records
+normalized source paths, OSH camera UIDs, metadata, manifest/frame counts,
+exact-ledger results, or run-scoped orphan/partial totals. Reviewers can
+therefore correlate the UUID-bound MP4 with its exact-five representation
+without depending on PostgreSQL table details.
+
 ## `performance.csv`
 
 | Column | Meaning |

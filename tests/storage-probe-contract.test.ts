@@ -94,6 +94,86 @@ test("storage probe remains valid Bash and gates exact 3.9.2 image identity", ()
   assert.doesNotMatch(probe, /lock_directory=\$\{OSCAR_STORAGE_LOCK_DIR/);
 });
 
+test("alarm-media probe scopes a no-replace baseline and removes every temporary marker", () => {
+  const start = probe.indexOf("  alarm-media-baseline)");
+  const end = probe.indexOf("  platform)", start);
+  const block = probe.slice(start, end);
+  assert.ok(start > 0 && end > start, "missing alarm-media probe actions");
+  for (const required of [
+    "alarm-media-baseline)",
+    "alarm-media-cleanup)",
+    "alarm-media-source-status)",
+    "alarm-media-ledger)",
+    "alarm-media-forensics)",
+    "alarm_all_camera_artifacts",
+    "baseline-final",
+    "baseline-partial",
+    "new-final",
+    "newFinalizedOrphans",
+    "newPartialArtifacts",
+    "expectedAlreadyPresentAtBaseline",
+  ]) assert.ok(block.includes(required), `missing alarm-media forensic contract: ${required}`);
+  assert.match(block, /ln -- "\$marker_tmp" "\$marker"/);
+  assert.doesNotMatch(block, /mv -- "\$marker_tmp" "\$marker"/);
+  assert.match(block, /chmod 600 "\$marker_tmp"/);
+  assert.match(block, /version\\t2/);
+  assert.match(block, /file_owner_id "\$marker"/);
+  assert.match(block, /file_mode "\$marker"/);
+  assert.match(block, /cut -d\/ -f3 "\$forensic_tmp\/expected"/);
+  assert.match(block, /camera\[path\[3\]\]/);
+  assert.match(block, /comm -13 "\$forensic_tmp\/baseline-final" "\$forensic_tmp\/current-final"/);
+  assert.match(block, /rm -f -- "\$marker"/);
+  assert.match(block, /trap cleanup_alarm_baseline EXIT/);
+  assert.match(block, /trap cleanup_alarm_forensics EXIT/);
+  assert.match(probe, /-g\[1-9\]\[0-9\]\*\\\.mp4/);
+});
+
+test("generated alarm-media scenario binds public observations, MP4 metadata, manifests, and ledgers", () => {
+  const start = scenarios.indexOf("private async configuredAlarmCameraUids");
+  const end = scenarios.indexOf("private storageUnavailable", start);
+  const block = scenarios.slice(start, end);
+  assert.ok(start > 0 && end > start, "missing generated alarm-media scenario coverage");
+  for (const required of [
+    "/sensorhub/api/observations/",
+    "/sensorhub/api/systems?searchMembers=true",
+    "cameraUidsForSystemComponents",
+    "assessAlarmVideoObservation",
+    "loadedmetadata",
+    "alarm-media-source-status",
+    "/sensorhub/buckets/videos/media/",
+    "assessRetainedMediaResponse",
+    "sourceByCamera.get(mediaSet.cameraUid) !== mediaSet.sourceObjectKey",
+    "alarm-media-ledger",
+    'ledger.attempts === 1',
+    'ledger.failure === ""',
+    "alarm-media-forensics",
+    "alarmMediaForensicsPassed",
+  ]) assert.ok(block.includes(required), `missing generated alarm-media assertion: ${required}`);
+  assert.match(block, /Buffer\.from\(item\.association\.eventId, "utf8"\)\.toString\("base64url"\)/);
+  assert.match(block, /generated\.flatMap\(item =>[\s\S]*item\.association\.paths/);
+  assert.match(block, /"alarm-media-baseline", \[this\.alarmMediaRunKey\(\)\]\)/);
+  assert.doesNotMatch(block, /baselineCreated:[\s\S]{0,120}cameras:/);
+  assert.doesNotMatch(block, /originalRpmConfig\?\.camera_ids/);
+});
+
+test("storage probe client registers privileged alarm baseline cleanup before an uncertain remote outcome", () => {
+  const client = readFileSync(resolve("src/storage-probe.ts"), "utf8");
+  const register = client.indexOf(
+    'if (action === "alarm-media-baseline" && alarmRun) this.alarmBaselineRuns.add(alarmRun)',
+  );
+  const remote = client.indexOf('const {stdout} = await execFileAsync("ssh"');
+  assert.ok(register > 0 && remote > register);
+  const cleanup = client.slice(client.indexOf("async cleanup(): Promise<void>"));
+  assert.match(cleanup, /for \(const run of this\.alarmBaselineRuns\)/);
+  assert.match(cleanup, /"sudo", "-n", "bash", this\.remoteScript/);
+  assert.match(cleanup, /"alarm-media-cleanup", run/);
+  assert.match(cleanup, /baselineCleanupError \?\?= error/);
+  assert.match(cleanup, /Unable to remove a privileged alarm-media baseline marker/);
+  assert.match(cleanup, /rm -f -- \$\{shellQuote\(this\.remoteScript\)\}/);
+  assert.doesNotMatch(cleanup, /rm -f -- \/tmp\/oscar-alarm-media/);
+  assert.match(cleanup, /this\.alarmBaselineRuns\.clear\(\)/);
+});
+
 test("platform probe binds roots, the stable lock, and exact helper provenance and behavior", () => {
   const block = probe.slice(probe.indexOf("  platform)"), probe.indexOf("  snapshot)"));
   for (const required of [
@@ -216,8 +296,11 @@ test("platform config probes remain pipefail-safe for a large persisted configur
   const helper = probe.match(/config_text_matches\(\) \{\n[\s\S]*?\n\}/)?.[0];
   assert.ok(helper, "missing config_text_matches helper");
   assert.match(helper, /grep -Eq -- "\$pattern" <<<"\$text"/);
-  assert.equal(block.match(/config_text_matches "\$config_text"/g)?.length, 4);
+  assert.equal(block.match(/config_text_matches "\$config_text"/g)?.length, 6);
   assert.doesNotMatch(block, /printf[^\n]*\$config_text[^\n]*\|[^\n]*grep/);
+  for (const field of [
+    "timeToRetention", "videoQueryPeriod", "enableFrameRetention", "frameRetentionCount", "jpegQuality",
+  ]) assert.ok(block.includes(field), `missing retained-media preflight field: ${field}`);
 
   const largeConfig = [
     '"OscarTieredObsSystemDatabase": {},',
@@ -459,7 +542,14 @@ test("storage lifecycle refuses mutation when exact release/profile preflight fa
   const fixtureCreate = scenarios.indexOf('"fixture-create-race"', start);
   const refusal = scenarios.indexOf("Storage lifecycle mutation refused", start);
   assert.ok(start > 0 && refusal > start && fixtureCreate > refusal);
-  assert.match(scenarios.slice(start, fixtureCreate), /if \(!profileAccepted\)/);
+  const block = scenarios.slice(start, fixtureCreate);
+  assert.match(block, /if \(!profileAccepted\)/);
+  assert.match(block, /media\.enabled === REGRESSION_MEDIA_RETENTION\.enabled/);
+  assert.match(block, /media\.timeToRetentionDays === REGRESSION_MEDIA_RETENTION\.timeToRetentionDays/);
+  assert.match(block, /media\.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION\.queryPeriodMinutes/);
+  assert.match(block, /media\.frameCount === REGRESSION_MEDIA_RETENTION\.frameCount/);
+  assert.match(block, /media\.jpegQuality === REGRESSION_MEDIA_RETENTION\.jpegQuality/);
+  assert.ok(block.indexOf("verifyGeneratedAlarmRetention") > block.indexOf("if (!profileAccepted)"));
 });
 
 test("storage lifecycle cleans an attempted fixture even when create acknowledgement is lost", () => {

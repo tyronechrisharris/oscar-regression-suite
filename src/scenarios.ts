@@ -5,6 +5,13 @@ import type {Locator, Page, Request} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {
+  alarmMediaForensicsPassed,
+  assessAlarmMediaForensics,
+  assessAlarmVideoObservation,
+  cameraUidsForSystemComponents,
+  type AlarmVideoAssociation,
+} from "./alarm-media-oracles.js";
+import {
   connectionDataStreamIds,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
@@ -63,6 +70,12 @@ interface ExportedAlarmArtifacts {
   qrImage: string;
 }
 
+interface GeneratedAlarmMedia {
+  alarmType: "gamma" | "neutron";
+  occupancyCount: number;
+  association: AlarmVideoAssociation;
+}
+
 type DashboardConnectionKind = "rpm" | "camera";
 type DashboardConnectionState = "online" | "offline" | "unknown";
 type DashboardFaultKind = "gamma-high" | "gamma-low" | "neutron-high" | "tamper" | "extended-occupancy";
@@ -83,6 +96,14 @@ const DASHBOARD_FAULT_LABELS: Record<DashboardFaultKind, string> = {
   "extended-occupancy": "Extended occupancy",
 };
 
+const REGRESSION_MEDIA_RETENTION = {
+  enabled: true,
+  timeToRetentionDays: 0,
+  queryPeriodMinutes: 1,
+  frameCount: 5,
+  jpegQuality: 85,
+} as const;
+
 function isVisible(locator: Locator): Promise<boolean> {
   return locator.isVisible().catch(() => false);
 }
@@ -92,6 +113,10 @@ export class RegressionScenarios {
   private originalRpmRunning: boolean | undefined;
   private originalRpmStatus: RpmStatus | null | undefined;
   private reservedLanePrepared = false;
+  private alarmMediaBaselineCreated = false;
+  private alarmMediaProbe: StorageProbeClient | undefined;
+  private alarmCameraUids: string[] | undefined;
+  private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
   private stopRequested: () => boolean = () => false;
   private activeScenario = "navigation";
 
@@ -302,19 +327,28 @@ export class RegressionScenarios {
 
   async runFull(): Promise<void> {
     try {
-      await this.hardMutationPreflight();
-      await this.prepareReservedLane();
-      await this.scenario("rpm-connection", () => this.connectionFault());
-      await this.scenario("rpm-faults", () => this.faults());
-      await this.scenario("rpm-alarms", () => this.alarms());
-      await this.scenario("event-uuid", () => this.eventUuidWorkflow());
-      await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
-      await this.scenario("extended-occupancy", () => this.extendedOccupancy());
-      await this.scenario("adjudication-report", () => this.reporting([{reportType: "ADJUDICATION"}]));
+      try {
+        await this.hardMutationPreflight();
+        await this.prepareReservedLane();
+        await this.scenario("rpm-connection", () => this.connectionFault());
+        await this.scenario("rpm-faults", () => this.faults());
+        await this.scenario("rpm-alarms", () => this.alarms());
+        await this.scenario("event-uuid", () => this.eventUuidWorkflow());
+        await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
+        await this.scenario("extended-occupancy", () => this.extendedOccupancy());
+        await this.scenario("adjudication-report", () => this.reporting([{reportType: "ADJUDICATION"}]));
+        // Keep the reserved RPM's automatic occupancy/alarm generation disabled until the
+        // scoped media baseline has been reconciled. Restoring its original random workload
+        // earlier could create legitimate, unrelated clips in the same camera directories and
+        // make an orphan check nondeterministic.
+        await this.scenario("storage-lifecycle", () => this.storageLifecycle());
+      } finally {
+        await this.restoreReservedLane();
+      }
     } finally {
-      await this.restoreReservedLane();
+      await this.alarmMediaProbe?.cleanup();
+      this.alarmMediaProbe = undefined;
     }
-    await this.scenario("storage-lifecycle", () => this.storageLifecycle());
   }
 
   async runRestoreDrill(): Promise<void> {
@@ -322,7 +356,12 @@ export class RegressionScenarios {
   }
 
   async emergencyCleanup(): Promise<void> {
-    await this.restoreReservedLane();
+    try {
+      await this.restoreReservedLane();
+    } finally {
+      await this.alarmMediaProbe?.cleanup();
+      this.alarmMediaProbe = undefined;
+    }
   }
 
   private async hardMutationPreflight(): Promise<void> {
@@ -2092,10 +2131,227 @@ export class RegressionScenarios {
     }
   }
 
+  private alarmMediaRunKey(): string {
+    return safeName(this.reporter.runId).replaceAll(/[.-]+/g, "_").slice(-80);
+  }
+
+  private async configuredAlarmCameraUids(): Promise<string[]> {
+    if (this.alarmCameraUids) return this.alarmCameraUids;
+    const page = await this.browser.oscarPage();
+    try {
+      await this.goto(page, "/");
+      const cameras = this.dashboardCard(page).locator(
+        `[data-testid="lane-health-${this.config.testLaneLabel}-camera"]`,
+      );
+      await cameras.first().waitFor({timeout: this.config.uiTimeoutMs});
+      const componentIds = (await cameras.evaluateAll(nodes => nodes.map(node =>
+        (node.getAttribute("data-component-id") ?? "").trim())))
+        .filter(Boolean);
+      const response = await page.context().request.get(this.viewerUrl(
+        "/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500",
+      ));
+      try {
+        if (!response.ok()) throw new Error(`camera systems catalog returned HTTP ${response.status()}`);
+        this.alarmCameraUids = cameraUidsForSystemComponents(await response.json(), componentIds);
+        return this.alarmCameraUids;
+      } finally {
+        await response.dispose();
+      }
+    } finally {
+      await page.close();
+    }
+  }
+
+  private async ensureAlarmMediaBaseline(scenario: string): Promise<void> {
+    if (this.alarmMediaBaselineCreated || this.config.storageWorkflow === "disabled") return;
+    if (!this.config.oscarSshTarget || !this.config.oscarReleaseDirectory) {
+      if (this.config.storageWorkflow === "required") {
+        throw new Error("Required alarm-media forensics need OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR");
+      }
+      return;
+    }
+    this.alarmMediaProbe ??= new StorageProbeClient(this.config, this.reporter.runId);
+    const created = await this.check({
+      scenario,
+      category: "alarm-media",
+      action: "capture pre-trigger alarm-media baseline",
+      target: this.config.testLaneLabel,
+      expected: "a private pre-trigger baseline inventories finalized and partial clips before any generated event exists",
+    }, async () => {
+      const value = await this.alarmMediaProbe!.runJson<{
+        baselineCreated: boolean;
+        baselineFinalized: number;
+        baselinePartials: number;
+      }>("alarm-media-baseline", [this.alarmMediaRunKey()]);
+      const passed = value.baselineCreated === true &&
+        Number.isSafeInteger(value.baselineFinalized) && value.baselineFinalized >= 0 &&
+        Number.isSafeInteger(value.baselinePartials) && value.baselinePartials >= 0;
+      return {passed, value: passed, observed: JSON.stringify(value)};
+    });
+    if (!created) throw new Error("Alarm trigger refused because its scoped media baseline failed");
+    this.alarmMediaBaselineCreated = true;
+  }
+
+  private async resolveAlarmEventUuid(
+    page: Page,
+    row: Locator,
+    type: "gamma" | "neutron",
+    occupancyCount: number,
+    scenario: string,
+  ): Promise<string | undefined> {
+    return this.check({
+      scenario,
+      category: "event-identity",
+      action: `resolve exact ${type} alarm UUID`,
+      target: `${this.config.testLaneLabel}:${occupancyCount}`,
+      expected: "the selected Event Log row opens an Event Details URL with the same nonblank occupancy UUID",
+    }, async () => {
+      await Promise.all([
+        page.waitForURL(
+          (url) => normalizePathname(url.pathname) === "/event-details",
+          {timeout: this.config.eventTimeoutMs, waitUntil: "domcontentloaded"},
+        ),
+        row.dblclick(),
+      ]);
+      const uuidValue = page.getByTestId("event-uuid-value");
+      await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
+      const eventId = (await uuidValue.innerText()).trim();
+      const url = new URL(page.url());
+      const passed = eventId.length > 0 && eventId.length <= 128 && url.searchParams.get("eventId") === eventId;
+      return {
+        passed,
+        value: passed ? eventId : undefined,
+        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}`,
+        evidence: passed ? "" : await this.screenshotOnFailure(page, `${scenario}-${type}-uuid`),
+      };
+    });
+  }
+
+  private async browserMp4Metadata(
+    page: Page,
+    paths: readonly string[],
+  ): Promise<Array<{path: string; loaded: boolean; duration: number; width: number; height: number}>> {
+    const urls = paths.map(path => ({path, url: this.viewerUrl(`/sensorhub/buckets/${path}`)}));
+    return page.evaluate(async ({items, timeoutMs}) => {
+      const results: Array<{path: string; loaded: boolean; duration: number; width: number; height: number}> = [];
+      for (const item of items) {
+        const video = document.createElement("video");
+        video.preload = "metadata";
+        video.muted = true;
+        video.playsInline = true;
+        video.style.display = "none";
+        document.body.append(video);
+        const metadata = await new Promise<{loaded: boolean; duration: number; width: number; height: number}>(resolve => {
+          let settled = false;
+          const finish = (loaded: boolean) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve({
+              loaded,
+              duration: Number.isFinite(video.duration) ? video.duration : 0,
+              width: video.videoWidth,
+              height: video.videoHeight,
+            });
+          };
+          const timer = window.setTimeout(() => finish(false), timeoutMs);
+          video.addEventListener("loadedmetadata", () => finish(video.readyState >= HTMLMediaElement.HAVE_METADATA),
+            {once: true});
+          video.addEventListener("error", () => finish(false), {once: true});
+          video.src = item.url;
+          video.load();
+        });
+        video.removeAttribute("src");
+        video.load();
+        video.remove();
+        results.push({path: item.path, ...metadata});
+      }
+      return results;
+    }, {items: urls, timeoutMs: Math.min(this.config.eventTimeoutMs, 30_000)});
+  }
+
+  private async captureAlarmMedia(
+    page: Page,
+    eventId: string,
+    type: "gamma" | "neutron",
+    occupancyCount: number,
+    scenario: string,
+  ): Promise<void> {
+    const association = await this.check({
+      scenario,
+      category: "alarm-media",
+      action: `bind ${type} alarm UUID to camera clips`,
+      target: eventId,
+      expected: "authoritative result.videoPaths contains one unique generation-qualified MP4 for every OSH camera system on the lane",
+    }, async () => {
+      const cameraUids = await this.configuredAlarmCameraUids();
+      const value = await poll(async () => {
+        const response = await page.context().request.get(
+          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(eventId)}`),
+          {headers: {Accept: "application/om+json"}},
+        );
+        try {
+          if (!response.ok()) throw new Error(`observation resource returned HTTP ${response.status()}`);
+          return assessAlarmVideoObservation(await response.json(), eventId, cameraUids);
+        } finally {
+          await response.dispose();
+        }
+      }, candidate => candidate.paths.length === cameraUids.length, {
+        timeoutMs: this.config.eventTimeoutMs,
+        intervalMs: 1_000,
+        description: `${type} alarm ${eventId} to persist authoritative videoPaths`,
+      });
+      return {
+        passed: true,
+        value,
+        observed: `${value.paths.length} unique path(s); cameras=${value.paths.map(path => path.cameraUid).join(",")}`,
+      };
+    });
+    if (!association) return;
+    this.generatedAlarmMedia.set(eventId, {alarmType: type, occupancyCount, association});
+
+    if (this.alarmMediaProbe) {
+      await this.check({
+        scenario,
+        category: "alarm-media",
+        action: `verify ${type} source objects exist`,
+        target: eventId,
+        expected: "every persisted video path is a non-symlink, nonzero source object in the videos bucket",
+      }, async () => {
+        const value = await this.alarmMediaProbe!.runJson<{paths: number; existing: number; nonzero: number}>(
+          "alarm-media-source-status",
+          association.paths.map(({path}) => path),
+        );
+        const passed = value.paths === association.paths.length && value.existing === value.paths &&
+          value.nonzero === value.paths;
+        return {passed, observed: JSON.stringify(value)};
+      });
+    }
+
+    await this.check({
+      scenario,
+      category: "alarm-media",
+      action: `load ${type} alarm MP4 metadata in Chromium`,
+      target: eventId,
+      expected: "every persisted camera MP4 reaches browser loadedmetadata with a positive duration and dimensions",
+    }, async () => {
+      const metadata = await this.browserMp4Metadata(page, association.paths.map(({path}) => path));
+      const passed = metadata.length === association.paths.length && metadata.every(item =>
+        item.loaded && item.duration > 0 && item.width > 0 && item.height > 0);
+      return {
+        passed,
+        observed: metadata.map(item =>
+          `${item.path}: loaded=${item.loaded}, duration=${item.duration}, ${item.width}x${item.height}`).join("; "),
+        evidence: passed ? "" : await this.screenshotOnFailure(page, `${scenario}-${type}-mp4`),
+      };
+    });
+  }
+
   private async triggerAlarm(
     type: "gamma" | "neutron",
     scenario = "rpm-alarms",
   ): Promise<number | undefined> {
+    await this.ensureAlarmMediaBaseline(scenario);
     const before = await this.emulator.waitForIdle(this.config.testRpmId);
     await this.emulator.trigger(this.config.testRpmId, type === "gamma", type === "neutron");
     const active = await this.emulator.waitForStatus(
@@ -2146,14 +2402,19 @@ export class RegressionScenarios {
       for (const type of ["gamma", "neutron"] as const) {
         const occupancyCount = await this.triggerAlarm(type);
         if (occupancyCount === undefined) throw new Error(`${type} trigger returned no occupancy count`);
-        await this.check({
+        const ingested = await this.check({
           scenario: "rpm-alarms", category: "event-ingestion", action: `ingest ${type} alarm`,
           target: this.config.testLaneLabel, expected: `Event Log shows a new ${type} event on the reserved lane`,
         }, async () => {
           const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
           const text = await row.innerText();
-          return {passed: new RegExp(type, "i").test(text), observed: text};
+          const passed = new RegExp(type, "i").test(text);
+          return {passed, value: passed, observed: text};
         });
+        if (!ingested) continue;
+        const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+        const eventId = await this.resolveAlarmEventUuid(page, row, type, occupancyCount, "rpm-alarms");
+        if (eventId) await this.captureAlarmMedia(page, eventId, type, occupancyCount, "rpm-alarms");
       }
     } finally { await page.close(); }
   }
@@ -2270,6 +2531,7 @@ export class RegressionScenarios {
       if (!eventUuid) return;
       const eventNodeId = new URL(page.url()).searchParams.get("nodeId");
       if (!eventNodeId) return;
+      await this.captureAlarmMedia(page, eventUuid, "gamma", occupancyCount, "event-uuid");
 
       const origin = new URL(this.config.oscarBaseUrl).origin;
       await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {origin});
@@ -2630,6 +2892,13 @@ export class RegressionScenarios {
       });
 
       if (alarmArtifacts) {
+        await this.captureAlarmMedia(
+          page,
+          alarmArtifacts.observationId,
+          "gamma",
+          occupancyCount,
+          "adjudication",
+        );
         const importPage = await this.browser.oscarPage();
         try {
           const imported = await this.check({
@@ -2829,6 +3098,165 @@ export class RegressionScenarios {
         };
       });
     } finally { await page.close(); }
+  }
+
+  private async verifyGeneratedAlarmRetention(probe: StorageProbeClient): Promise<void> {
+    if (!this.alarmMediaBaselineCreated || this.generatedAlarmMedia.size === 0) return;
+    const generated = [...this.generatedAlarmMedia.values()];
+    const page = await this.browser.oscarPage();
+    try {
+      await this.goto(page, "/");
+      const retained = await this.check({
+        scenario: "storage-lifecycle",
+        category: "retained-media",
+        action: "retain the exact generated alarm clips as five frames",
+        target: `${generated.length} generated alarm event(s)`,
+        expected: "each exact UUID has one source-bound manifest per camera and five quality-85, hash-valid, Chromium-decodable JPEGs per source",
+      }, async () => {
+        const assessments = await poll(async () => {
+          const available = new Map<string, ReturnType<typeof assessRetainedMediaResponse>>();
+          for (const item of generated) {
+            const eventId = item.association.eventId;
+            const response = await page.context().request.get(this.viewerUrl(
+              `/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`,
+            ));
+            try {
+              if (response.status() === 404) continue;
+              if (!response.ok()) throw new Error(`retained-media API returned HTTP ${response.status()} for ${eventId}`);
+              const assessment = assessRetainedMediaResponse(await response.json(), eventId);
+              const sourceByCamera = new Map(item.association.paths.map(path => [path.cameraUid, path.path]));
+              if (assessment.mediaSetCount !== sourceByCamera.size || assessment.frameCount !== sourceByCamera.size * 5 ||
+                  assessment.jpegQualities.some(quality => quality !== 85) ||
+                  assessment.mediaSets.some(mediaSet => sourceByCamera.get(mediaSet.cameraUid) !== mediaSet.sourceObjectKey) ||
+                  assessment.mediaSets.some(mediaSet => !sourceByCamera.has(mediaSet.cameraUid))) {
+                throw new Error(`retained manifests do not bind exactly to alarm ${eventId} videoPaths`);
+              }
+              available.set(eventId, assessment);
+            } finally {
+              await response.dispose();
+            }
+          }
+          return available;
+        }, value => value.size === generated.length, {
+          timeoutMs: this.config.storageArchiveTimeoutMs,
+          intervalMs: 5_000,
+          description: "accelerated retention to publish exact generated alarm manifests",
+        });
+
+        let validFrames = 0;
+        let expectedFrames = 0;
+        for (const assessment of assessments.values()) {
+          expectedFrames += assessment.frameCount;
+          for (const asset of assessment.assets) {
+            const imageUrl = this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`);
+            const image = await page.context().request.get(imageUrl);
+            try {
+              const bytes = Buffer.from(await image.body());
+              const contentType = (image.headers()["content-type"] ?? "").split(";", 1)[0]?.trim();
+              const structureValid = image.ok() && contentType === asset.contentType &&
+                assessJpeg(bytes, asset.bytes, asset.sha256, asset.width, asset.height);
+              const decoded = structureValid ? await page.evaluate(async ({url, width, height}) => {
+                const response = await fetch(url, {credentials: "include", cache: "no-store"});
+                if (!response.ok) return false;
+                const blob = await response.blob();
+                if (blob.type !== "image/jpeg") return false;
+                try {
+                  const bitmap = await createImageBitmap(blob);
+                  const valid = bitmap.width === width && bitmap.height === height;
+                  bitmap.close();
+                  return valid;
+                } catch {
+                  return false;
+                }
+              }, {url: imageUrl, width: asset.width, height: asset.height}) : false;
+              if (structureValid && decoded) validFrames++;
+            } finally {
+              await image.dispose();
+            }
+          }
+        }
+        const passed = validFrames === expectedFrames;
+        return {
+          passed,
+          value: passed ? assessments : undefined,
+          observed: `${assessments.size}/${generated.length} exact event manifest(s); ` +
+            `${validFrames}/${expectedFrames} hash-valid and browser-decodable retained JPEGs`,
+          evidence: passed ? "" : await this.screenshotOnFailure(page, "generated-alarm-retention"),
+        };
+      });
+
+      if (retained) {
+        await this.check({
+          scenario: "storage-lifecycle",
+          category: "retained-media",
+          action: "verify generated alarm retention ledgers did not retry",
+          target: `${generated.length} generated alarm event(s)`,
+          expected: "each exact event/camera ledger is published once, has no failure, and names the persisted source path",
+        }, async () => {
+          let checked = 0;
+          const failures: string[] = [];
+          for (const item of generated) {
+            const assessment = retained.get(item.association.eventId);
+            if (!assessment) {
+              failures.push(`${item.association.eventId}: missing retained assessment`);
+              continue;
+            }
+            const sourceByCamera = new Map(item.association.paths.map(path => [path.cameraUid, path.path]));
+            for (const mediaSet of assessment.mediaSets) {
+              const value = await probe.runJson<{
+                exists?: boolean;
+                ledger?: {
+                  eventId?: string;
+                  laneUid?: string;
+                  cameraUid?: string;
+                  sourceObjectKey?: string;
+                  state?: string;
+                  attempts?: number;
+                  failure?: string;
+                };
+              }>("alarm-media-ledger", [
+                Buffer.from(item.association.eventId, "utf8").toString("base64url"),
+                Buffer.from(mediaSet.laneUid, "utf8").toString("base64url"),
+                Buffer.from(mediaSet.cameraUid, "utf8").toString("base64url"),
+              ]);
+              const ledger = value.ledger;
+              const expectedSource = sourceByCamera.get(mediaSet.cameraUid);
+              const valid = value.exists === true && ledger?.eventId === item.association.eventId &&
+                ledger.laneUid === mediaSet.laneUid && ledger.cameraUid === mediaSet.cameraUid &&
+                ledger.sourceObjectKey?.replaceAll("\\", "/") === expectedSource &&
+                (ledger.state === "PUBLISHED" || ledger.state === "SOURCE_DELETED") &&
+                ledger.attempts === 1 && ledger.failure === "";
+              checked++;
+              if (!valid) failures.push(`${item.association.eventId}/${mediaSet.cameraUid}: invalid ledger`);
+            }
+          }
+          return {
+            passed: failures.length === 0 && checked === generated.reduce(
+              (count, item) => count + item.association.paths.length, 0),
+            observed: `${checked} exact ledger(s); failures=${failures.join("; ") || "none"}`,
+          };
+        });
+      }
+
+      await this.check({
+        scenario: "storage-lifecycle",
+        category: "alarm-media",
+        action: "reject new orphan or partial alarm media",
+        target: this.config.testLaneLabel,
+        expected: "since the scoped run baseline, every new finalized MP4 is UUID-bound, no new partial exists, and no generated path predates the run",
+      }, async () => {
+        const expectedPaths = [...new Set(generated.flatMap(item =>
+          item.association.paths.map(({path}) => path)))];
+        const value = assessAlarmMediaForensics(
+          await probe.runJson("alarm-media-forensics", [this.alarmMediaRunKey(), ...expectedPaths]),
+          expectedPaths.length,
+        );
+        return {passed: alarmMediaForensicsPassed(value), observed: JSON.stringify(value)};
+      });
+      this.alarmMediaBaselineCreated = false;
+    } finally {
+      await page.close();
+    }
   }
 
   private storageUnavailable(scenario: string): boolean {
@@ -3054,7 +3482,7 @@ export class RegressionScenarios {
 
   private async storageLifecycle(): Promise<void> {
     if (this.storageUnavailable("storage-lifecycle")) return;
-    const probe = new StorageProbeClient(this.config, this.reporter.runId);
+    const probe = this.alarmMediaProbe ?? new StorageProbeClient(this.config, this.reporter.runId);
     const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
     let fixtureCreateAttempted = false;
     let apiPage: Page | undefined;
@@ -3062,10 +3490,16 @@ export class RegressionScenarios {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
-        expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, and accelerated one-day disposable archive profile are running"}, async () => {
+        expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, one-day archive profile, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
+        const media = platform.videoRetention;
         const passed = storagePlatformHasExactReleaseIdentity(platform, this.config.storageExpectedRelease) &&
             platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
-            platform.archiveIntervalMinutes === 1;
+            platform.archiveIntervalMinutes === 1 &&
+            media.enabled === REGRESSION_MEDIA_RETENTION.enabled &&
+            media.timeToRetentionDays === REGRESSION_MEDIA_RETENTION.timeToRetentionDays &&
+            media.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION.queryPeriodMinutes &&
+            media.frameCount === REGRESSION_MEDIA_RETENTION.frameCount &&
+            media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality;
         return {
           passed,
           value: passed,
@@ -3073,8 +3507,11 @@ export class RegressionScenarios {
         };
       });
       if (!profileAccepted) {
-        throw new Error("Storage lifecycle mutation refused because the exact accelerated 3.9.2 profile failed");
+        throw new Error(
+          "Storage lifecycle mutation refused because the exact accelerated 3.9.2 archive/media test profile failed",
+        );
       }
+      await this.verifyGeneratedAlarmRetention(probe);
       this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
       fixtureCreateAttempted = true;
       const fixture = await probe.runJson<{coldId: string; hotId: string; datastreamId: number;
@@ -3208,6 +3645,7 @@ export class RegressionScenarios {
       if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
         this.reporter.error("storage-lifecycle", "fixture-cleanup", error));
       await probe.cleanup();
+      if (this.alarmMediaProbe === probe) this.alarmMediaProbe = undefined;
     }
   }
 

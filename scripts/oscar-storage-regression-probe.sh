@@ -56,6 +56,36 @@ retention_hold_id_from_output() {
 valid_deployment_id() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
 valid_store_key() { [[ $1 =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; }
 valid_id_scope() { [[ $1 =~ ^-?[0-9]+$ && $1 -ge -2147483648 && $1 -le 2147483647 ]]; }
+valid_media_token() { [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]; }
+valid_alarm_video_path() {
+  [[ $1 =~ ^videos/clips/[A-Za-z0-9._-]+/[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])_([01][0-9]|2[0-3])-[0-5][0-9]-[0-5][0-9]_[0-9]{3}-g[1-9][0-9]*\.mp4$ ]]
+}
+alarm_media_marker() {
+  valid_run "$1" || fail 'Alarm-media run ID is invalid.'
+  printf '/tmp/oscar-alarm-media-%s.baseline' "$1"
+}
+alarm_all_camera_artifacts() {
+  local listing full relative name kind
+  listing=$(compose exec -T oscar sh -eu -c '
+    root=/var/lib/oscar/files/videos/clips
+    test ! -L "$root"
+    test -d "$root" || exit 0
+    find "$root" -mindepth 2 -maxdepth 2 -type f -print
+  ' alarm-camera-artifacts)
+  while IFS= read -r full; do
+    [[ -n $full ]] || continue
+    relative=${full#/var/lib/oscar/files/}
+    [[ $relative =~ ^videos/clips/[A-Za-z0-9._-]+/[^/]+$ ]] ||
+      fail 'Alarm-media inventory encountered an unsafe clip path.'
+    name=${relative##*/}
+    case $name in
+      *.partial-*|*.partial|*.partial.*|*.tmp|*.tmp.*) kind=partial ;;
+      *.mp4) kind=final ;;
+      *) continue ;;
+    esac
+    printf '%s\t%s\n' "$kind" "$relative"
+  done <<<"$listing" | sort -u
+}
 env_value() {
   local name=$1 fallback=$2 value
   value=$(awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' .env)
@@ -272,6 +302,127 @@ create_observation_fixture() {
 }
 
 case $action in
+  alarm-media-baseline)
+    run=${1:-}
+    (($# == 1)) || fail 'Alarm-media baseline requires exactly one run ID.'
+    valid_run "$run" || fail 'Alarm-media baseline requires a valid run ID.'
+    marker=$(alarm_media_marker "$run")
+    [[ ! -e $marker && ! -L $marker ]] || fail 'Alarm-media baseline marker already exists.'
+    artifacts=$(alarm_all_camera_artifacts)
+    marker_tmp=$(mktemp "/tmp/.oscar-alarm-media-$run.XXXXXX")
+    cleanup_alarm_baseline() { rm -f -- "$marker_tmp"; }
+    trap cleanup_alarm_baseline EXIT
+    {
+      printf 'version\t2\n'
+      [[ -z $artifacts ]] || printf '%s\n' "$artifacts"
+    } >"$marker_tmp"
+    chmod 600 "$marker_tmp"
+    ln -- "$marker_tmp" "$marker"
+    rm -f -- "$marker_tmp"
+    trap - EXIT
+    baseline_finalized=$(awk -F '\t' '$1=="final" {count++} END {print count+0}' "$marker")
+    baseline_partials=$(awk -F '\t' '$1=="partial" {count++} END {print count+0}' "$marker")
+    printf '{"baselineCreated":true,"baselineFinalized":%s,"baselinePartials":%s}\n' \
+      "$baseline_finalized" "$baseline_partials"
+    ;;
+  alarm-media-cleanup)
+    run=${1:-}
+    (($# == 1)) || fail 'Alarm-media cleanup requires exactly one run ID.'
+    valid_run "$run" || fail 'Alarm-media cleanup requires a valid run ID.'
+    marker=$(alarm_media_marker "$run")
+    if [[ ! -e $marker && ! -L $marker ]]; then
+      printf '{"removed":false}\n'
+      exit 0
+    fi
+    [[ -f $marker && ! -L $marker && $(file_owner_id "$marker") == 0 && $(file_mode "$marker") == 600 ]] ||
+      fail 'Alarm-media cleanup refused an unsafe baseline marker.'
+    [[ $(grep -Fxc $'version\t2' "$marker") == 1 ]] ||
+      fail 'Alarm-media cleanup refused an unknown baseline marker.'
+    rm -f -- "$marker"
+    printf '{"removed":true}\n'
+    ;;
+  alarm-media-source-status)
+    (($# > 0)) || fail 'Alarm-media source status requires at least one path.'
+    source_paths=$#
+    source_existing=0
+    source_nonzero=0
+    for source_path in "$@"; do
+      valid_alarm_video_path "$source_path" || fail "Alarm-media source path is invalid: $source_path"
+      source_status=$(compose exec -T oscar sh -eu -c '
+        source=/var/lib/oscar/files/$1
+        if test -f "$source" && test ! -L "$source"; then
+          bytes=$(wc -c <"$source" | tr -d "[:space:]")
+          printf "1\\t%s\\n" "${bytes:-0}"
+        else
+          printf "0\\t0\\n"
+        fi
+      ' alarm-media-source "$source_path")
+      source_exists=${source_status%%$'\t'*}
+      source_bytes=${source_status#*$'\t'}
+      [[ $source_exists == 1 ]] && source_existing=$((source_existing+1))
+      [[ $source_bytes =~ ^[0-9]+$ ]] || fail 'Alarm-media source returned an invalid byte count.'
+      ((source_bytes > 0)) && source_nonzero=$((source_nonzero+1))
+    done
+    printf '{"paths":%s,"existing":%s,"nonzero":%s}\n' \
+      "$source_paths" "$source_existing" "$source_nonzero"
+    ;;
+  alarm-media-ledger)
+    event_token=${1:-}; lane_token=${2:-}; camera_token=${3:-}
+    (($# == 3)) || fail 'Alarm-media ledger requires event, lane, and camera tokens.'
+    valid_media_token "$event_token" && valid_media_token "$lane_token" && valid_media_token "$camera_token" ||
+      fail 'Alarm-media ledger token is invalid.'
+    ledger_key="retained-media/v1/events/$event_token/lanes/$lane_token/cameras/$camera_token/.job.json"
+    ledger_json=$(compose exec -T oscar sh -eu -c '
+      ledger=/var/lib/oscar/files/videos/$1
+      if test ! -f "$ledger" || test -L "$ledger"; then
+        printf "{\\"exists\\":false}\\n"
+        exit 0
+      fi
+      compact=$(tr -d "\\r\\n" <"$ledger")
+      case $compact in \{*\}) ;; *) exit 2 ;; esac
+      printf "{\\"exists\\":true,\\"ledger\\":%s}\\n" "$compact"
+    ' alarm-media-ledger "$ledger_key")
+    printf '%s\n' "$ledger_json"
+    ;;
+  alarm-media-forensics)
+    run=${1:-}; shift || true
+    valid_run "$run" || fail 'Alarm-media forensics requires a valid run ID.'
+    (($# > 0)) || fail 'Alarm-media forensics requires generated source paths.'
+    marker=$(alarm_media_marker "$run")
+    [[ -f $marker && ! -L $marker && $(file_owner_id "$marker") == 0 && $(file_mode "$marker") == 600 ]] ||
+      fail 'Alarm-media baseline marker is missing or unsafe.'
+    [[ $(grep -Fxc $'version\t2' "$marker") == 1 ]] || fail 'Alarm-media baseline marker has an unknown version.'
+    for source_path in "$@"; do valid_alarm_video_path "$source_path" || fail 'Generated alarm-media path is invalid.'; done
+    forensic_tmp=$(mktemp -d "/tmp/.oscar-alarm-media-forensics-$run.XXXXXX")
+    cleanup_alarm_forensics() { rm -rf -- "$forensic_tmp"; }
+    trap cleanup_alarm_forensics EXIT
+    printf '%s\n' "$@" | sort -u >"$forensic_tmp/expected"
+    [[ $(wc -l <"$forensic_tmp/expected" | tr -d '[:space:]') == $# ]] ||
+      fail 'Generated alarm-media paths contain duplicates.'
+    cut -d/ -f3 "$forensic_tmp/expected" | sort -u >"$forensic_tmp/cameras"
+    awk -F '\t' 'NR==FNR {camera[$1]=1; next} $1=="final" {split($2,path,"/"); if (camera[path[3]]) print $2}' \
+      "$forensic_tmp/cameras" "$marker" | sort -u >"$forensic_tmp/baseline-final"
+    awk -F '\t' 'NR==FNR {camera[$1]=1; next} $1=="partial" {split($2,path,"/"); if (camera[path[3]]) print $2}' \
+      "$forensic_tmp/cameras" "$marker" | sort -u >"$forensic_tmp/baseline-partial"
+    alarm_all_camera_artifacts >"$forensic_tmp/current-all"
+    awk -F '\t' 'NR==FNR {camera[$1]=1; next} $1=="final" {split($2,path,"/"); if (camera[path[3]]) print $2}' \
+      "$forensic_tmp/cameras" "$forensic_tmp/current-all" | sort -u >"$forensic_tmp/current-final"
+    awk -F '\t' 'NR==FNR {camera[$1]=1; next} $1=="partial" {split($2,path,"/"); if (camera[path[3]]) print $2}' \
+      "$forensic_tmp/cameras" "$forensic_tmp/current-all" | sort -u >"$forensic_tmp/current-partial"
+    comm -13 "$forensic_tmp/baseline-final" "$forensic_tmp/current-final" >"$forensic_tmp/new-final"
+    expected_paths=$(wc -l <"$forensic_tmp/expected" | tr -d '[:space:]')
+    current_expected=$(comm -12 "$forensic_tmp/expected" "$forensic_tmp/current-final" | wc -l | tr -d '[:space:]')
+    new_finalized=$(wc -l <"$forensic_tmp/new-final" | tr -d '[:space:]')
+    new_orphans=$(comm -23 "$forensic_tmp/new-final" "$forensic_tmp/expected" | wc -l | tr -d '[:space:]')
+    new_partials=$(comm -13 "$forensic_tmp/baseline-partial" "$forensic_tmp/current-partial" | wc -l | tr -d '[:space:]')
+    baseline_collisions=$(comm -12 "$forensic_tmp/expected" "$forensic_tmp/baseline-final" | wc -l | tr -d '[:space:]')
+    rm -f -- "$marker"
+    printf '{"baselineFound":true,"expectedPaths":%s,"currentExpectedPaths":%s,' \
+      "$expected_paths" "$current_expected"
+    printf '"newFinalizedPaths":%s,"newFinalizedOrphans":%s,"newPartialArtifacts":%s,' \
+      "$new_finalized" "$new_orphans" "$new_partials"
+    printf '"expectedAlreadyPresentAtBaseline":%s}\n' "$baseline_collisions"
+    ;;
   platform)
     expected_release=3.9.2
     configured_release=$(env_value OSCAR_VERSION missing)
@@ -610,6 +761,12 @@ case $action in
     [[ -n $config ]] && config_text=$(compose exec -T oscar sh -c "cat -- '$config'" 2>/dev/null || true)
     interval=$(printf '%s' "$config_text" | sed -n 's/.*"intervalMinutes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
     grace=$(printf '%s' "$config_text" | sed -n 's/.*"rollbackGraceDays"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    media_retention=$(printf '%s' "$config_text" | sed -n 's/.*"timeToRetention"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    media_query_period=$(printf '%s' "$config_text" | sed -n 's/.*"videoQueryPeriod"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    media_frame_count=$(printf '%s' "$config_text" | sed -n 's/.*"frameRetentionCount"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    media_jpeg_quality=$(printf '%s' "$config_text" | sed -n 's/.*"jpegQuality"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
+    media_enabled=null; config_text_matches "$config_text" '"enableFrameRetention"[[:space:]]*:[[:space:]]*true' && media_enabled=true || true
+    config_text_matches "$config_text" '"enableFrameRetention"[[:space:]]*:[[:space:]]*false' && media_enabled=false || true
     delete_hot=null; config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true' && delete_hot=true || true
     config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*false' && delete_hot=false || true
     schema=$(scalar "SELECT coalesce(max(version),0) FROM oscar_storage_schema_version;")
@@ -680,8 +837,11 @@ case $action in
       "$checksums" "$([[ $installed == t ]] && echo true || echo false)" "$([[ $preloaded == t ]] && echo true || echo false)" "$schema"
     printf '"archiveMarker":{"present":%s,"exact":%s,"format":"%s","version":"%s","dataChecksums":"%s","initializedAt":"%s"},' \
       "$marker_present" "$marker_exact" "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"
-    printf '"batchRewriteConfigured":%s,"dailyJournalConfigured":%s,"archiveIntervalMinutes":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s}\n' \
+    printf '"batchRewriteConfigured":%s,"dailyJournalConfigured":%s,"archiveIntervalMinutes":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
       "$batch" "$journal" "${interval:-null}" "$delete_hot" "${grace:-null}"
+    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"frameCount":%s,"jpegQuality":%s}}\n' \
+      "$media_enabled" "${media_retention:-null}" "${media_query_period:-null}" \
+      "${media_frame_count:-null}" "${media_jpeg_quality:-null}"
     ;;
 
   snapshot)

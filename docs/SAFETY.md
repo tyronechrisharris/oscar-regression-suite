@@ -36,6 +36,13 @@ verified backups according to the target's configured count; restore is never
 attempted. Do not enable this path on production or a target containing data
 that must be preserved.
 
+The same disposable target must explicitly use `timeToRetention=0`,
+`videoQueryPeriod=1`, `enableFrameRetention=true`, `frameRetentionCount=5`, and
+`jpegQuality=85` for the generated-alarm media check. The suite verifies those
+live values before it polls or creates the archive fixture; it never edits the
+configuration. OSCAR's packaged and production age default remains seven days.
+Never copy the zero-day test setting into production.
+
 The only restore coverage is the separately selected `restore-drill` profile.
 It is rejected unless `STORAGE_WORKFLOW=required`, the ordinary target and
 disposable-storage acknowledgements pass, all three storage-plane directories
@@ -81,6 +88,11 @@ a deterministic quiet configuration. The suite then toggles connection and fault
 states, creates gamma/neutron occupancies, submits a Code 9 adjudication with a
 `REG-...` vehicle identifier and run-ID note, and creates report files.
 
+The reserved RPM stays quiet through `storage-lifecycle`, so each new clip in
+its authoritative camera directories can be bound to an exact generated UUID.
+The lifecycle may publish five retained JPEGs and durable media ledger/catalog
+records for each generated alarm.
+
 Event and adjudication history is intentionally not deleted. It is audit data and
 is the expected permanent footprint of a full run.
 
@@ -94,6 +106,12 @@ records whether the restored state matches.
 Normal exceptions are contained and cleanup runs in `finally`. `SIGINT` and
 `SIGTERM` request emergency cleanup. A hard kill, runner power loss, or emulator
 loss can prevent it.
+
+Alarm-media forensics uses one root-owned mode-0600 marker named
+`/tmp/oscar-alarm-media-<run-key>.baseline`. Normal completion and failure
+cleanup use a privileged probe action derived only from the validated run key;
+the copied probe is then removed without privilege. Pre-existing clip or ledger
+failures are not changed or attributed to the new run.
 
 ## Manual recovery after a hard interruption
 

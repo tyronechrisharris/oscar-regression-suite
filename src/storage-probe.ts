@@ -7,6 +7,7 @@ const execFileAsync = promisify(execFile);
 const TARGET_PATTERN = /^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9A-Fa-f:]+\])$/;
 const ACTION_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 const ARGUMENT_PATTERN = /^[A-Za-z0-9_./:@+=,-]{1,512}$/;
+const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/;
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -16,6 +17,7 @@ export class StorageProbeClient {
   private readonly target: string;
   private readonly releaseDirectory: string;
   private readonly remoteScript: string;
+  private readonly alarmBaselineRuns = new Set<string>();
   private installed = false;
 
   constructor(private readonly config: SuiteConfig, runId: string) {
@@ -56,6 +58,10 @@ export class StorageProbeClient {
     if (args.some(argument => !ARGUMENT_PATTERN.test(argument))) {
       throw new Error("Storage probe argument contains unsupported characters");
     }
+    const alarmRun = args[0] && RUN_ID_PATTERN.test(args[0]) ? args[0] : undefined;
+    // Register cleanup before the remote call. A lost acknowledgement after the
+    // baseline link must not strand a privileged marker in /tmp.
+    if (action === "alarm-media-baseline" && alarmRun) this.alarmBaselineRuns.add(alarmRun);
     await this.install();
     const command = [
       "sudo", "-n", "bash", this.remoteScript,
@@ -74,19 +80,51 @@ export class StorageProbeClient {
     const line = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
     if (!line) throw new Error(`Storage probe ${action} returned no JSON`);
     try {
-      return JSON.parse(line) as T;
+      const result = JSON.parse(line) as T;
+      if ((action === "alarm-media-forensics" || action === "alarm-media-cleanup") && alarmRun) {
+        this.alarmBaselineRuns.delete(alarmRun);
+      }
+      return result;
     } catch (error) {
       throw new Error(`Storage probe ${action} returned invalid JSON`, {cause: error});
     }
   }
 
   async cleanup(): Promise<void> {
-    if (!this.installed) return;
-    const command = `rm -f -- ${shellQuote(this.remoteScript)}`;
-    await execFileAsync("ssh", [...this.commonOptions(), this.target, command], {
-      timeout: 20_000,
-      maxBuffer: 1024 * 1024,
-    }).catch(() => undefined);
+    if (!this.installed) {
+      this.alarmBaselineRuns.clear();
+      return;
+    }
+    // Baselines are root-owned mode-0600 files in sticky /tmp. Ask the
+    // installed, fail-closed probe to remove only the marker derived from each
+    // validated run ID; the unprivileged SSH user cannot safely unlink it.
+    let baselineCleanupError: unknown;
+    for (const run of this.alarmBaselineRuns) {
+      const cleanupCommand = [
+        "sudo", "-n", "bash", this.remoteScript,
+        "--release-dir", this.releaseDirectory,
+        "alarm-media-cleanup", run,
+      ].map(shellQuote).join(" ");
+      try {
+        await execFileAsync("ssh", [...this.commonOptions(), this.target, cleanupCommand], {
+          timeout: 20_000,
+          maxBuffer: 1024 * 1024,
+        });
+      } catch (error) {
+        baselineCleanupError ??= error;
+      }
+    }
+    if (baselineCleanupError) {
+      // Retain both the installed helper and the exact run IDs so a caller's
+      // outer/final emergency cleanup can retry the privileged removal.
+      throw new Error("Unable to remove a privileged alarm-media baseline marker", {
+        cause: baselineCleanupError,
+      });
+    }
+    await execFileAsync("ssh", [
+      ...this.commonOptions(), this.target, `rm -f -- ${shellQuote(this.remoteScript)}`,
+    ], {timeout: 20_000, maxBuffer: 1024 * 1024}).catch(() => undefined);
     this.installed = false;
+    this.alarmBaselineRuns.clear();
   }
 }
