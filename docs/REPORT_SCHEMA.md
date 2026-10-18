@@ -26,6 +26,11 @@ normalized source paths, OSH camera UIDs, metadata, manifest/frame counts,
 exact-ledger results, or run-scoped orphan/partial totals. Reviewers can
 therefore correlate the UUID-bound MP4 with its exact-five representation
 without depending on PostgreSQL table details.
+For an unfiltered full run without `STORAGE_RETAINED_EVENT_ID`, the early
+storage-health row is `skipped` with an explicit self-seeding reason; the later
+storage-lifecycle rows for that generated UUID are the authoritative API,
+decode, manifest, ledger, and Viewer-gallery proof. A missing generated event is
+reported as `incorrect`, so deferral cannot hide absent coverage.
 
 ## `performance.csv`
 

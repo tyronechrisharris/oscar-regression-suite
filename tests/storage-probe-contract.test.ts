@@ -525,7 +525,7 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
 
 test("retained-media scenario browser-decodes every assessed frame", () => {
   const start = scenarios.indexOf("action: \"verify exact-five retained JPEG API\"");
-  const end = scenarios.indexOf("action: \"render retained-media gallery\"", start);
+  const end = scenarios.indexOf("await this.verifyRetainedMediaGallery(", start);
   const originStart = scenarios.lastIndexOf("const page = await this.browser.oscarPage()", start);
   const block = scenarios.slice(originStart, end);
   assert.ok(originStart > 0 && start > originStart && end > start);
@@ -564,12 +564,40 @@ test("storage lifecycle cleans an attempted fixture even when create acknowledge
 });
 
 test("retained-media gallery measures concurrency and proves selected content loaded", () => {
-  const start = scenarios.indexOf('action: "render retained-media gallery"');
-  const end = scenarios.indexOf("const legacyId", start);
+  const start = scenarios.indexOf("private async verifyRetainedMediaGallery");
+  const end = scenarios.indexOf("private async storageHealth", start);
   const block = scenarios.slice(start, end);
   assert.match(block, /peakInFlightFrameRequests <= 3/);
   assert.match(block, /initialRequests === cameras/);
   assert.match(block, /selectedFrameRequested && selectedFrameLoaded/);
   assert.match(block, /image\.naturalWidth > 0/);
   assert.match(block, /source !== initialSource/);
+});
+
+test("full retained-media proof self-seeds without weakening smoke fixture requirements", () => {
+  const policyStart = scenarios.indexOf("private fullRunCanSelfSeedRetainedMedia");
+  const policyEnd = scenarios.indexOf("private async check", policyStart);
+  const policy = scenarios.slice(policyStart, policyEnd);
+  assert.match(policy, /this\.config\.profile === "full"/);
+  assert.match(policy, /this\.selected\("storage-lifecycle"\)/);
+  for (const producer of ["rpm-alarms", "event-uuid", "adjudication"]) {
+    assert.ok(policy.includes(`"${producer}"`), `missing retained-media producer ${producer}`);
+  }
+
+  const healthStart = scenarios.indexOf("private async storageHealth");
+  const lifecycleStart = scenarios.indexOf("private async storageLifecycle", healthStart);
+  const health = scenarios.slice(healthStart, lifecycleStart);
+  assert.match(health, /if \(this\.fullRunCanSelfSeedRetainedMedia\(\)\)/);
+  assert.match(health, /this\.retainedMediaProofDeferred = true/);
+  assert.match(health, /full profile will self-seed an exact alarm UUID/);
+  assert.match(health, /STORAGE_RETAINED_EVENT_ID is missing and this run cannot self-seed/);
+
+  const generatedStart = scenarios.indexOf("private async verifyGeneratedAlarmRetention");
+  const generatedEnd = scenarios.indexOf("private storageUnavailable", generatedStart);
+  const generated = scenarios.slice(generatedStart, generatedEnd);
+  assert.match(generated, /"self-seed retained-media proof"/);
+  assert.match(generated, /generated events=\$\{this\.generatedAlarmMedia\.size\}/);
+  assert.match(generated, /const galleryEventId = generated\[0\]!\.association\.eventId/);
+  assert.match(generated, /"render self-seeded retained-media gallery"/);
+  assert.match(generated, /await this\.verifyRetainedMediaGallery\(/);
 });

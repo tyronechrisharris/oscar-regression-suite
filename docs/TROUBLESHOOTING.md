@@ -69,6 +69,19 @@ Inspect the Viewer message and OSCAR service logs, then retry the individual
 intentionally scoped to the reserved lane to avoid an unnecessarily expensive
 all-lane query.
 
+## Retained fixture ID is missing
+
+`STORAGE_RETAINED_EVENT_ID` remains required for a required smoke/read-only
+retained-media proof. A normal unfiltered full run intentionally reports the
+early check as deferred, then uses an exact UUID produced by `rpm-alarms`,
+`event-uuid`, or `adjudication` and runs the API/decode and Viewer gallery proof
+after `storage-lifecycle` retains it. If a scenario filter selects
+`storage-health` but omits `storage-lifecycle` or all three alarm-producing
+scenarios, configure an already-retained event ID or expand the filter. A
+`self-seed retained-media proof` failure means the run promised this generated
+fixture but no exact alarm association reached retention; inspect the earlier
+alarm-media outcomes rather than substituting an unrelated historical event.
+
 ## Generated alarm media association fails
 
 Start with the `alarm-media` rows in `functional-results.csv`. A camera-catalog

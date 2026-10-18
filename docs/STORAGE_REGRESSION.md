@@ -164,8 +164,14 @@ OSCAR and rejects recovery errors or partial publications, then repeats the
 archive/WAL partial scan after helper, export, and purge coverage.
 Do not fabricate or rename production daily files for this test.
 
-Provide `STORAGE_RETAINED_EVENT_ID` for an alarm already reduced to the new
-format. Every camera set must expose exactly FIRST, QUARTER, MIDDLE,
+For smoke/read-only validation, provide `STORAGE_RETAINED_EVENT_ID` for an alarm
+already reduced to the new format. An unfiltered full run does not need a
+pre-existing retained event: its early storage-health pass explicitly defers
+this one proof, generates exact alarm UUIDs, and runs the same gallery proof
+after their accelerated retention. A scenario-filtered full run that omits
+either `storage-lifecycle` or every alarm-producing scenario must still provide
+`STORAGE_RETAINED_EVENT_ID` when `storage-health` is selected. Every camera set
+must expose exactly FIRST, QUARTER, MIDDLE,
 THREE_QUARTERS, and LAST at quality 85 as independently decodable,
 size/hash-valid JPEGs, and
 the response must remain within the Viewer's per-frame and event-wide byte/pixel
@@ -183,7 +189,12 @@ selected frame to load, decode, and replace the initial image. Optionally provid
 video. `STORAGE_EVENT_NODE_ID` is included in Event Details links when needed.
 
 The full profile additionally tests every gamma/neutron alarm it generates; it
-does not rely on `STORAGE_RETAINED_EVENT_ID` for this path. Before the first
+does not rely on `STORAGE_RETAINED_EVENT_ID` for this path. The exact generated
+UUID remains in run state through retention, and one of those UUIDs must also
+pass the Event Details five-choice lazy-gallery and three-request concurrency
+proof after its source-bound manifests and JPEGs validate. Failure to generate
+an event after the early proof was deferred is an explicit incorrect result,
+not a silent skip. Before the first
 trigger, the target probe writes a private no-replace baseline of finalized MP4
 and partial/temp clip names across the videos bucket. Camera relationships come
 from the reserved lane's Viewer components and authenticated OSH systems

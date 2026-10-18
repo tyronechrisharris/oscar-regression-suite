@@ -117,6 +117,7 @@ export class RegressionScenarios {
   private alarmMediaProbe: StorageProbeClient | undefined;
   private alarmCameraUids: string[] | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
+  private retainedMediaProofDeferred = false;
   private stopRequested: () => boolean = () => false;
   private activeScenario = "navigation";
 
@@ -134,6 +135,11 @@ export class RegressionScenarios {
 
   private selected(scenario: string): boolean {
     return this.config.scenarioFilter.size === 0 || this.config.scenarioFilter.has(scenario);
+  }
+
+  private fullRunCanSelfSeedRetainedMedia(): boolean {
+    return this.config.profile === "full" && this.selected("storage-lifecycle") &&
+      ["rpm-alarms", "event-uuid", "adjudication"].some(scenario => this.selected(scenario));
   }
 
   private async check<T>(metadata: CheckMetadata, probe: () => Promise<ProbeResult<T>>): Promise<T | undefined> {
@@ -3101,7 +3107,21 @@ export class RegressionScenarios {
   }
 
   private async verifyGeneratedAlarmRetention(probe: StorageProbeClient): Promise<void> {
-    if (!this.alarmMediaBaselineCreated || this.generatedAlarmMedia.size === 0) return;
+    if (!this.alarmMediaBaselineCreated || this.generatedAlarmMedia.size === 0) {
+      if (this.retainedMediaProofDeferred) {
+        this.reporter.outcome(
+          "storage-lifecycle",
+          "retained-media",
+          "self-seed retained-media proof",
+          this.config.testLaneLabel,
+          "at least one exact generated alarm UUID reaches accelerated five-frame retention",
+          `baseline=${this.alarmMediaBaselineCreated}; generated events=${this.generatedAlarmMedia.size}`,
+          "incorrect",
+          0,
+        );
+      }
+      return;
+    }
     const generated = [...this.generatedAlarmMedia.values()];
     const page = await this.browser.oscarPage();
     try {
@@ -3236,6 +3256,18 @@ export class RegressionScenarios {
             observed: `${checked} exact ledger(s); failures=${failures.join("; ") || "none"}`,
           };
         });
+
+        const galleryEventId = generated[0]!.association.eventId;
+        await this.verifyRetainedMediaGallery(
+          page,
+          galleryEventId,
+          "storage-lifecycle",
+          this.retainedMediaProofDeferred
+            ? "render self-seeded retained-media gallery"
+            : "render generated retained-media gallery",
+          "generated-retained-media-five-frame-gallery",
+        );
+        this.retainedMediaProofDeferred = false;
       }
 
       await this.check({
@@ -3274,6 +3306,91 @@ export class RegressionScenarios {
       return true;
     }
     return false;
+  }
+
+  private async verifyRetainedMediaGallery(
+    page: Page,
+    eventId: string,
+    scenario: "storage-health" | "storage-lifecycle",
+    action: string,
+    evidenceName: string,
+  ): Promise<void> {
+    await this.check({
+      scenario,
+      category: "viewer",
+      action,
+      target: eventId,
+      expected: "Event Details renders five choices per camera while lazily fetching only selected frames",
+    }, async () => {
+      const framePattern = /\/media\/[^/]+\/[^/]+\/frame-0[1-5]\.jpg(?:\?|$)/;
+      const frameRequests: string[] = [];
+      let inFlightFrameRequests = 0;
+      let peakInFlightFrameRequests = 0;
+      await page.route(framePattern, async route => {
+        frameRequests.push(route.request().url());
+        inFlightFrameRequests++;
+        peakInFlightFrameRequests = Math.max(peakInFlightFrameRequests, inFlightFrameRequests);
+        try {
+          // Hold the request briefly so the scheduler's real in-flight bound
+          // is observable even on a fast local test network.
+          await sleep(150);
+          await route.continue();
+        } finally {
+          inFlightFrameRequests--;
+        }
+      });
+      const node = this.config.storageEventNodeId
+        ? `&nodeId=${encodeURIComponent(this.config.storageEventNodeId)}` : "";
+      await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}${node}`);
+      await page.getByTestId("retained-media-gallery").waitFor({timeout: this.config.eventTimeoutMs});
+      const cameras = await page.getByTestId("retained-media-camera").count();
+      const thumbnails = await page.getByTestId("retained-media-thumbnail").count();
+      if (cameras > 0) {
+        await poll(
+          () => page.getByTestId("retained-media-main-image").evaluateAll((images, expected) =>
+            images.length === expected && images.every(image =>
+              image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0 &&
+              image.naturalHeight > 0), cameras),
+          Boolean,
+          {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100,
+            description: "initial retained frames to load and decode in the gallery"},
+        );
+      }
+      const initialRequests = frameRequests.length;
+      let selectedFrameLoaded = false;
+      let selectedFrameRequested = false;
+      if (thumbnails >= 5) {
+        const firstCamera = page.getByTestId("retained-media-camera").first();
+        const mainImage = firstCamera.getByTestId("retained-media-main-image");
+        const initialSource = await mainImage.getAttribute("src");
+        const initialMetadata = await firstCamera.getByTestId("retained-media-frame-metadata").innerText();
+        await firstCamera.getByTestId("retained-media-thumbnail").nth(4).click();
+        const selected = await poll(async () => {
+          const source = await mainImage.getAttribute("src").catch(() => null);
+          const metadata = await firstCamera.getByTestId("retained-media-frame-metadata").innerText();
+          const loaded = await mainImage.evaluate(image => image instanceof HTMLImageElement &&
+            image.complete && image.naturalWidth > 0 && image.naturalHeight > 0).catch(() => false);
+          return {source, metadata, loaded};
+        }, value => Boolean(value.loaded && value.source && value.source !== initialSource &&
+            value.metadata !== initialMetadata),
+        {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100,
+          description: "selected retained frame content to load and replace the initial image"});
+        selectedFrameLoaded = Boolean(selected.loaded);
+        selectedFrameRequested = frameRequests.slice(initialRequests)
+          .some(url => /\/frame-05\.jpg(?:\?|$)/.test(url));
+      }
+      return {
+        passed: cameras > 0 && thumbnails === cameras * 5 &&
+          initialRequests === cameras && peakInFlightFrameRequests > 0 &&
+          peakInFlightFrameRequests <= 3 && frameRequests.length === initialRequests + 1 &&
+          selectedFrameRequested && selectedFrameLoaded,
+        observed: `${cameras} camera group(s), ${thumbnails} choices, ` +
+          `${initialRequests} initial frame request(s), ${frameRequests.length} after selection, ` +
+          `peak in-flight=${peakInFlightFrameRequests}, selected requested=${selectedFrameRequested}, ` +
+          `selected loaded=${selectedFrameLoaded}`,
+        evidence: await this.browser.screenshot(page, evidenceName),
+      };
+    });
   }
 
   private async storageHealth(): Promise<void> {
@@ -3324,10 +3441,17 @@ export class RegressionScenarios {
       const eventId = this.config.storageRetainedEventId;
       if (!eventId) {
         const metadata = {scenario: "storage-health", category: "retained-media", action: "verify exact-five JPEG API and gallery",
-          target: "retained media", expected: "a known retained alarm event is configured"};
-        if (this.config.storageWorkflow === "required") {
+          target: "retained media",
+          expected: "a configured retained event or an exact full-run generated alarm proves the API and gallery"};
+        if (this.fullRunCanSelfSeedRetainedMedia()) {
+          this.retainedMediaProofDeferred = true;
+          this.skip(metadata,
+            "full profile will self-seed an exact alarm UUID and run this proof after accelerated retention");
+        } else if (this.config.storageWorkflow === "required") {
           this.reporter.outcome(metadata.scenario, metadata.category, metadata.action, metadata.target,
-            metadata.expected, "STORAGE_RETAINED_EVENT_ID is missing", "incorrect", 0);
+            metadata.expected,
+            "STORAGE_RETAINED_EVENT_ID is missing and this run cannot self-seed retained media",
+            "incorrect", 0);
         } else this.skip(metadata, "no retained-media fixture event configured");
       } else {
         const page = await this.browser.oscarPage();
@@ -3381,74 +3505,13 @@ export class RegressionScenarios {
               observed: `${assessment.mediaSetCount} camera set(s), ${assessment.frameCount} frames, ` +
                 `${valid} statically and browser-decodable JPEGs; qualities=${assessment.jpegQualities.join(",")}`};
           });
-          await this.check({scenario: "storage-health", category: "viewer", action: "render retained-media gallery",
-            target: eventId, expected: "Event Details renders five choices per camera while lazily fetching only selected frames"}, async () => {
-            const framePattern = /\/media\/[^/]+\/[^/]+\/frame-0[1-5]\.jpg(?:\?|$)/;
-            const frameRequests: string[] = [];
-            let inFlightFrameRequests = 0;
-            let peakInFlightFrameRequests = 0;
-            await page.route(framePattern, async route => {
-              frameRequests.push(route.request().url());
-              inFlightFrameRequests++;
-              peakInFlightFrameRequests = Math.max(peakInFlightFrameRequests, inFlightFrameRequests);
-              try {
-                // Hold the request briefly so the scheduler's real in-flight
-                // bound is observable even on a fast local test network.
-                await sleep(150);
-                await route.continue();
-              } finally {
-                inFlightFrameRequests--;
-              }
-            });
-            const node = this.config.storageEventNodeId ? `&nodeId=${encodeURIComponent(this.config.storageEventNodeId)}` : "";
-            await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}${node}`);
-            await page.getByTestId("retained-media-gallery").waitFor({timeout: this.config.eventTimeoutMs});
-            const cameras = await page.getByTestId("retained-media-camera").count();
-            const thumbnails = await page.getByTestId("retained-media-thumbnail").count();
-            if (cameras > 0) {
-              await poll(
-                () => page.getByTestId("retained-media-main-image").evaluateAll((images, expected) =>
-                  images.length === expected && images.every(image =>
-                    image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0 &&
-                    image.naturalHeight > 0), cameras),
-                Boolean,
-                {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100,
-                  description: "initial retained frames to load and decode in the gallery"},
-              );
-            }
-            const initialRequests = frameRequests.length;
-            let selectedFrameLoaded = false;
-            let selectedFrameRequested = false;
-            if (thumbnails >= 5) {
-              const firstCamera = page.getByTestId("retained-media-camera").first();
-              const mainImage = firstCamera.getByTestId("retained-media-main-image");
-              const initialSource = await mainImage.getAttribute("src");
-              const initialMetadata = await firstCamera.getByTestId("retained-media-frame-metadata").innerText();
-              await firstCamera.getByTestId("retained-media-thumbnail").nth(4).click();
-              const selected = await poll(async () => {
-                const source = await mainImage.getAttribute("src").catch(() => null);
-                const metadata = await firstCamera.getByTestId("retained-media-frame-metadata").innerText();
-                const loaded = await mainImage.evaluate(image => image instanceof HTMLImageElement &&
-                  image.complete && image.naturalWidth > 0 && image.naturalHeight > 0).catch(() => false);
-                return {source, metadata, loaded};
-              }, value => Boolean(value.loaded && value.source && value.source !== initialSource &&
-                  value.metadata !== initialMetadata),
-              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100,
-                description: "selected retained frame content to load and replace the initial image"});
-              selectedFrameLoaded = Boolean(selected.loaded);
-              selectedFrameRequested = frameRequests.slice(initialRequests)
-                .some(url => /\/frame-05\.jpg(?:\?|$)/.test(url));
-            }
-            return {passed: cameras > 0 && thumbnails === cameras * 5 &&
-                initialRequests === cameras && peakInFlightFrameRequests > 0 &&
-                peakInFlightFrameRequests <= 3 && frameRequests.length === initialRequests + 1 &&
-                selectedFrameRequested && selectedFrameLoaded,
-              observed: `${cameras} camera group(s), ${thumbnails} choices, ` +
-                `${initialRequests} initial frame request(s), ${frameRequests.length} after selection, ` +
-                `peak in-flight=${peakInFlightFrameRequests}, selected requested=${selectedFrameRequested}, ` +
-                `selected loaded=${selectedFrameLoaded}`,
-              evidence: await this.browser.screenshot(page, "retained-media-five-frame-gallery")};
-          });
+          await this.verifyRetainedMediaGallery(
+            page,
+            eventId,
+            "storage-health",
+            "render retained-media gallery",
+            "retained-media-five-frame-gallery",
+          );
         } finally { await page.close(); }
       }
 

@@ -51,7 +51,8 @@ source review before the suite can certify that version.
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
 - OSCAR 3.9.2 exact-five retained JPEG API/gallery, including generated-alarm
-  manifest/source binding, one-attempt successful retention ledgers, and
+  self-seeding by exact UUID in a full run, manifest/source binding,
+  one-attempt successful retention ledgers, and
   run-baselined orphan/partial rejection; bounded catalog/frame
   transfers and event resource budgets, baseline-JPEG structure plus Chromium
   decode/dimension checks for every frame, lazy selected-frame requests, and
