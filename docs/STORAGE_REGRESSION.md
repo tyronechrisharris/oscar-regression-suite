@@ -399,6 +399,7 @@ OSCAR_RESTORE_ARCHIVE_DIR=<canonical-archive-directory>
 OSCAR_RESTORE_WAL_ARCHIVE_DIR=<canonical-wal-archive-directory>
 OSCAR_RESTORE_BACKUP_DIR=<canonical-backup-directory>
 OSCAR_RESTORE_PATHS_ACK=<archive>|<wal-archive>|<backup>|DEDICATED-RESTORE-PATHS
+STORAGE_RESTORE_PROBE_TIMEOUT_MS=7200000
 ```
 
 Then, and only then, run `npm run test:restore-drill`. The profile accepts no
@@ -432,6 +433,23 @@ If recovery must atomically replace either approved credential leaf, it
 force-recreates the Compose services so file-backed secret mounts and the
 gateway's in-memory TLS state cannot retain the old inode, then requires all
 three services healthy before deleting the database/application canaries.
+
+The restore-only probe deadline defaults to two hours and is bounded between
+600,000 and 28,800,000 milliseconds. It covers the fresh coordinated backup,
+independent validation, WAL merge, restore, promotion, and post-restore proofs;
+ordinary probes continue to use `STORAGE_PROBE_TIMEOUT_MS`. Reaching the local
+deadline is a failed run, but it does not release the disruption phase: the
+deadline bounds only the primary SSH wait, and fail-closed quiescence may extend
+beyond it. An atomically pre-armed `ready` gate is claimed by exactly one of the
+remote wrapper or cancellation poll, so a delayed SSH command cannot begin after
+the poll declares cancellation. The runner then validates the root-owned
+control files and polls the exact probe-session PID/start-time/PGID/SID until no
+session member remains; even an atomic numeric status cannot outrank a surviving
+member. Health and container-identity oracles therefore cannot race a restore
+that outlived SSH. Treat unexpectedly long active work as a
+product/performance defect rather than increasing this bound until it passes.
+Malformed, linked, or incorrectly permissioned control state is nonterminal by
+design: preserve the lease and investigate instead of inferring quiescence.
 
 The report retains all raw pre/restore/post samples. Only the exact
 `storage-restore-drill-disruption` phase of this profile is excluded from

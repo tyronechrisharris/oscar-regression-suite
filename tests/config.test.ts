@@ -310,6 +310,23 @@ test("storage paths, modes, and numeric bounds fail closed", () => {
   withEnvironment({...baseEnvironment, STORAGE_HOT_RETENTION_DAYS: "0"}, () => {
     assert.throws(() => loadConfig([]), /STORAGE_HOT_RETENTION_DAYS must be an integer >= 1/);
   });
+  withEnvironment(baseEnvironment, () => {
+    const config = loadConfig([]);
+    assert.equal(config.storageProbeTimeoutMs, 1_800_000);
+    assert.equal(config.storageRestoreProbeTimeoutMs, 7_200_000);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_RESTORE_PROBE_TIMEOUT_MS: "599999"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /STORAGE_RESTORE_PROBE_TIMEOUT_MS must be an integer >= 600000/,
+    );
+  });
+  withEnvironment({...baseEnvironment, STORAGE_RESTORE_PROBE_TIMEOUT_MS: "28800001"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /STORAGE_RESTORE_PROBE_TIMEOUT_MS must be an integer between 600000 and 28800000/,
+    );
+  });
 });
 
 test("configuration loads the lane membership oracle and operational-view workflow mode", () => {

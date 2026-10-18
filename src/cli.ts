@@ -102,6 +102,8 @@ async function main(): Promise<number> {
     storageWorkflow: config.storageWorkflow,
     storageExpectedRelease: config.storageExpectedRelease,
     storageBackupWorkflow: config.storageBackupWorkflow,
+    storageProbeTimeoutMs: config.storageProbeTimeoutMs,
+    storageRestoreProbeTimeoutMs: config.storageRestoreProbeTimeoutMs,
     ...(config.oscarReleaseDirectory
       ? {oscarReleaseDirectory: config.oscarReleaseDirectory} : {}),
     ...(config.releaseRestoreEvidenceDirectory

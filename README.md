@@ -146,6 +146,20 @@ it only after reviewing
 STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required npm run test:restore-drill
 ```
 
+`STORAGE_RESTORE_PROBE_TIMEOUT_MS` is a restore-only deadline (default
+`7200000`, bounded from 10 minutes through 8 hours). Ordinary storage probes
+keep the tighter `STORAGE_PROBE_TIMEOUT_MS`. The restore deadline bounds the
+primary SSH wait; fail-closed quiescence after that deadline can take longer.
+An atomically pre-armed launch gate prevents a delayed SSH command from starting
+after cancellation. If the deadline is reached, the runner keeps the exact
+disruption phase active and waits until the privileged remote wrapper publishes
+a terminal status and its exact probe-session PID/start-time/PGID/SID has no
+remaining member before any post-restore health or identity check can run. Do
+not raise this deadline to disguise a stalled or algorithmically unbounded
+product restore; inspect the preserved failure evidence instead. A malformed,
+linked, or incorrectly permissioned control file is deliberately nonterminal
+and retains the remote lease for operator investigation.
+
 For final 3.9.2 certification, first preserve the complete PASS directory from
 an unfiltered `restore-drill`. Then set every workflow to `required`, set an exact
 `OSCAR_BUILD_LABEL`, point `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching

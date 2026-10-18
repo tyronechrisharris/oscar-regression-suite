@@ -194,6 +194,18 @@ Keep every raw resource sample. Exempt only the exact
 only in this profile; require a real target-host sample during it, healthy
 pre/post coverage, immutable image identity, stable restart counts per identity,
 and no OOM in any phase.
+Use the separate bounded `STORAGE_RESTORE_PROBE_TIMEOUT_MS` (default 7,200,000
+ms, accepted range 600,000–28,800,000 ms) for the destructive workflow; do not
+inflate the ordinary `STORAGE_PROBE_TIMEOUT_MS`. If that deadline is crossed,
+require the runner to retain the disruption phase; the deadline bounds the
+primary SSH wait, while fail-closed quiescence can take longer. Require an
+atomically pre-armed launch gate so cancellation and a delayed SSH launch cannot
+both win. The exact remote probe-session PID/start-time/PGID/SID must have no
+remaining member before an atomic status is terminal and post-restore oracles
+execute. A timeout is a failure and must not be hidden by extending the bound
+around a stalled or algorithmically excessive product restore. Treat malformed,
+linked, or incorrectly permissioned control state as nonterminal and retain the
+remote lease for investigation.
 Never reinterpret a smoke/full request as restore authorization.
 
 For final 3.9.2 certification, first preserve a complete unfiltered

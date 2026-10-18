@@ -60,6 +60,7 @@ export interface SuiteConfig {
   storageHotRetentionDays: number;
   storageArchiveTimeoutMs: number;
   storageProbeTimeoutMs: number;
+  storageRestoreProbeTimeoutMs: number;
   resultsRoot: string;
   scenarioFilter: Set<string>;
 }
@@ -195,6 +196,8 @@ export interface RunMetadata {
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.9.2";
   storageBackupWorkflow: CapabilityMode;
+  storageProbeTimeoutMs: number;
+  storageRestoreProbeTimeoutMs: number;
   oscarReleaseDirectory?: string;
   releaseRestoreEvidenceDirectory?: string;
   releaseRestoreEvidenceRunId?: string;

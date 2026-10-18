@@ -59,6 +59,19 @@ function integer(name: string, fallback: number, minimum: number): number {
   return value;
 }
 
+function boundedInteger(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const value = integer(name, fallback, minimum);
+  if (value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
 function boolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name]?.trim().toLowerCase();
   if (!raw) return fallback;
@@ -284,6 +297,12 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     storageHotRetentionDays: integer("STORAGE_HOT_RETENTION_DAYS", 30, 1),
     storageArchiveTimeoutMs: integer("STORAGE_ARCHIVE_TIMEOUT_MS", 300_000, 60_000),
     storageProbeTimeoutMs: integer("STORAGE_PROBE_TIMEOUT_MS", 1_800_000, 60_000),
+    storageRestoreProbeTimeoutMs: boundedInteger(
+      "STORAGE_RESTORE_PROBE_TIMEOUT_MS",
+      7_200_000,
+      600_000,
+      28_800_000,
+    ),
     resultsRoot,
     scenarioFilter: new Set(scenarioValues),
   };

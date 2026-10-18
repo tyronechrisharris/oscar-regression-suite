@@ -9,6 +9,7 @@ import test from "node:test";
 const probePath = resolve("scripts/oscar-storage-regression-probe.sh");
 const probe = readFileSync(probePath, "utf8");
 const scenarios = readFileSync(resolve("src/scenarios.ts"), "utf8");
+const storageClient = readFileSync(resolve("src/storage-probe.ts"), "utf8");
 
 function entrypointContractAccepts(entrypoint: string): boolean {
   const helper = probe.match(/^entrypoint_has_managed_tmp_contract\(\) \{\n[\s\S]*?^\}/mu)?.[0];
@@ -215,11 +216,11 @@ test("generated alarm-media scenario binds public observations, MP4 metadata, ma
 });
 
 test("storage probe client registers privileged alarm baseline cleanup before an uncertain remote outcome", () => {
-  const client = readFileSync(resolve("src/storage-probe.ts"), "utf8");
+  const client = storageClient;
   const register = client.indexOf(
     'if (action === "alarm-media-baseline" && alarmRun) this.alarmBaselineRuns.add(alarmRun)',
   );
-  const remote = client.indexOf('const {stdout} = await execFileAsync("ssh"', register);
+  const remote = client.indexOf('await execFileAsync("ssh"', register);
   assert.ok(register > 0 && remote > register);
   const cleanup = client.slice(client.indexOf("async cleanup(): Promise<void>"));
   assert.match(cleanup, /for \(const run of this\.alarmBaselineRuns\)/);
@@ -230,6 +231,40 @@ test("storage probe client registers privileged alarm baseline cleanup before an
   assert.match(cleanup, /removeRemoteWorkspace/);
   assert.doesNotMatch(cleanup, /rm -f -- \/tmp\/oscar-alarm-media/);
   assert.match(cleanup, /this\.alarmBaselineRuns\.clear\(\)/);
+});
+
+test("restore control state is pre-armed, descendant-aware, and fail-closed", () => {
+  const state = storageClient.slice(
+    storageClient.indexOf("private async waitForRestoreTermination"),
+    storageClient.indexOf("private async restoreCommand"),
+  );
+  const wrapper = storageClient.slice(
+    storageClient.indexOf("private async restoreCommand"),
+    storageClient.indexOf("async install()"),
+  );
+  for (const required of [
+    '[ -e \\"$control_path\\" ] || [ -L \\"$control_path\\" ]',
+    "0:0:600",
+    "ready + active + cancelled",
+    'mv -T -- \\"$ready_path\\" \\"$cancelled_path\\"',
+    "complete:%s",
+    "ps -eo pid=,pgid=,sid=",
+    "$2 == pgid || $3 == sid",
+  ]) assert.ok(state.includes(required), `missing fail-closed restore state contract: ${required}`);
+  assert.doesNotMatch(state, /not-started/);
+  assert.ok(state.indexOf("ps -eo pid=,pgid=,sid=") < state.lastIndexOf("complete:%s"),
+    "terminal status must not outrank exact session-member discovery");
+  for (const required of [
+    "oscar-storage-restore-arm",
+    "not-launched",
+    'mv -T -- \\"$ready_path\\" \\"$active_path\\"',
+    "setsid --fork --wait",
+    "wait_for_session_quiet",
+    "trap finalize_wrapper EXIT",
+    "publish_status",
+  ]) assert.ok(wrapper.includes(required), `missing restore wrapper lifecycle contract: ${required}`);
+  assert.ok(wrapper.indexOf("mv -fT --") < wrapper.indexOf('exec \\"${command[@]}\\"'),
+    "session identity must be published before the product restore can execute");
 });
 
 test("platform probe binds roots, the stable lock, and exact helper provenance and behavior", () => {
