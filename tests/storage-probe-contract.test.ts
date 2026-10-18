@@ -92,6 +92,15 @@ test("archive health aggregates generations independently from archive objects",
 test("storage snapshot emits activeHolds exactly once", () => {
   const block = probe.slice(probe.indexOf("  snapshot)"), probe.indexOf("  archive-health)"));
   assert.equal(block.match(/'activeHolds'/g)?.length, 1);
+  assert.equal(
+    block.match(/awk '\{print \\\$1\+0\}'/g)?.length,
+    3,
+    "snapshot byte probes must escape awk's positional field from the outer set -u shell",
+  );
+  assert.ok(
+    !block.includes("awk '{print \\\\$1+0}'"),
+    "a doubled backslash leaves $1 exposed to the outer shell",
+  );
 });
 
 test("backup check authenticates markers, epoch, supported verification, and journal receipts", () => {
