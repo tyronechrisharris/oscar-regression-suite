@@ -2855,7 +2855,7 @@ export class RegressionScenarios {
       const platform = await this.check({
         scenario: "storage-health", category: "storage-platform", action: "verify PostgreSQL and storage controls",
         target: this.config.targetHost,
-        expected: "the running images, deployment/root identities, stable lock, exact WAL command, packaged helpers, backup-root isolation, and complete 3.9.2 storage profile match",
+        expected: "the running images, deployment/root identities, stable lock, exact WAL command, packaged helpers, backup-root isolation, split noexec/data and executable/native temp mounts, forced JVM temp and JavaCPP cache properties, and complete 3.9.2 storage profile match",
       }, async () => {
         const value = assessStoragePlatform(await probe.runJson("platform"));
         const release = this.config.storageExpectedRelease;
@@ -3062,7 +3062,7 @@ export class RegressionScenarios {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
-        expected: "the exact OSCAR 3.9.2 release is running and archive deletion is enabled with a one-day rollback grace only on this disposable test deployment"}, async () => {
+        expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, and accelerated one-day disposable archive profile are running"}, async () => {
         const passed = storagePlatformHasExactReleaseIdentity(platform, this.config.storageExpectedRelease) &&
             platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
             platform.archiveIntervalMinutes === 1;

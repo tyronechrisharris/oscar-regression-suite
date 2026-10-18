@@ -54,6 +54,25 @@ file and directory durability barriers.
 It also requires the packaged storage CLI to route portable-export copies and
 purge deletions through the archive-object helper; the acknowledged lifecycle
 then exercises both CLI paths against its registered generation.
+
+The platform gate also fail-closes on the live JVM temporary-directory split.
+It first requires the packaged entrypoint to be the exact executable deployed in
+the container and verifies that its managed properties follow `JAVA_OPTS`.
+`/tmp` must remain a read/write `tmpfs` with `noexec,nosuid,nodev`, while the
+only native-library exception is a separate read/write `tmpfs` mounted at
+`/run/oscar-native` without `noexec`, owned by UID/GID 10001 with mode `0700`,
+and capped at exactly 256 MiB. The probe executes a private copied binary from
+that mount to prove the kernel permits native loading, then removes it. It
+inspects the running Java process rather than trusting environment text: the
+last/effective `-Djava.io.tmpdir` must be `/run/oscar-native`, JavaCPP's
+last/effective cache must be `/run/oscar-native/javacpp`, and the last/effective
+`-Doscar.data.tmpdir` must be `/tmp`. This keeps DuckDB/JNI and JavaCPP/FFmpeg
+extraction functional without leaving an executable cache in persistent state
+or moving untrusted multipart or Cambio staging onto the executable mount. A
+missing mount, wrong ownership/mode/cap, changed
+mount option, extra Java process, or overridden effective property rejects the
+release identity before the lifecycle creates any fixture.
+
 A locally built/offline-loaded image may legitimately have no repository digest;
 its immutable image ID and required OCI labels remain the gate. Set `auto` only
 for an explicit legacy run with no storage target configured; it is not the

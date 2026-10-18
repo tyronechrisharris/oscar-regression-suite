@@ -8,6 +8,25 @@ const probePath = resolve("scripts/oscar-storage-regression-probe.sh");
 const probe = readFileSync(probePath, "utf8");
 const scenarios = readFileSync(resolve("src/scenarios.ts"), "utf8");
 
+function entrypointContractAccepts(entrypoint: string): boolean {
+  const helper = probe.match(/^entrypoint_has_managed_tmp_contract\(\) \{\n[\s\S]*?^\}/mu)?.[0];
+  assert.ok(helper, "missing entrypoint temp-contract helper");
+  try {
+    execFileSync("bash", ["-c", `set -Eeuo pipefail
+${helper}
+candidate=$(mktemp)
+trap 'rm -f -- "$candidate"' EXIT
+cat >"$candidate"
+entrypoint_has_managed_tmp_contract "$candidate"`], {
+      input: entrypoint,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function runProbeQueryHelpers(helperSource: string): string {
   return execFileSync("bash", ["-c", `set -Eeuo pipefail
 psql_admin() {
@@ -105,6 +124,68 @@ test("platform probe binds roots, the stable lock, and exact helper provenance a
     assert.ok(probe.includes(required), `missing root-marker contract: ${required}`);
   }
   assert.match(block, /expected_archive_command='\/usr\/local\/bin\/oscar-archive-wal "%p" "%f" \/var\/lib\/postgresql\/wal-archive'/);
+});
+
+test("platform probe verifies the live split native and untrusted-data temp contract", () => {
+  const block = probe.slice(probe.indexOf("  platform)"), probe.indexOf("  snapshot)"));
+  for (const required of [
+    "/proc/self/mountinfo",
+    "packaged_entrypoint=docker/oscar/entrypoint.sh",
+    "/usr/local/bin/oscar-entrypoint",
+    "packagedEntrypointSha256",
+    "deployedEntrypointSha256",
+    "containerEntrypointExact",
+    "managedPropertiesAfterJavaOpts",
+    "native_path=/run/oscar-native",
+    "mount_has_option /tmp noexec",
+    'mount_has_option "$native_path" noexec',
+    'stat -c "%u:%g:%a" "$native_path"',
+    'stat -f -c "%S:%b" "$native_path"',
+    'cp /bin/true "$exec_probe"',
+    'readlink "$process/exe"',
+    '-Djava.io.tmpdir=*',
+    '-Dorg.bytedeco.javacpp.cachedir=*',
+    '-Doscar.data.tmpdir=*',
+    'effective_java_tmp=${argument#-Djava.io.tmpdir=}',
+    'effective_javacpp_cache=${argument#-Dorg.bytedeco.javacpp.cachedir=}',
+    'effective_data_tmp=${argument#-Doscar.data.tmpdir=}',
+    '"nativeRuntime"',
+    '"nativeNoexecAbsent"',
+    '"nativeSizeBytes"',
+    '"javaTmpPropertyCount"',
+    '"javaCppCachePropertyCount"',
+    '"dataTmpPropertyCount"',
+  ]) assert.ok(block.includes(required), `missing live JVM temp contract: ${required}`);
+  assert.match(block, /rm -f -- "\$exec_probe"/);
+  assert.ok(!block.includes('mount_has_option "$native_path" exec'));
+});
+
+test("entrypoint contract requires one managed property tail after JAVA_OPTS", () => {
+  const valid = `NATIVE_TMP_DIR=/run/oscar-native
+readonly NATIVE_TMP_DIR
+exec java \${JAVA_OPTS:-} \\
+  -Djava.io.tmpdir="\${NATIVE_TMP_DIR}" \\
+  -Dorg.bytedeco.javacpp.cachedir="\${NATIVE_TMP_DIR}/javacpp" \\
+  -Doscar.data.tmpdir=/tmp \\
+  com.example.Main
+`;
+  assert.equal(entrypointContractAccepts(valid), true);
+  assert.equal(entrypointContractAccepts(valid.replace(
+    "exec java ${JAVA_OPTS:-} \\\n  -Djava.io.tmpdir=\"${NATIVE_TMP_DIR}\"",
+    "-Djava.io.tmpdir=\"${NATIVE_TMP_DIR}\" \\\nexec java ${JAVA_OPTS:-}",
+  )), false);
+  assert.equal(entrypointContractAccepts(valid.replace(
+    "-Dorg.bytedeco.javacpp.cachedir=\"${NATIVE_TMP_DIR}/javacpp\" \\\n  -Doscar.data.tmpdir=/tmp",
+    "-Doscar.data.tmpdir=/tmp \\\n  -Dorg.bytedeco.javacpp.cachedir=\"${NATIVE_TMP_DIR}/javacpp\"",
+  )), false);
+  assert.equal(entrypointContractAccepts(valid.replace(
+    "  -Dorg.bytedeco.javacpp.cachedir=\"${NATIVE_TMP_DIR}/javacpp\" \\\n",
+    "",
+  )), false);
+  assert.equal(entrypointContractAccepts(valid.replace(
+    "  -Doscar.data.tmpdir=/tmp \\",
+    "  -Doscar.data.tmpdir=/tmp \\\n  -Doscar.data.tmpdir=/tmp \\",
+  )), false);
 });
 
 test("platform config probes remain pipefail-safe for a large persisted configuration", () => {

@@ -432,6 +432,41 @@ export interface StoragePlatformProbe {
     postgresBackupRootAbsent: boolean;
     isolatedBasebackupWired: boolean;
   };
+  nativeRuntime: {
+    entrypointPath: string;
+    packagedEntrypointSha256: string;
+    deployedEntrypointSha256: string;
+    entrypointRegularExecutable: boolean;
+    containerEntrypointExact: boolean;
+    managedPropertiesAfterJavaOpts: boolean;
+    tmpPath: string;
+    tmpMountType: string;
+    tmpReadWrite: boolean;
+    tmpNoexec: boolean;
+    tmpNosuid: boolean;
+    tmpNodev: boolean;
+    nativePath: string;
+    nativeMountType: string;
+    nativeReadWrite: boolean;
+    nativeNoexecAbsent: boolean;
+    nativeNosuid: boolean;
+    nativeNodev: boolean;
+    nativeDirectory: boolean;
+    nativeExecutable: boolean;
+    runtimeUid: number;
+    runtimeGid: number;
+    nativeOwnerUid: number;
+    nativeOwnerGid: number;
+    nativeMode: string;
+    nativeSizeBytes: number;
+    javaProcessCount: number;
+    javaTmpPropertyCount: number;
+    effectiveJavaTmp: string;
+    javaCppCachePropertyCount: number;
+    effectiveJavaCppCache: string;
+    dataTmpPropertyCount: number;
+    effectiveDataTmp: string;
+  };
   appImage: StorageImageIdentity;
   postgisImage: StorageImageIdentity;
   gatewayImage: StorageImageIdentity;
@@ -625,6 +660,62 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         isolatedBasebackupWired: isolation.isolatedBasebackupWired === true,
       };
     })(),
+    nativeRuntime: (() => {
+      const runtime = object(probe.nativeRuntime, "nativeRuntime");
+      return {
+        entrypointPath: text(runtime.entrypointPath, "nativeRuntime.entrypointPath"),
+        packagedEntrypointSha256: sha256(
+          runtime.packagedEntrypointSha256,
+          "nativeRuntime.packagedEntrypointSha256",
+        ),
+        deployedEntrypointSha256: sha256(
+          runtime.deployedEntrypointSha256,
+          "nativeRuntime.deployedEntrypointSha256",
+        ),
+        entrypointRegularExecutable: runtime.entrypointRegularExecutable === true,
+        containerEntrypointExact: runtime.containerEntrypointExact === true,
+        managedPropertiesAfterJavaOpts: runtime.managedPropertiesAfterJavaOpts === true,
+        tmpPath: text(runtime.tmpPath, "nativeRuntime.tmpPath"),
+        tmpMountType: text(runtime.tmpMountType, "nativeRuntime.tmpMountType"),
+        tmpReadWrite: runtime.tmpReadWrite === true,
+        tmpNoexec: runtime.tmpNoexec === true,
+        tmpNosuid: runtime.tmpNosuid === true,
+        tmpNodev: runtime.tmpNodev === true,
+        nativePath: text(runtime.nativePath, "nativeRuntime.nativePath"),
+        nativeMountType: text(runtime.nativeMountType, "nativeRuntime.nativeMountType"),
+        nativeReadWrite: runtime.nativeReadWrite === true,
+        nativeNoexecAbsent: runtime.nativeNoexecAbsent === true,
+        nativeNosuid: runtime.nativeNosuid === true,
+        nativeNodev: runtime.nativeNodev === true,
+        nativeDirectory: runtime.nativeDirectory === true,
+        nativeExecutable: runtime.nativeExecutable === true,
+        runtimeUid: integer(runtime.runtimeUid, "nativeRuntime.runtimeUid"),
+        runtimeGid: integer(runtime.runtimeGid, "nativeRuntime.runtimeGid"),
+        nativeOwnerUid: integer(runtime.nativeOwnerUid, "nativeRuntime.nativeOwnerUid"),
+        nativeOwnerGid: integer(runtime.nativeOwnerGid, "nativeRuntime.nativeOwnerGid"),
+        nativeMode: text(runtime.nativeMode, "nativeRuntime.nativeMode"),
+        nativeSizeBytes: integer(runtime.nativeSizeBytes, "nativeRuntime.nativeSizeBytes"),
+        javaProcessCount: integer(runtime.javaProcessCount, "nativeRuntime.javaProcessCount"),
+        javaTmpPropertyCount: integer(
+          runtime.javaTmpPropertyCount,
+          "nativeRuntime.javaTmpPropertyCount",
+        ),
+        effectiveJavaTmp: text(runtime.effectiveJavaTmp, "nativeRuntime.effectiveJavaTmp"),
+        javaCppCachePropertyCount: integer(
+          runtime.javaCppCachePropertyCount,
+          "nativeRuntime.javaCppCachePropertyCount",
+        ),
+        effectiveJavaCppCache: text(
+          runtime.effectiveJavaCppCache,
+          "nativeRuntime.effectiveJavaCppCache",
+        ),
+        dataTmpPropertyCount: integer(
+          runtime.dataTmpPropertyCount,
+          "nativeRuntime.dataTmpPropertyCount",
+        ),
+        effectiveDataTmp: text(runtime.effectiveDataTmp, "nativeRuntime.effectiveDataTmp"),
+      };
+    })(),
     appImage: imageIdentity(probe.appImage, "appImage"),
     postgisImage: imageIdentity(probe.postgisImage, "postgisImage"),
     gatewayImage: imageIdentity(probe.gatewayImage, "gatewayImage"),
@@ -701,6 +792,33 @@ export function storagePlatformHasExactReleaseIdentity(
     value.backupIsolation.appBackupRootAbsent &&
     value.backupIsolation.postgresBackupRootAbsent &&
     value.backupIsolation.isolatedBasebackupWired &&
+    value.nativeRuntime.entrypointPath === "/usr/local/bin/oscar-entrypoint" &&
+    value.nativeRuntime.packagedEntrypointSha256 ===
+      value.nativeRuntime.deployedEntrypointSha256 &&
+    value.nativeRuntime.entrypointRegularExecutable &&
+    value.nativeRuntime.containerEntrypointExact &&
+    value.nativeRuntime.managedPropertiesAfterJavaOpts &&
+    value.nativeRuntime.tmpPath === "/tmp" &&
+    value.nativeRuntime.tmpMountType === "tmpfs" &&
+    value.nativeRuntime.tmpReadWrite && value.nativeRuntime.tmpNoexec &&
+    value.nativeRuntime.tmpNosuid && value.nativeRuntime.tmpNodev &&
+    value.nativeRuntime.nativePath === "/run/oscar-native" &&
+    value.nativeRuntime.nativeMountType === "tmpfs" &&
+    value.nativeRuntime.nativeReadWrite && value.nativeRuntime.nativeNoexecAbsent &&
+    value.nativeRuntime.nativeNosuid && value.nativeRuntime.nativeNodev &&
+    value.nativeRuntime.nativeDirectory && value.nativeRuntime.nativeExecutable &&
+    value.nativeRuntime.runtimeUid === 10001 && value.nativeRuntime.runtimeGid === 10001 &&
+    value.nativeRuntime.nativeOwnerUid === 10001 &&
+    value.nativeRuntime.nativeOwnerGid === 10001 &&
+    value.nativeRuntime.nativeMode === "700" &&
+    value.nativeRuntime.nativeSizeBytes === 256 * 1024 * 1024 &&
+    value.nativeRuntime.javaProcessCount === 1 &&
+    value.nativeRuntime.javaTmpPropertyCount >= 1 &&
+    value.nativeRuntime.effectiveJavaTmp === "/run/oscar-native" &&
+    value.nativeRuntime.javaCppCachePropertyCount >= 1 &&
+    value.nativeRuntime.effectiveJavaCppCache === "/run/oscar-native/javacpp" &&
+    value.nativeRuntime.dataTmpPropertyCount >= 1 &&
+    value.nativeRuntime.effectiveDataTmp === "/tmp" &&
     value.appImage.reference === `oscar:${release}` &&
     value.postgisImage.reference === `oscar-postgis:${release}` &&
     value.gatewayImage.reference === "nginxinc/nginx-unprivileged:1.28.1-alpine" &&

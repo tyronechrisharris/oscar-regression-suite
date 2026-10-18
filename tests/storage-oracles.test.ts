@@ -211,6 +211,22 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
       sourcePreserved: true, destinationPreserved: true},
     backupIsolation: {appBackupRootAbsent: true, postgresBackupRootAbsent: true,
       isolatedBasebackupWired: true},
+    nativeRuntime: {
+      entrypointPath: "/usr/local/bin/oscar-entrypoint",
+      packagedEntrypointSha256: "e".repeat(64), deployedEntrypointSha256: "e".repeat(64),
+      entrypointRegularExecutable: true, containerEntrypointExact: true,
+      managedPropertiesAfterJavaOpts: true,
+      tmpPath: "/tmp", tmpMountType: "tmpfs", tmpReadWrite: true, tmpNoexec: true,
+      tmpNosuid: true, tmpNodev: true,
+      nativePath: "/run/oscar-native", nativeMountType: "tmpfs", nativeReadWrite: true,
+      nativeNoexecAbsent: true, nativeNosuid: true, nativeNodev: true,
+      nativeDirectory: true, nativeExecutable: true,
+      runtimeUid: 10001, runtimeGid: 10001, nativeOwnerUid: 10001, nativeOwnerGid: 10001,
+      nativeMode: "700", nativeSizeBytes: 256 * 1024 * 1024,
+      javaProcessCount: 1, javaTmpPropertyCount: 1, effectiveJavaTmp: "/run/oscar-native",
+      javaCppCachePropertyCount: 1, effectiveJavaCppCache: "/run/oscar-native/javacpp",
+      dataTmpPropertyCount: 1, effectiveDataTmp: "/tmp",
+    },
     postgisImage: {...image, reference: "oscar-postgis:3.9.2", storageProfileLabel: "3.9.2"},
     gatewayImage: {...image, reference: "nginxinc/nginx-unprivileged:1.28.1-alpine", versionLabel: ""},
     dataChecksums: "on", pgStatStatementsInstalled: true,
@@ -223,6 +239,7 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
   assert.equal(platform.storageRoots.walArchive.rootKind, "wal-archive");
+  assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
   assert.equal(storagePlatformHasExactReleaseIdentity(platform, "3.9.2"), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, configuredRelease: "4.0.0"},
@@ -272,6 +289,28 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
       postgresBackupRootAbsent: false}},
     "3.9.2",
   ), false);
+  for (const nativeRuntime of [
+    {...platform.nativeRuntime, deployedEntrypointSha256: "f".repeat(64)},
+    {...platform.nativeRuntime, entrypointRegularExecutable: false},
+    {...platform.nativeRuntime, containerEntrypointExact: false},
+    {...platform.nativeRuntime, managedPropertiesAfterJavaOpts: false},
+    {...platform.nativeRuntime, tmpNoexec: false},
+    {...platform.nativeRuntime, nativeMountType: "overlay"},
+    {...platform.nativeRuntime, nativeNoexecAbsent: false},
+    {...platform.nativeRuntime, nativeExecutable: false},
+    {...platform.nativeRuntime, nativeMode: "755"},
+    {...platform.nativeRuntime, nativeOwnerUid: 0},
+    {...platform.nativeRuntime, nativeSizeBytes: 512 * 1024 * 1024},
+    {...platform.nativeRuntime, javaProcessCount: 2},
+    {...platform.nativeRuntime, javaTmpPropertyCount: 0},
+    {...platform.nativeRuntime, effectiveJavaTmp: "/tmp"},
+    {...platform.nativeRuntime, javaCppCachePropertyCount: 0},
+    {...platform.nativeRuntime, effectiveJavaCppCache: "/var/lib/oscar/.javacpp/cache"},
+    {...platform.nativeRuntime, dataTmpPropertyCount: 0},
+    {...platform.nativeRuntime, effectiveDataTmp: "/run/oscar-native"},
+  ]) {
+    assert.equal(storagePlatformHasExactReleaseIdentity({...platform, nativeRuntime}, "3.9.2"), false);
+  }
   const metric = storageMetricFromProbe("batch", {databaseSizeBytes: "100", observationInsertCalls: 2,
     observationInsertRows: 20, observationRowsPerCall: 10});
   assert.equal(metric.databaseSizeBytes, 100);

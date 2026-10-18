@@ -51,6 +51,36 @@ config_text_matches() {
   local text=$1 pattern=$2
   grep -Eq -- "$pattern" <<<"$text"
 }
+entrypoint_has_managed_tmp_contract() {
+  local entrypoint=$1
+  [[ $(grep -Fxc 'NATIVE_TMP_DIR=/run/oscar-native' "$entrypoint") == 1 &&
+     $(grep -Fxc 'readonly NATIVE_TMP_DIR' "$entrypoint") == 1 ]] &&
+    awk '
+      /^[[:space:]]*exec java \$\{JAVA_OPTS:-\}/ {
+        java_opts++
+        if (state == 0) state = 1
+        next
+      }
+      /^[[:space:]]*-Djava\.io\.tmpdir="\$\{NATIVE_TMP_DIR\}"/ {
+        java_tmp++
+        if (state == 1) state = 2
+        next
+      }
+      /^[[:space:]]*-Dorg\.bytedeco\.javacpp\.cachedir="\$\{NATIVE_TMP_DIR\}\/javacpp"/ {
+        javacpp_cache++
+        if (state == 2) state = 3
+        next
+      }
+      /^[[:space:]]*-Doscar\.data\.tmpdir=\/tmp/ {
+        data_tmp++
+        if (state == 3) state = 4
+      }
+      END {
+        exit !(state == 4 && java_opts == 1 && java_tmp == 1 &&
+          javacpp_cache == 1 && data_tmp == 1)
+      }
+    ' "$entrypoint"
+}
 absolute_path() { case $1 in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$release_dir" "${1#./}" ;; esac; }
 canonical_directory() {
   local value=$1 resolved
@@ -246,17 +276,24 @@ case $action in
     packaged_prepare_restore_helper=postgis/prepare-restore.sh
     packaged_merge_wal_restore_helper=postgis/merge-wal-restore.sh
     packaged_atomic_source=docker/oscar/atomic-publish.c
+    packaged_entrypoint=docker/oscar/entrypoint.sh
     [[ -f $packaged_wal_helper && ! -L $packaged_wal_helper &&
        -f $packaged_archive_helper && ! -L $packaged_archive_helper &&
        -f $packaged_prepare_restore_helper && ! -L $packaged_prepare_restore_helper &&
        -f $packaged_merge_wal_restore_helper && ! -L $packaged_merge_wal_restore_helper &&
-       -f $packaged_atomic_source && ! -L $packaged_atomic_source ]] ||
+       -f $packaged_atomic_source && ! -L $packaged_atomic_source &&
+       -f $packaged_entrypoint && ! -L $packaged_entrypoint ]] ||
       fail 'A packaged storage helper is missing, linked, or non-regular.'
     packaged_wal_sha=$(sha256_file "$packaged_wal_helper")
     packaged_archive_sha=$(sha256_file "$packaged_archive_helper")
     packaged_prepare_restore_sha=$(sha256_file "$packaged_prepare_restore_helper")
     packaged_merge_wal_restore_sha=$(sha256_file "$packaged_merge_wal_restore_helper")
     packaged_atomic_source_sha=$(sha256_file "$packaged_atomic_source")
+    packaged_entrypoint_sha=$(sha256_file "$packaged_entrypoint")
+    entrypoint_tmp_contract=false
+    if entrypoint_has_managed_tmp_contract "$packaged_entrypoint"; then
+      entrypoint_tmp_contract=true
+    fi
     wal_publication_contract=false
     if grep -Fq 'cmp -s -- "$source_path" "$destination"' "$packaged_wal_helper" &&
        grep -Fq 'sync -d "$partial"' "$packaged_wal_helper" &&
@@ -284,16 +321,20 @@ case $action in
     compose exec -T oscar sh -c 'test -f /usr/local/bin/oscar-atomic-publish && test ! -L /usr/local/bin/oscar-atomic-publish && test -x /usr/local/bin/oscar-atomic-publish' && atomic_publisher_regular=true
     atomic_source_stamp_regular=false
     compose exec -T oscar sh -c 'test -f /usr/local/share/oscar-atomic-publish.source.sha256 && test ! -L /usr/local/share/oscar-atomic-publish.source.sha256' && atomic_source_stamp_regular=true
+    entrypoint_regular=false
+    compose exec -T oscar sh -c 'test -f /usr/local/bin/oscar-entrypoint && test ! -L /usr/local/bin/oscar-entrypoint && test -x /usr/local/bin/oscar-entrypoint' && entrypoint_regular=true
     deployed_wal_sha=$(compose exec -T postgres sha256sum /usr/local/bin/oscar-archive-wal | awk '{print $1}')
     deployed_archive_sha=$(compose exec -T oscar sha256sum /usr/local/bin/oscar-archive-object | awk '{print $1}')
     deployed_prepare_restore_sha=$(compose exec -T postgres sha256sum /usr/local/bin/oscar-prepare-restore | awk '{print $1}')
     deployed_merge_wal_restore_sha=$(compose exec -T postgres sha256sum /usr/local/bin/oscar-merge-wal-restore | awk '{print $1}')
     deployed_atomic_sha=$(compose exec -T oscar sha256sum /usr/local/bin/oscar-atomic-publish | awk '{print $1}')
     deployed_atomic_source_sha=$(compose exec -T oscar cat /usr/local/share/oscar-atomic-publish.source.sha256 | tr -d '[:space:]')
+    deployed_entrypoint_sha=$(compose exec -T oscar sha256sum /usr/local/bin/oscar-entrypoint | awk '{print $1}')
     for digest in "$packaged_wal_sha" "$packaged_archive_sha" "$packaged_prepare_restore_sha" \
       "$packaged_merge_wal_restore_sha" "$packaged_atomic_source_sha" "$deployed_wal_sha" \
       "$deployed_archive_sha" "$deployed_prepare_restore_sha" "$deployed_merge_wal_restore_sha" \
-      "$deployed_atomic_sha" "$deployed_atomic_source_sha"; do
+      "$deployed_atomic_sha" "$deployed_atomic_source_sha" "$packaged_entrypoint_sha" \
+      "$deployed_entrypoint_sha"; do
       [[ $digest =~ ^[0-9a-f]{64}$ ]] || fail 'A packaged/deployed storage helper has an invalid SHA-256 identity.'
     done
     atomic_behavior_output=$(compose exec -T oscar sh -eu -c '
@@ -393,6 +434,131 @@ case $action in
     app_container_id=$(container_image_id oscar); postgis_container_id=$(container_image_id postgres); gateway_container_id=$(container_image_id gateway)
     app_container=$(compose ps -q oscar)
     postgres_container=$(compose ps -q postgres)
+    container_entrypoint_exact=false
+    [[ $(docker inspect "$app_container" --format '{{json .Config.Entrypoint}}') == \
+      '["/usr/local/bin/oscar-entrypoint"]' ]] && container_entrypoint_exact=true
+    native_runtime_output=$(compose exec -T oscar sh -u -c '
+      mount_type() {
+        awk -v target="$1" '\''
+          $5 == target {
+            matches++
+            for (field = 7; field <= NF; field++)
+              if ($field == "-") type = $(field + 1)
+          }
+          END {
+            if (matches == 1 && type != "") print type
+            else if (matches == 0) print "missing"
+            else print "multiple"
+          }
+        '\'' /proc/self/mountinfo
+      }
+      mount_has_option() {
+        if awk -v target="$1" -v required="$2" '\''
+          $5 == target {
+            count = split($6, options, ",")
+            for (option = 1; option <= count; option++)
+              if (options[option] == required) found = 1
+          }
+          END { exit found ? 0 : 1 }
+        '\'' /proc/self/mountinfo; then printf true; return 0
+        else printf false; return 1; fi
+      }
+
+      tmp_type=$(mount_type /tmp)
+      native_path=/run/oscar-native
+      native_type=$(mount_type "$native_path")
+      tmp_rw=$(mount_has_option /tmp rw)
+      tmp_noexec=$(mount_has_option /tmp noexec)
+      tmp_nosuid=$(mount_has_option /tmp nosuid)
+      tmp_nodev=$(mount_has_option /tmp nodev)
+      native_rw=$(mount_has_option "$native_path" rw)
+      if mount_has_option "$native_path" noexec >/dev/null; then native_noexec_absent=false
+      else native_noexec_absent=true; fi
+      native_nosuid=$(mount_has_option "$native_path" nosuid)
+      native_nodev=$(mount_has_option "$native_path" nodev)
+
+      native_directory=false
+      [ -d "$native_path" ] && [ ! -L "$native_path" ] && native_directory=true
+      metadata=$(stat -c "%u:%g:%a" "$native_path" 2>/dev/null || printf "-1:-1:missing")
+      old_ifs=$IFS; IFS=:; set -- $metadata; IFS=$old_ifs
+      native_owner_uid=${1:--1}; native_owner_gid=${2:--1}; native_mode=${3:-missing}
+      filesystem=$(stat -f -c "%S:%b" "$native_path" 2>/dev/null || printf "0:0")
+      old_ifs=$IFS; IFS=:; set -- $filesystem; IFS=$old_ifs
+      case ${1:-}:${2:-} in
+        *[!0-9:]*|:|:*|*:|0:*) native_size_bytes=-1 ;;
+        *) native_size_bytes=$((${1} * ${2})) ;;
+      esac
+
+      native_executable=false
+      exec_probe="$native_path/.regression-exec-probe.$$"
+      if cp /bin/true "$exec_probe" 2>/dev/null && chmod 0500 "$exec_probe" 2>/dev/null &&
+         "$exec_probe" >/dev/null 2>&1; then native_executable=true; fi
+      if ! rm -f -- "$exec_probe" >/dev/null 2>&1; then native_executable=false; fi
+
+      runtime_uid=$(id -u); runtime_gid=$(id -g)
+      java_process_count=0
+      java_tmp_property_count=0; effective_java_tmp=missing
+      javacpp_cache_property_count=0; effective_javacpp_cache=missing
+      data_tmp_property_count=0; effective_data_tmp=missing
+      for process in /proc/[0-9]*; do
+        executable=$(readlink "$process/exe" 2>/dev/null || true)
+        case $executable in
+          */java)
+            java_process_count=$((java_process_count + 1))
+            arguments=$(tr "\\000" "\\n" <"$process/cmdline" 2>/dev/null || true)
+            old_ifs=$IFS
+            IFS="
+"
+            for argument in $arguments; do
+              case $argument in
+                -Djava.io.tmpdir=*)
+                  java_tmp_property_count=$((java_tmp_property_count + 1))
+                  effective_java_tmp=${argument#-Djava.io.tmpdir=}
+                  ;;
+                -Dorg.bytedeco.javacpp.cachedir=*)
+                  javacpp_cache_property_count=$((javacpp_cache_property_count + 1))
+                  effective_javacpp_cache=${argument#-Dorg.bytedeco.javacpp.cachedir=}
+                  ;;
+                -Doscar.data.tmpdir=*)
+                  data_tmp_property_count=$((data_tmp_property_count + 1))
+                  effective_data_tmp=${argument#-Doscar.data.tmpdir=}
+                  ;;
+              esac
+            done
+            IFS=$old_ifs
+            ;;
+        esac
+      done
+      printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n" \
+        "$tmp_type" "$tmp_rw" "$tmp_noexec" "$tmp_nosuid" "$tmp_nodev" \
+        "$native_type" "$native_rw" "$native_noexec_absent" "$native_nosuid" "$native_nodev" \
+        "$native_directory" "$native_executable" "$runtime_uid" "$runtime_gid" \
+        "$native_owner_uid" "$native_owner_gid" "$native_mode" "$native_size_bytes" \
+        "$java_process_count" "$java_tmp_property_count" "$effective_java_tmp" \
+        "$javacpp_cache_property_count" "$effective_javacpp_cache" \
+        "$data_tmp_property_count" "$effective_data_tmp" /tmp "$native_path"
+    ')
+    IFS='|' read -r tmp_mount_type tmp_mount_read_write tmp_mount_noexec tmp_mount_nosuid tmp_mount_nodev \
+      native_mount_type native_mount_read_write native_mount_noexec_absent native_mount_nosuid native_mount_nodev \
+      native_directory native_executable runtime_uid runtime_gid native_owner_uid native_owner_gid native_mode \
+      native_size_bytes java_process_count java_tmp_property_count effective_java_tmp \
+      javacpp_cache_property_count effective_javacpp_cache \
+      data_tmp_property_count effective_data_tmp tmp_path native_path \
+      <<<"$native_runtime_output"
+    for value in "$tmp_mount_type" "$native_mount_type" "$native_mode" "$effective_java_tmp" \
+      "$effective_javacpp_cache" "$effective_data_tmp" "$tmp_path" "$native_path"; do
+      safe_json_text "$value"
+    done
+    for value in "$runtime_uid" "$runtime_gid" "$native_owner_uid" "$native_owner_gid" \
+      "$native_size_bytes" "$java_process_count" "$java_tmp_property_count" \
+      "$javacpp_cache_property_count" "$data_tmp_property_count"; do
+      [[ $value =~ ^-?[0-9]+$ ]] || fail 'The OSCAR native-runtime probe returned a nonnumeric field.'
+    done
+    for value in "$tmp_mount_read_write" "$tmp_mount_noexec" "$tmp_mount_nosuid" "$tmp_mount_nodev" \
+      "$native_mount_read_write" "$native_mount_noexec_absent" "$native_mount_nosuid" "$native_mount_nodev" \
+      "$native_directory" "$native_executable"; do
+      [[ $value == true || $value == false ]] || fail 'The OSCAR native-runtime probe returned a nonboolean field.'
+    done
     app_backup_root_absent=false
     postgres_backup_root_absent=false
     if ! docker inspect "$app_container" --format '{{range .Mounts}}{{println .Destination}}{{end}}' |
@@ -474,6 +640,19 @@ case $action in
       "$atomic_first_publish_succeeded" "$atomic_collision_rejected" "$atomic_source_preserved" "$atomic_destination_preserved"
     printf '"backupIsolation":{"appBackupRootAbsent":%s,"postgresBackupRootAbsent":%s,"isolatedBasebackupWired":%s},' \
       "$app_backup_root_absent" "$postgres_backup_root_absent" "$isolated_basebackup_wired"
+    printf '"nativeRuntime":{"entrypointPath":"/usr/local/bin/oscar-entrypoint","packagedEntrypointSha256":"%s","deployedEntrypointSha256":"%s","entrypointRegularExecutable":%s,"containerEntrypointExact":%s,"managedPropertiesAfterJavaOpts":%s,' \
+      "$packaged_entrypoint_sha" "$deployed_entrypoint_sha" "$entrypoint_regular" \
+      "$container_entrypoint_exact" "$entrypoint_tmp_contract"
+    printf '"tmpPath":"%s","tmpMountType":"%s","tmpReadWrite":%s,"tmpNoexec":%s,"tmpNosuid":%s,"tmpNodev":%s,' \
+      "$tmp_path" "$tmp_mount_type" "$tmp_mount_read_write" "$tmp_mount_noexec" "$tmp_mount_nosuid" "$tmp_mount_nodev"
+    printf '"nativePath":"%s","nativeMountType":"%s","nativeReadWrite":%s,"nativeNoexecAbsent":%s,"nativeNosuid":%s,"nativeNodev":%s,"nativeDirectory":%s,"nativeExecutable":%s,' \
+      "$native_path" "$native_mount_type" "$native_mount_read_write" "$native_mount_noexec_absent" \
+      "$native_mount_nosuid" "$native_mount_nodev" "$native_directory" "$native_executable"
+    printf '"runtimeUid":%s,"runtimeGid":%s,"nativeOwnerUid":%s,"nativeOwnerGid":%s,"nativeMode":"%s","nativeSizeBytes":%s,"javaProcessCount":%s,"javaTmpPropertyCount":%s,"effectiveJavaTmp":"%s","javaCppCachePropertyCount":%s,"effectiveJavaCppCache":"%s","dataTmpPropertyCount":%s,"effectiveDataTmp":"%s"},' \
+      "$runtime_uid" "$runtime_gid" "$native_owner_uid" "$native_owner_gid" "$native_mode" \
+      "$native_size_bytes" "$java_process_count" "$java_tmp_property_count" "$effective_java_tmp" \
+      "$javacpp_cache_property_count" "$effective_javacpp_cache" \
+      "$data_tmp_property_count" "$effective_data_tmp"
     printf '"appImage":{"reference":"%s","imageId":"%s","containerImageId":"%s","repoDigests":%s,"versionLabel":"%s","storageProfileLabel":""},' \
       "$app_image" "$app_id" "$app_container_id" "$app_digests" "$app_version_label"
     printf '"postgisImage":{"reference":"%s","imageId":"%s","containerImageId":"%s","repoDigests":%s,"versionLabel":"%s","storageProfileLabel":"%s"},' \
