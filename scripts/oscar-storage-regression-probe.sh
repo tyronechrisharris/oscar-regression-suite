@@ -47,6 +47,10 @@ env_value() {
   value=$(awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' .env)
   printf '%s' "${value:-$fallback}"
 }
+config_text_matches() {
+  local text=$1 pattern=$2
+  grep -Eq -- "$pattern" <<<"$text"
+}
 absolute_path() { case $1 in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$release_dir" "${1#./}" ;; esac; }
 canonical_directory() {
   local value=$1 resolved
@@ -360,8 +364,8 @@ case $action in
     [[ -n $config ]] && config_text=$(compose exec -T oscar sh -c "cat -- '$config'" 2>/dev/null || true)
     interval=$(printf '%s' "$config_text" | sed -n 's/.*"intervalMinutes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
     grace=$(printf '%s' "$config_text" | sed -n 's/.*"rollbackGraceDays"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    delete_hot=null; printf '%s' "$config_text" | grep -Eq '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true' && delete_hot=true || true
-    printf '%s' "$config_text" | grep -Eq '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*false' && delete_hot=false || true
+    delete_hot=null; config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true' && delete_hot=true || true
+    config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*false' && delete_hot=false || true
     schema=$(scalar "SELECT coalesce(max(version),0) FROM oscar_storage_schema_version;")
     checksums=$(scalar "SHOW data_checksums;")
     installed=$(scalar "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements');")
@@ -385,9 +389,9 @@ case $action in
     batch=false
     # The 3.9.2 tiered database config sets reWriteBatchedInserts=true in code;
     # explicit serialized properties are also accepted for forward compatibility.
-    printf '%s' "$config_text" | grep -Eq 'OscarTieredObsSystemDatabase|reWriteBatchedInserts[^A-Za-z]*(true|"true")' && batch=true || true
+    config_text_matches "$config_text" 'OscarTieredObsSystemDatabase|reWriteBatchedInserts[^A-Za-z]*(true|"true")' && batch=true || true
     journal=false
-    printf '%s' "$config_text" | grep -q 'DailyFileJournalService' && journal=true || true
+    config_text_matches "$config_text" 'DailyFileJournalService' && journal=true || true
     printf '{"expectedRelease":"%s","configuredRelease":"%s","templateRelease":"%s","deploymentId":"%s",' \
       "$expected_release" "$configured_release" "$template_release" "$deployment_id"
     printf '"storageRoots":{"archive":%s,"backup":%s,"walArchive":%s},' \

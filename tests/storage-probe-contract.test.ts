@@ -78,6 +78,43 @@ test("platform probe binds roots, the stable lock, and exact helper provenance a
   assert.match(block, /expected_archive_command='\/usr\/local\/bin\/oscar-archive-wal "%p" "%f" \/var\/lib\/postgresql\/wal-archive'/);
 });
 
+test("platform config probes remain pipefail-safe for a large persisted configuration", () => {
+  const block = probe.slice(probe.indexOf("  platform)"), probe.indexOf("  snapshot)"));
+  const helper = probe.match(/config_text_matches\(\) \{\n[\s\S]*?\n\}/)?.[0];
+  assert.ok(helper, "missing config_text_matches helper");
+  assert.match(helper, /grep -Eq -- "\$pattern" <<<"\$text"/);
+  assert.equal(block.match(/config_text_matches "\$config_text"/g)?.length, 4);
+  assert.doesNotMatch(block, /printf[^\n]*\$config_text[^\n]*\|[^\n]*grep/);
+
+  const largeConfig = [
+    '"OscarTieredObsSystemDatabase": {},',
+    '"DailyFileJournalService": {},',
+    '"deleteHotAfterArchive": true,',
+    '"reWriteBatchedInserts": true,',
+    `"padding":"${"x".repeat(1024 * 1024)}"`,
+  ].join("\n");
+  const legacyPipeline = `set -o pipefail
+config_text=$(cat)
+printf '%s' "$config_text" | grep -q DailyFileJournalService`;
+  assert.throws(
+    () => execFileSync("bash", ["-c", legacyPipeline], {input: largeConfig, stdio: ["pipe", "pipe", "pipe"]}),
+    "large-config fixture must reproduce the legacy SIGPIPE failure",
+  );
+
+  const safeProbe = `set -Eeuo pipefail
+${helper}
+config_text=$(cat)
+config_text_matches "$config_text" 'OscarTieredObsSystemDatabase'
+config_text_matches "$config_text" 'DailyFileJournalService'
+config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true'
+config_text_matches "$config_text" 'reWriteBatchedInserts[^A-Za-z]*(true|"true")'
+! config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*false'`;
+  assert.doesNotThrow(() => execFileSync("bash", ["-c", safeProbe], {
+    input: largeConfig,
+    stdio: ["pipe", "pipe", "pipe"],
+  }));
+});
+
 test("archive health aggregates generations independently from archive objects", () => {
   const block = probe.slice(probe.indexOf("  archive-health)"), probe.indexOf("  journal-status)"));
   assert.match(block, /WITH generations AS/);
