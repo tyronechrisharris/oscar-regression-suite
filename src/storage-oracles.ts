@@ -12,7 +12,6 @@ export const MAX_RETAINED_EVENT_BYTES = 64 * 1024 * 1024;
 export const MAX_RETAINED_EVENT_PIXELS = 120_000_000;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function object(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -97,12 +96,16 @@ export function assessRetainedMediaResponse(
     if (manifest.schemaVersion !== 1 || manifest.eventId !== expectedEventId) {
       throw new Error(`mediaSets[${setIndex}] manifest identity is invalid`);
     }
-    const mediaSetId = text(manifest.mediaSetId, `mediaSets[${setIndex}].manifest.mediaSetId`);
-    if (!UUID_PATTERN.test(mediaSetId) || setIds.has(mediaSetId)) {
-      throw new Error(`mediaSets[${setIndex}] has an invalid or duplicate mediaSetId`);
+    const laneUid = text(manifest.laneUid, `mediaSets[${setIndex}].manifest.laneUid`);
+    const cameraUid = text(manifest.cameraUid, `mediaSets[${setIndex}].manifest.cameraUid`);
+    const mediaSetId = sha256(manifest.mediaSetId, `mediaSets[${setIndex}].manifest.mediaSetId`);
+    const expectedMediaSetId = createHash("sha256")
+      .update(`${expectedEventId}\0${laneUid}\0${cameraUid}`, "utf8")
+      .digest("hex");
+    if (mediaSetId !== expectedMediaSetId || setIds.has(mediaSetId)) {
+      throw new Error(`mediaSets[${setIndex}] has an invalid or duplicate deterministic mediaSetId`);
     }
     setIds.add(mediaSetId);
-    const cameraUid = text(manifest.cameraUid, `mediaSets[${setIndex}].manifest.cameraUid`);
     if (cameraUidSet.has(cameraUid)) {
       throw new Error(`mediaSets[${setIndex}] has an invalid or duplicate cameraUid`);
     }

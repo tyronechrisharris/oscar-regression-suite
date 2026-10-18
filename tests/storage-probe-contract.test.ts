@@ -126,6 +126,18 @@ test("archive health aggregates generations independently from archive objects",
   assert.equal(block.match(/'activeHolds'/g)?.length, 1, "archive-health JSON must contain activeHolds once");
 });
 
+test("journal status extracts SHA-256 without exposing nested positional parameters", () => {
+  const block = probe.slice(probe.indexOf("  journal-status)"), probe.indexOf("  journal-restart)"));
+  const digestFragment = block.match(/digest_line=\$\(sha256sum "\$csv"\)\n\s*actual_sha=\$\{digest_line%% \*\}/)?.[0];
+  assert.ok(digestFragment, "missing nesting-safe journal digest extraction");
+  assert.doesNotMatch(block, /awk[^\n]*\\\\\$1/);
+  const actual = execFileSync("sh", ["-eu", "-c", `csv=$1
+${digestFragment}
+printf '%s' "$actual_sha"`, "journal-digest", resolve("package.json")], {encoding: "utf8"});
+  const expected = execFileSync("sha256sum", [resolve("package.json")], {encoding: "utf8"}).split(/\s+/u)[0];
+  assert.equal(actual, expected);
+});
+
 test("storage snapshot emits activeHolds exactly once", () => {
   const block = probe.slice(probe.indexOf("  snapshot)"), probe.indexOf("  archive-health)"));
   assert.equal(block.match(/'activeHolds'/g)?.length, 1);
@@ -229,7 +241,35 @@ test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
 });
 
 test("disposable lifecycle proves exact-row activation and deployed helper behavior", () => {
+  const allocator = probe.slice(probe.indexOf("create_observation_fixture()"), probe.indexOf("\n\ncase $action"));
+  for (const required of [
+    "INSERT INTO oscar_regression_fixture_allocator(singleton,leased_high_water)",
+    "ON CONFLICT (singleton) DO UPDATE",
+    "oscar_regression_fixture_allocator.leased_high_water",
+    "EXCLUDED.leased_high_water-1099511627778",
+    "max(id) FROM obs",
+    "max(max_id) FROM oscar_archive_generation",
+    "RETURNING leased_high_water cold_id,leased_high_water-1 hot_id",
+    "9223370937343148029",
+    "INSERT INTO obs(id,datastreamid",
+    "cold_id::text",
+    "hot_id::text",
+    "oscar_archive_id_block",
+    "oscar_obs_overlay",
+  ]) assert.ok(allocator.includes(required), `missing collision-safe fixture allocation contract: ${required}`);
+  const allocatorTable = probe.slice(probe.indexOf("ensure_fixture_table()"), probe.indexOf("create_observation_fixture()"));
+  assert.match(allocatorTable, /oscar_regression_fixture_allocator/);
+  assert.match(allocatorTable, /singleton boolean PRIMARY KEY/);
+  assert.doesNotMatch(allocator, /pg_advisory_xact_lock/);
+  assert.match(allocator, /WHERE id IN \(a\.cold_id,a\.hot_id\)/);
+  assert.match(allocator, /FROM cold,hot RETURNING \*/);
+
+  const create = probe.slice(probe.indexOf("  fixture-create)"), probe.indexOf("  fixture-create-race)"));
   const race = probe.slice(probe.indexOf("  fixture-create-race)"), probe.indexOf("  fixture-status)"));
+  assert.match(create, /create_observation_fixture "\$run"/);
+  assert.match(race, /create_observation_fixture "\$run"/);
+  assert.match(race, /sampled_at-interval '2 minutes'/);
+  assert.match(race, /sampled_at-interval '1 minute'/);
   assert.match(race, /BEFORE UPDATE OF archivegenerationid/);
   assert.match(race, /pg_advisory_xact_lock/);
   assert.match(race, /pg_temp\.oscar_archive_activation_row WHERE observation_id=\$cold_id/);
@@ -241,6 +281,12 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
   assert.match(status, /g\.row_count=1 AND g\.min_id=f\.cold_id AND g\.max_id=f\.cold_id/);
   assert.match(status, /o\.archivegenerationid=g\.id/);
   assert.match(status, /exactRowOwnership/);
+
+  const cleanupStart = probe.indexOf("  fixture-cleanup)");
+  const cleanup = probe.slice(cleanupStart, probe.indexOf("  *) fail", cleanupStart));
+  assert.match(cleanup, /DELETE FROM oscar_regression_fixture WHERE run_id='\$run' RETURNING cold_id,hot_id/);
+  assert.match(cleanup, /DELETE FROM obs o USING f WHERE o\.id IN \(f\.cold_id,f\.hot_id\)/);
+  assert.doesNotMatch(cleanup, /DELETE FROM obs(?:\s+WHERE|;)/);
 
   const archiveHelper = probe.slice(probe.indexOf("  archive-helper-check)"), probe.indexOf("  wal-helper-check)"));
   assert.match(archiveHelper, /oscar-archive-object verify/);
@@ -262,7 +308,8 @@ test("retained-media scenario browser-decodes every assessed frame", () => {
   const originStart = scenarios.lastIndexOf("const page = await this.browser.oscarPage()", start);
   const block = scenarios.slice(originStart, end);
   assert.ok(originStart > 0 && start > originStart && end > start);
-  assert.match(block, /await this\.goto\(page, "\/dashboard"\)/);
+  assert.match(block, /await this\.goto\(page, "\/"\)/);
+  assert.doesNotMatch(block, /await this\.goto\(page, "\/dashboard"\)/);
   assert.match(block, /for \(const asset of assessment\.assets\)/);
   assert.match(block, /createImageBitmap\(blob\)/);
   assert.match(block, /bitmap\.width === width && bitmap\.height === height/);
@@ -275,6 +322,17 @@ test("storage lifecycle refuses mutation when exact release/profile preflight fa
   const refusal = scenarios.indexOf("Storage lifecycle mutation refused", start);
   assert.ok(start > 0 && refusal > start && fixtureCreate > refusal);
   assert.match(scenarios.slice(start, fixtureCreate), /if \(!profileAccepted\)/);
+});
+
+test("storage lifecycle cleans an attempted fixture even when create acknowledgement is lost", () => {
+  const start = scenarios.indexOf("private async storageLifecycle");
+  const end = scenarios.indexOf("private async storageRestoreDrill", start);
+  const block = scenarios.slice(start, end);
+  const attempted = block.indexOf("fixtureCreateAttempted = true");
+  const create = block.indexOf('probe.runJson<{coldId: string; hotId: string', attempted);
+  const cleanup = block.indexOf('if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup"', create);
+  assert.ok(attempted > 0 && create > attempted && cleanup > create);
+  assert.doesNotMatch(block, /fixtureCreated/);
 });
 
 test("retained-media gallery measures concurrency and proves selected content loaded", () => {

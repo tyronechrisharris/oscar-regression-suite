@@ -2907,7 +2907,7 @@ export class RegressionScenarios {
           // Establish a same-origin authenticated document before exercising
           // browser-native fetch/createImageBitmap. A blank about:blank page
           // would otherwise turn the decode into a cross-origin CORS probe.
-          await this.goto(page, "/dashboard");
+          await this.goto(page, "/");
           await this.check({scenario: "storage-health", category: "retained-media",
             action: "verify exact-five retained JPEG API", target: eventId,
             expected: "each retained camera has five quality-85, bounded baseline JPEGs whose hashes, dimensions, content types, and Chromium decodes match"}, async () => {
@@ -3056,7 +3056,7 @@ export class RegressionScenarios {
     if (this.storageUnavailable("storage-lifecycle")) return;
     const probe = new StorageProbeClient(this.config, this.reporter.runId);
     const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
-    let fixtureCreated = false;
+    let fixtureCreateAttempted = false;
     let apiPage: Page | undefined;
     try {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
@@ -3076,11 +3076,11 @@ export class RegressionScenarios {
         throw new Error("Storage lifecycle mutation refused because the exact accelerated 3.9.2 profile failed");
       }
       this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
-      const fixture = await probe.runJson<{coldId: number; hotId: number; datastreamId: number;
+      fixtureCreateAttempted = true;
+      const fixture = await probe.runJson<{coldId: string; hotId: string; datastreamId: number;
         coldTime: string; hotTime: string; activationBlocked: boolean; sourceMutated: boolean;
         staleActivationRejected: boolean; staleRowUnmarked: boolean}>(
           "fixture-create-race", [fixtureRun, String(this.config.storageHotRetentionDays)]);
-      fixtureCreated = true;
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "reject concurrent source change during archive activation", target: String(fixture.coldId),
         expected: "a controlled source-row change after export makes activation roll back without marking the stale row"}, async () => ({
@@ -3090,8 +3090,8 @@ export class RegressionScenarios {
       }));
       const archived = await poll(
         () => probe.runJson<{generationId: string | null; generationState: string | null;
-          parityVerified: boolean; generationRows: number; generationMinId: number | null;
-          generationMaxId: number | null; markedRows: number; fixtureColdMarked: boolean;
+          parityVerified: boolean; generationRows: number; generationMinId: string | null;
+          generationMaxId: string | null; markedRows: number; fixtureColdMarked: boolean;
           fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
           "fixture-status", [fixtureRun]),
         value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
@@ -3205,7 +3205,7 @@ export class RegressionScenarios {
       this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-after", await probe.runJson("snapshot")));
     } finally {
       if (apiPage) await apiPage.close().catch(() => undefined);
-      if (fixtureCreated) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
+      if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
         this.reporter.error("storage-lifecycle", "fixture-cleanup", error));
       await probe.cleanup();
     }

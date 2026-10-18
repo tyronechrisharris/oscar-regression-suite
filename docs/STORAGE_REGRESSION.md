@@ -81,6 +81,16 @@ time, releases the barrier, and requires the stale activation to fail with no
 archive marker. The trigger/function are always removed. It then requires the
 real retry to mark exactly that one current source row (matching generation
 count/min/max), leave the hot control unmarked, and obtain a parity receipt.
+
+Because `obs.id` has no database sequence, these direct-SQL fixtures use a
+singleton allocator row to serialize a collision-checked test-only `BIGINT`
+lease more than 2^40 IDs beyond the durable hot/archive high-water and fail
+atomically if either candidate is no longer free. The archived fixture keeps
+the larger leased ID so a restart can
+advance the store's durable high-water even after ordinary fixture-row cleanup.
+This deliberate side effect is another reason `storage-lifecycle` is restricted
+to a fresh, disposable database and must never run against a production store.
+
 It verifies a self-contained export,
 accelerates only that registered generation's grace timestamp, proves the cold
 row remains API-queryable alongside the hot row, and then tests hold

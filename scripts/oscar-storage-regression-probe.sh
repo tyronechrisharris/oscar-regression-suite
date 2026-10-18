@@ -161,7 +161,70 @@ ensure_fixture_table() {
     cold_id bigint NOT NULL UNIQUE, hot_id bigint NOT NULL UNIQUE, datastream_id bigint NOT NULL,
     cold_time timestamptz NOT NULL, hot_time timestamptz NOT NULL,
     generation_id uuid, created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE TABLE IF NOT EXISTS oscar_regression_fixture_allocator (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    leased_high_water bigint NOT NULL CHECK (leased_high_water > 0)
   );" >/dev/null
+}
+create_observation_fixture() {
+  local run=$1 cold_time_sql=$2 hot_time_sql=$3 fixture_json
+  # PostgisStore allocates positive observation IDs from an in-process AtomicLong
+  # initialized from the durable hot/archive high-water. Keep direct SQL fixtures
+  # in a test-only lease over 2^40 IDs beyond that high-water. The singleton
+  # allocator UPSERT takes a PostgreSQL row lock and computes each new lease
+  # from the latest committed allocator value, even when concurrent statements
+  # began with the same READ COMMITTED snapshot. The obs primary key still
+  # fails the entire statement if an outside writer reaches either candidate.
+  # The archived cold ID is the top of the lease so its durable generation
+  # high-water prevents the deleted hot ID from becoming the restart next ID.
+  fixture_json=$(json_query "WITH source AS MATERIALIZED (
+      SELECT o.* FROM obs o JOIN obs_datastreams d ON d.id=o.datastreamid
+      WHERE d.data->>'outputName'='gammaCounts' AND o.archivegenerationid IS NULL
+      ORDER BY o.id DESC LIMIT 1),
+    fixture_clock AS MATERIALIZED (SELECT clock_timestamp() sampled_at),
+    high_water AS MATERIALIZED (
+      SELECT greatest(
+        coalesce((SELECT max(id) FROM obs),0),
+        coalesce((SELECT max(max_id) FROM oscar_archive_generation),0),
+        coalesce((SELECT max(greatest(cold_id,hot_id)) FROM oscar_regression_fixture),0)
+      ) id),
+    allocated AS MATERIALIZED (
+      INSERT INTO oscar_regression_fixture_allocator(singleton,leased_high_water)
+      SELECT true,high_water.id+1099511627778 FROM high_water CROSS JOIN source
+      WHERE high_water.id BETWEEN 0 AND 9223370937343148029
+        AND NOT EXISTS (SELECT 1 FROM oscar_regression_fixture WHERE run_id='$run')
+      ON CONFLICT (singleton) DO UPDATE SET leased_high_water=greatest(
+        oscar_regression_fixture_allocator.leased_high_water,
+        EXCLUDED.leased_high_water-1099511627778)+1099511627778
+      WHERE greatest(oscar_regression_fixture_allocator.leased_high_water,
+        EXCLUDED.leased_high_water-1099511627778) BETWEEN 0 AND 9223370937343148029
+      RETURNING leased_high_water cold_id,leased_high_water-1 hot_id),
+    collision_free AS MATERIALIZED (
+      SELECT a.* FROM allocated a
+      WHERE NOT EXISTS (SELECT 1 FROM obs WHERE id IN (a.cold_id,a.hot_id))
+        AND NOT EXISTS (SELECT 1 FROM oscar_regression_fixture
+          WHERE cold_id IN (a.cold_id,a.hot_id) OR hot_id IN (a.cold_id,a.hot_id))
+        AND NOT EXISTS (SELECT 1 FROM oscar_archive_generation
+          WHERE a.cold_id BETWEEN min_id AND max_id OR a.hot_id BETWEEN min_id AND max_id)
+        AND NOT EXISTS (SELECT 1 FROM oscar_archive_id_block
+          WHERE a.cold_id BETWEEN min_id AND max_id OR a.hot_id BETWEEN min_id AND max_id)
+        AND NOT EXISTS (SELECT 1 FROM oscar_obs_overlay
+          WHERE observation_id IN (a.cold_id,a.hot_id))),
+    cold AS (INSERT INTO obs(id,datastreamid,foiid,phenomenontime,resulttime,result)
+      SELECT allocation.cold_id,source.datastreamid,source.foiid,$cold_time_sql,$cold_time_sql,source.result
+      FROM source CROSS JOIN collision_free allocation CROSS JOIN fixture_clock RETURNING *),
+    hot AS (INSERT INTO obs(id,datastreamid,foiid,phenomenontime,resulttime,result)
+      SELECT allocation.hot_id,source.datastreamid,source.foiid,$hot_time_sql,$hot_time_sql,source.result
+      FROM source CROSS JOIN collision_free allocation CROSS JOIN fixture_clock RETURNING *),
+    registry AS (INSERT INTO oscar_regression_fixture(run_id,cold_id,hot_id,datastream_id,cold_time,hot_time)
+      SELECT '$run',cold.id,hot.id,cold.datastreamid,cold.phenomenontime,hot.phenomenontime
+      FROM cold,hot RETURNING *)
+    SELECT json_build_object('runId',run_id,'coldId',cold_id::text,'hotId',hot_id::text,
+      'datastreamId',datastream_id,'coldTime',cold_time,'hotTime',hot_time) FROM registry;")
+  [[ $fixture_json == \{* ]] ||
+    fail 'Could not allocate two collision-free test observation IDs below the signed BIGINT limit.'
+  printf '%s\n' "$fixture_json"
 }
 
 case $action in
@@ -506,7 +569,8 @@ case $action in
         expected_bytes=$(sed -n "s/.*\"byteCount\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$manifest" | head -n1)
         expected_records=$(sed -n "s/.*\"recordCount\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$manifest" | head -n1)
         if [ -f "$csv" ]; then
-          actual_sha=$(sha256sum "$csv" | awk "{print \\$1}")
+          digest_line=$(sha256sum "$csv")
+          actual_sha=${digest_line%% *}
           actual_bytes=$(wc -c <"$csv" | tr -d "[:space:]")
           actual_records=$(wc -l <"$csv" | tr -d "[:space:]")
         else actual_sha=missing; actual_bytes=-1; actual_records=-1; fi
@@ -539,17 +603,9 @@ case $action in
     [[ $retention =~ ^[1-9][0-9]*$ ]] || fail 'Invalid retention days.'
     ensure_fixture_table
     [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';") == 0 ]] || fail 'Fixture already exists.'
-    json_query "WITH source AS (
-      SELECT o.* FROM obs o JOIN obs_datastreams d ON d.id=o.datastreamid
-      WHERE d.data->>'outputName'='gammaCounts' ORDER BY o.id DESC LIMIT 1),
-    cold AS (INSERT INTO obs(datastreamid,foiid,phenomenontime,resulttime,result)
-      SELECT datastreamid,foiid,now()-make_interval(days=>$retention+2),now()-make_interval(days=>$retention+2),result FROM source RETURNING *),
-    hot AS (INSERT INTO obs(datastreamid,foiid,phenomenontime,resulttime,result)
-      SELECT datastreamid,foiid,now()-interval '1 minute',now()-interval '1 minute',result FROM source RETURNING *),
-    registry AS (INSERT INTO oscar_regression_fixture(run_id,cold_id,hot_id,datastream_id,cold_time,hot_time)
-      SELECT '$run',cold.id,hot.id,cold.datastreamid,cold.phenomenontime,hot.phenomenontime FROM cold,hot RETURNING *)
-    SELECT json_build_object('runId',run_id,'coldId',cold_id,'hotId',hot_id,'datastreamId',datastream_id,
-      'coldTime',cold_time,'hotTime',hot_time) FROM registry;"
+    create_observation_fixture "$run" \
+      "fixture_clock.sampled_at-make_interval(days=>$retention+2)" \
+      "fixture_clock.sampled_at-interval '1 minute'"
     ;;
 
   fixture-create-race)
@@ -598,17 +654,9 @@ case $action in
     done
     $holder_ready || fail 'Could not establish the PostgreSQL activation barrier.'
     race_started=$(scalar "SELECT to_char(clock_timestamp(),'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"');")
-    json_query "WITH source AS (
-        SELECT o.* FROM obs o JOIN obs_datastreams d ON d.id=o.datastreamid
-        WHERE d.data->>'outputName'='gammaCounts' ORDER BY o.id DESC LIMIT 1),
-      cold AS (INSERT INTO obs(datastreamid,foiid,phenomenontime,resulttime,result)
-        SELECT datastreamid,foiid,now()-interval '1 minute',now()-interval '1 minute',result FROM source RETURNING *),
-      hot AS (INSERT INTO obs(datastreamid,foiid,phenomenontime,resulttime,result)
-        SELECT datastreamid,foiid,now()-interval '1 minute',now()-interval '1 minute',result FROM source RETURNING *),
-      registry AS (INSERT INTO oscar_regression_fixture(run_id,cold_id,hot_id,datastream_id,cold_time,hot_time)
-        SELECT '$run',cold.id,hot.id,cold.datastreamid,cold.phenomenontime,hot.phenomenontime FROM cold,hot RETURNING *)
-      SELECT json_build_object('runId',run_id,'coldId',cold_id,'hotId',hot_id,'datastreamId',datastream_id,
-        'coldTime',cold_time,'hotTime',hot_time) FROM registry;" >/dev/null
+    create_observation_fixture "$run" \
+      "fixture_clock.sampled_at-interval '2 minutes'" \
+      "fixture_clock.sampled_at-interval '1 minute'" >/dev/null
     race_fixture_created=true
     cold_id=$(scalar "SELECT cold_id FROM oscar_regression_fixture WHERE run_id='$run';")
     [[ $cold_id =~ ^[1-9][0-9]{0,18}$ ]] || fail 'Could not identify the activation-race cold row.'
@@ -631,7 +679,7 @@ case $action in
       UPDATE oscar_regression_fixture f SET cold_time=changed.phenomenontime FROM changed
         WHERE f.run_id='$run' AND f.cold_id=$cold_id RETURNING 1;")
     [[ $chilled == 1 ]] || fail 'Could not move the protected fixture row into the archive window.'
-    fixture_json=$(json_query "SELECT json_build_object('runId',run_id,'coldId',cold_id,'hotId',hot_id,
+    fixture_json=$(json_query "SELECT json_build_object('runId',run_id,'coldId',cold_id::text,'hotId',hot_id::text,
         'datastreamId',datastream_id,'coldTime',cold_time,'hotTime',hot_time)
       FROM oscar_regression_fixture WHERE run_id='$run';")
     deadline=$((SECONDS+180)); activation_blocked=false
@@ -675,7 +723,7 @@ case $action in
     saved AS (UPDATE oscar_regression_fixture f SET generation_id=g.id FROM g WHERE f.run_id='$run' RETURNING f.*)
     SELECT json_build_object('exists',EXISTS(SELECT 1 FROM f),'generationId',(SELECT id FROM g),'generationState',(SELECT state FROM g),
       'parityVerified',coalesce((SELECT parity_verified FROM g),false),'generationRows',coalesce((SELECT row_count FROM g),0),
-      'generationMinId',(SELECT min_id FROM g),'generationMaxId',(SELECT max_id FROM g),
+      'generationMinId',(SELECT min_id::text FROM g),'generationMaxId',(SELECT max_id::text FROM g),
       'markedRows',coalesce((SELECT count(*) FROM obs o,g WHERE o.archivegenerationid=g.id),0),
       'fixtureColdMarked',coalesce((SELECT o.archivegenerationid=g.id FROM obs o,f,g WHERE o.id=f.cold_id),false),
       'fixtureHotUnmarked',coalesce((SELECT o.archivegenerationid IS NULL FROM obs o,f WHERE o.id=f.hot_id),false),

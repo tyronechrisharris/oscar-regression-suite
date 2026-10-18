@@ -17,6 +17,7 @@ const digest = (value: Buffer | string) => createHash("sha256").update(value).di
 
 function retainedResponse() {
   const eventId = "event-1";
+  const laneUid = "lane-01";
   const cameraUid = "camera-01";
   const cameraToken = Buffer.from(cameraUid).toString("base64url");
   const positions = ["FIRST", "QUARTER", "MIDDLE", "THREE_QUARTERS", "LAST"];
@@ -25,8 +26,8 @@ function retainedResponse() {
     bytes: 4, width: 1, height: 1, sha256: "a".repeat(64),
   }));
   return {eventId, response: {schemaVersion: 1, eventId, mediaSets: [{
-    manifest: {schemaVersion: 1, eventId, mediaSetId: "123e4567-e89b-42d3-a456-426614174000",
-      cameraUid, jpegQuality: 85,
+    manifest: {schemaVersion: 1, eventId,
+      mediaSetId: digest(`${eventId}\0${laneUid}\0${cameraUid}`), laneUid, cameraUid, jpegQuality: 85,
       source: {sha256: "b".repeat(64), bytes: 100, rollbackDeleteAfter: "2026-10-18T00:00:00Z"}, assets},
     manifestPath: `media/${eventId}/${cameraToken}/manifest.json`,
     assets: assets.map((asset, index) => ({asset, path: `media/${eventId}/${cameraToken}/frame-0${index + 1}.jpg`})),
@@ -40,6 +41,31 @@ test("retained-media oracle requires exactly five canonical JPEG assets", () => 
   assert.equal(result.assets.length, 5);
   fixture.response.mediaSets[0]!.manifest.assets.pop();
   assert.throws(() => assessRetainedMediaResponse(fixture.response, fixture.eventId), /exactly five/);
+});
+
+test("retained-media oracle requires unique deterministic lowercase SHA-256 media-set IDs", () => {
+  const valid = retainedResponse();
+  assert.equal(assessRetainedMediaResponse(valid.response, valid.eventId).mediaSetCount, 1);
+
+  const malformed = retainedResponse();
+  malformed.response.mediaSets[0]!.manifest.mediaSetId = "123e4567-e89b-42d3-a456-426614174000";
+  assert.throws(() => assessRetainedMediaResponse(malformed.response, malformed.eventId),
+    /lowercase SHA-256/);
+
+  const uppercase = retainedResponse();
+  uppercase.response.mediaSets[0]!.manifest.mediaSetId = uppercase.response.mediaSets[0]!.manifest.mediaSetId.toUpperCase();
+  assert.throws(() => assessRetainedMediaResponse(uppercase.response, uppercase.eventId),
+    /lowercase SHA-256/);
+
+  const wrongIdentity = retainedResponse();
+  wrongIdentity.response.mediaSets[0]!.manifest.mediaSetId = "c".repeat(64);
+  assert.throws(() => assessRetainedMediaResponse(wrongIdentity.response, wrongIdentity.eventId),
+    /deterministic mediaSetId/);
+
+  const duplicate = retainedResponse();
+  duplicate.response.mediaSets.push(structuredClone(duplicate.response.mediaSets[0]!));
+  assert.throws(() => assessRetainedMediaResponse(duplicate.response, duplicate.eventId),
+    /duplicate deterministic mediaSetId/);
 });
 
 test("retained-media oracle rejects event path traversal and duplicate positions", () => {
@@ -92,8 +118,8 @@ test("retained-media oracle enforces frame and event-wide resource budgets", () 
   for (const asset of first.manifest.assets) asset.bytes = 10 * 1024 * 1024;
   for (const asset of first.assets) asset.asset.bytes = 10 * 1024 * 1024;
   const second = structuredClone(first);
-  second.manifest.mediaSetId = "223e4567-e89b-42d3-a456-426614174000";
   second.manifest.cameraUid = "camera-02";
+  second.manifest.mediaSetId = digest(`${oversizedEvent.eventId}\0${second.manifest.laneUid}\0${second.manifest.cameraUid}`);
   const firstToken = Buffer.from("camera-01").toString("base64url");
   const secondToken = Buffer.from("camera-02").toString("base64url");
   second.manifestPath = second.manifestPath.replace(firstToken, secondToken);

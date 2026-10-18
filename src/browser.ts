@@ -9,6 +9,24 @@ import {
   type AlarmTransferCameraState,
 } from "./alarm-transfer-camera-fixture.js";
 
+export function isExpectedRetainedMediaMiss(
+  baseUrl: string,
+  method: string,
+  status: number,
+  responseUrl: string,
+): boolean {
+  if (method !== "GET" || status !== 404) return false;
+  try {
+    const expectedOrigin = new URL(baseUrl).origin;
+    const response = new URL(responseUrl);
+    if (response.origin !== expectedOrigin || response.search !== "" || response.hash !== "") return false;
+    const pathname = decodeURIComponent(response.pathname);
+    return /^\/sensorhub\/buckets\/videos\/media\/[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$/.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
 export class BrowserHarness {
   private browser: Browser | undefined;
   private oscarContext: BrowserContext | undefined;
@@ -308,6 +326,16 @@ export class BrowserHarness {
       if (response.status() === 404) {
         const url = response.url();
         const expectedPreparingRequest = /(?:\.m3u8|\/hls\/|\/sw\.js(?:\?|$)|\/favicon\.ico(?:\?|$))/i.test(url);
+        // The Viewer first probes the retained-frame manifest and deliberately
+        // falls back to the legacy MP4 when an event has not been compacted.
+        // Suppress only that exact, same-origin GET miss; other 404s remain
+        // regression errors and every 5xx remains an error below.
+        const expectedRetainedMediaMiss = isExpectedRetainedMediaMiss(
+          this.config.oscarBaseUrl,
+          response.request().method(),
+          response.status(),
+          url,
+        );
         const expectedMissingObservation = [...this.expectedMissingObservationIds].some((observationId) => {
           try {
             return decodeURIComponent(new URL(url).pathname)
@@ -316,7 +344,7 @@ export class BrowserHarness {
             return false;
           }
         });
-        if (!expectedPreparingRequest && !expectedMissingObservation) {
+        if (!expectedPreparingRequest && !expectedRetainedMediaMiss && !expectedMissingObservation) {
           this.reporter.error(
             this.scenario,
             `${source}-http`,
