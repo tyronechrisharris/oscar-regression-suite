@@ -667,6 +667,18 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
   assert.match(block, /future_segment_sha/);
   assert.doesNotMatch(block, /wal_canary/);
   assert.match(block, /state='VERIFIED'/);
+  assert.match(block, /archive_canary_profile="restore_\$run"/);
+  assert.match(block,
+    /archive_canary="\$archive_canary_parent\/profile=\$archive_canary_profile"/);
+  assert.match(block, /install -d -o 10001 -g 10001 -m 0750 -- "\$archive_canary"/);
+  assert.match(block, /rmdir -- "\$archive_canary" \|\| fail/);
+  assert.match(block, /archive_restored=false; \[\[ -d \$archive_canary && ! -L \$archive_canary \]\]/);
+  assert.doesNotMatch(block, /archive_dir\/[.]restore-regression-/,
+    "archive restore canaries must stay inside the production-approved datasets layout");
+  const archiveCanaryRelative =
+    "datasets/observations/date=2026-10-18/profile=restore_2026_10_18t17_43_32_227z_nimo_mme3l";
+  assert.match(archiveCanaryRelative,
+    /^datasets\/observations\/date=[0-9]{4}-[0-9]{2}-[0-9]{2}\/profile=[A-Za-z0-9_-]+$/u);
 });
 
 test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {

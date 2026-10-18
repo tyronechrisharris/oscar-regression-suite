@@ -2651,7 +2651,10 @@ case $action in
     marker="$run:before"
     mutated="$run:after"
     state_relative="files/.restore-regression/$run.canary"
-    archive_canary="$archive_dir/.restore-regression-$run.canary"
+    archive_canary_day=$(date -u +%F)
+    archive_canary_profile="restore_$run"
+    archive_canary_parent="$archive_dir/datasets/observations/date=$archive_canary_day"
+    archive_canary="$archive_canary_parent/profile=$archive_canary_profile"
     secret_canary="$release_dir/secrets/.restore-regression-$run.canary"
     tls_canary="$release_dir/tls/.restore-regression-$run.canary"
     env_canary="# OSCAR_RESTORE_DRILL_CANARY=$marker"
@@ -2677,7 +2680,9 @@ case $action in
       if compose ps --status running --services 2>/dev/null | grep -Fxq oscar; then
         compose exec -T oscar sh -c "rm -f -- '/var/lib/oscar/$state_relative'; rmdir /var/lib/oscar/files/.restore-regression 2>/dev/null || true" >/dev/null 2>&1
       fi
-      rm -f -- "$archive_canary" "$secret_canary" "$tls_canary"
+      rmdir -- "$archive_canary" "$archive_canary_parent" \
+        "$archive_dir/datasets/observations" "$archive_dir/datasets" 2>/dev/null || true
+      rm -f -- "$secret_canary" "$tls_canary"
       rm -rf -- "$restore_work"
       sed -i "/^# OSCAR_RESTORE_DRILL_CANARY=$run:/d" .env 2>/dev/null
       set -e
@@ -2696,7 +2701,7 @@ case $action in
     psql_admin --command "ALTER TABLE oscar_regression_fixture ADD COLUMN IF NOT EXISTS restore_marker text;
       UPDATE oscar_regression_fixture SET restore_marker='$marker' WHERE run_id='$run';" >/dev/null
     compose exec -T oscar sh -eu -c 'mkdir -p /var/lib/oscar/files/.restore-regression; printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$marker"
-    printf '%s\n' "$marker" >"$archive_canary"
+    install -d -o 10001 -g 10001 -m 0750 -- "$archive_canary"
     printf '%s\n' "$marker" >"$secret_canary"
     printf '%s\n' "$marker" >"$tls_canary"
     printf '%s\n' "$env_canary" >>.env
@@ -2764,7 +2769,7 @@ case $action in
       fail 'Post-backup source-timeline WAL was not archived before restore.'
     future_segment_sha=$(sha256_file "$wal_dir/$future_segment")
     compose exec -T oscar sh -eu -c 'printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$mutated"
-    printf '%s\n' "$mutated" >"$archive_canary"
+    rmdir -- "$archive_canary" || fail 'Could not remove the empty post-backup archive directory canary.'
     printf '%s\n' "$mutated" >"$secret_canary"
     printf '%s\n' "$mutated" >"$tls_canary"
     sed -i "s|^# OSCAR_RESTORE_DRILL_CANARY=$marker$|$env_mutated|" .env
@@ -2782,7 +2787,7 @@ case $action in
     [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run' AND restore_marker='$marker';") == 1 ]] && database_restored=true
     state_restored=false
     [[ $(compose exec -T oscar sh -c "cat -- '/var/lib/oscar/$state_relative'" 2>/dev/null || true) == "$marker" ]] && state_restored=true
-    archive_restored=false; [[ $(cat -- "$archive_canary" 2>/dev/null || true) == "$marker" ]] && archive_restored=true
+    archive_restored=false; [[ -d $archive_canary && ! -L $archive_canary ]] && archive_restored=true
     credentials_restored=false
     if [[ $(cat -- "$secret_canary" 2>/dev/null || true) == "$marker" &&
           $(cat -- "$tls_canary" 2>/dev/null || true) == "$marker" &&
