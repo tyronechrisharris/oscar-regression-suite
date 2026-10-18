@@ -39,6 +39,20 @@ scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" | tr -d '[
 json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-fA-F-]{36}$ ]]; }
+retention_hold_id_from_output() {
+  local output=$1 expected_store=$2 expected_scope=$3 line hold_id='' store_key='' id_scope='' matches=0
+  while IFS= read -r line; do
+    if [[ $line =~ ^Retention\ hold\ created:\ ([0-9a-fA-F-]{36})\ \(store=([a-z_][a-z0-9_]{0,62}),\ id-scope=(-?[0-9]+)\)$ ]]; then
+      hold_id=${BASH_REMATCH[1]}
+      store_key=${BASH_REMATCH[2]}
+      id_scope=${BASH_REMATCH[3]}
+      matches=$((matches+1))
+    fi
+  done <<<"$output"
+  [[ $matches -eq 1 && $store_key == "$expected_store" && $id_scope == "$expected_scope" ]] || return 1
+  valid_uuid "$hold_id" || return 1
+  printf '%s' "$hold_id"
+}
 valid_deployment_id() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
 valid_store_key() { [[ $1 =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; }
 valid_id_scope() { [[ $1 =~ ^-?[0-9]+$ && $1 -ge -2147483648 && $1 -le 2147483647 ]]; }
@@ -1046,13 +1060,23 @@ case $action in
         [[ $pending_hold =~ ^[0-9a-fA-F-]{36}$ ]] || continue
         sudo bash oscar.sh archive hold release --id "$pending_hold" --released-by oscar-regression-cleanup >/dev/null 2>&1
       done
+      while IFS= read -r pending_hold; do
+        [[ $pending_hold =~ ^[0-9a-fA-F-]{36}$ ]] || continue
+        sudo bash oscar.sh archive hold release --id "$pending_hold" --released-by oscar-regression-cleanup >/dev/null 2>&1
+      done < <(psql_admin --quiet --tuples-only --no-align --command "
+        SELECT id::text FROM oscar_retention_hold
+         WHERE released_at IS NULL AND store_key='$store_key' AND id_scope=$id_scope
+           AND created_by='oscar-regression'
+           AND ((subject_type='ARCHIVE_GENERATION' AND subject_id='$generation' AND reason='regression-$run')
+             OR (subject_type='OBSERVATION' AND subject_id='$cold_id' AND reason='regression-observation-$run'))
+         ORDER BY id;")
       set -e
     }
     trap cleanup_control_holds EXIT
     hold_output=$(sudo bash oscar.sh archive hold create --store-key "$store_key" --id-scope "$id_scope" \
       --generation "$generation" --reason "regression-$run" --created-by oscar-regression)
-    hold=$(printf '%s' "$hold_output" | sed -n 's/^Retention hold created: //p' | tail -n1)
-    valid_uuid "$hold" || fail 'Hold create did not return an ID.'
+    hold=$(retention_hold_id_from_output "$hold_output" "$store_key" "$id_scope") ||
+      fail 'Hold create did not return one canonical scoped ID.'
     generation_hold=$hold
     [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$hold' AND released_at IS NULL;") == 1 ]] || fail 'Created hold is not listed.'
     sudo bash oscar.sh archive hold release --id "$hold" --released-by oscar-regression >/dev/null
@@ -1060,8 +1084,8 @@ case $action in
     generation_hold=''
     observation_hold_output=$(sudo bash oscar.sh archive hold create --store-key "$store_key" --id-scope "$id_scope" \
       --observation "$cold_id" --reason "regression-observation-$run" --created-by oscar-regression)
-    observation_hold=$(printf '%s' "$observation_hold_output" | sed -n 's/^Retention hold created: //p' | tail -n1)
-    valid_uuid "$observation_hold" || fail 'Observation hold create did not return an ID.'
+    observation_hold=$(retention_hold_id_from_output "$observation_hold_output" "$store_key" "$id_scope") ||
+      fail 'Observation hold create did not return one canonical scoped ID.'
     [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$observation_hold' AND subject_type='OBSERVATION' AND subject_id='$cold_id' AND released_at IS NULL;") == 1 ]] ||
       fail 'Created observation hold is not listed.'
     sudo bash oscar.sh archive hold release --id "$observation_hold" --released-by oscar-regression >/dev/null

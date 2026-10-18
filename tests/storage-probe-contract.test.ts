@@ -43,6 +43,18 @@ json_value=$(json_query 'UPDATE fixture SET value=1 RETURNING json')
 printf '%s\\t%s' "$scalar_value" "$json_value"`], {encoding: "utf8"});
 }
 
+function runHoldOutputParser(output: string, storeKey = "obs", idScope = "4"): string {
+  const validUuid = probe.match(/^valid_uuid\(\) \{[^\n]+\}$/mu)?.[0];
+  const parser = probe.match(/^retention_hold_id_from_output\(\) \{\n[\s\S]*?^\}/mu)?.[0];
+  assert.ok(validUuid && parser, "missing retention-hold output parser");
+  return execFileSync("bash", ["-c", `set -Eeuo pipefail
+${validUuid}
+${parser}
+retention_hold_id_from_output "$1" "$2" "$3"`, "hold-parser", output, storeKey, idScope], {
+    encoding: "utf8",
+  });
+}
+
 test("query helpers suppress DML command tags before parsing scalar and JSON rows", () => {
   const scalarHelper = probe.match(/^scalar\(\) \{[^\n]+\}$/mu)?.[0];
   const jsonHelper = probe.match(/^json_query\(\) \{[^\n]+\}$/mu)?.[0];
@@ -54,6 +66,16 @@ test("query helpers suppress DML command tags before parsing scalar and JSON row
 
   const legacyHelpers = helpers.replaceAll(" --quiet", "");
   assert.equal(runProbeQueryHelpers(legacyHelpers), "1UPDATE1\tUPDATE 1");
+});
+
+test("retention-hold parser accepts the canonical scoped CLI line and rejects ambiguity", () => {
+  const id = "ee6dda6f-af28-4f9c-951f-97b80c231cd5";
+  const canonical = `Retention hold created: ${id} (store=obs, id-scope=4)`;
+  assert.equal(runHoldOutputParser(`administrative preface\n${canonical}\n`), id);
+  assert.throws(() => runHoldOutputParser(canonical, "other_store", "4"));
+  assert.throws(() => runHoldOutputParser(canonical, "obs", "5"));
+  assert.throws(() => runHoldOutputParser(`Retention hold created: ${id}`));
+  assert.throws(() => runHoldOutputParser(`${canonical}\n${canonical}`));
 });
 
 test("storage probe remains valid Bash and gates exact 3.9.2 image identity", () => {
@@ -348,6 +370,11 @@ test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
   assert.match(controlBlock, /--observation "\$cold_id"/);
   assert.ok(controlBlock.includes("generationHoldCreated"));
   assert.ok(controlBlock.includes("observationHoldCreated"));
+  assert.match(controlBlock, /retention_hold_id_from_output "\$hold_output" "\$store_key" "\$id_scope"/);
+  assert.match(controlBlock, /retention_hold_id_from_output "\$observation_hold_output" "\$store_key" "\$id_scope"/);
+  assert.match(controlBlock, /created_by='oscar-regression'/);
+  assert.match(controlBlock, /reason='regression-\$run'/);
+  assert.match(controlBlock, /reason='regression-observation-\$run'/);
 });
 
 test("disposable lifecycle proves exact-row activation and deployed helper behavior", () => {
