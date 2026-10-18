@@ -10,7 +10,7 @@ import {
   laneUidForSystemName,
 } from "../src/alarm-media-oracles.js";
 
-const eventId = "0abcdef";
+const eventId = "00000000-0000-4000-8000-000000000001";
 const cameras = ["urn:osh:sensor:camera:50:a", "urn:osh:sensor:camera:50:b"];
 
 function observation(videoPaths: unknown = [
@@ -96,8 +96,13 @@ test("alarm video oracle rejects missing, duplicate, foreign, blank, and stale c
 });
 
 test("alarm video oracle requires the exact selected event and collision-free camera tokens", () => {
-  assert.throws(() => assessAlarmVideoObservation({...observation(), id: "other"}, eventId, cameras),
+  assert.throws(() => assessAlarmVideoObservation({
+    ...observation(),
+    id: "00000000-0000-4000-8000-000000000099",
+  }, eventId, cameras),
     /does not match/);
+  assert.throws(() => assessAlarmVideoObservation({...observation(), id: "other"}, eventId, cameras),
+    /canonical lowercase/);
   assert.throws(() => assessAlarmVideoObservation(observation(), eventId, ["camera:a", "camera-a"]),
     /same clip token/);
   assert.throws(() => assessAlarmVideoObservation(observation(), eventId, ["camera/unsafe"]),
@@ -111,8 +116,8 @@ test("alarm video run oracle rejects duplicate event UUIDs and cross-event clip 
       "videos/clips/urn-osh-sensor-camera-50-a/2026-10-18_07-32-52_004-g8.mp4",
       "videos/clips/urn-osh-sensor-camera-50-b/2026-10-18_07-32-52_004-g8.mp4",
     ]),
-    id: "1abcdef",
-  }, "1abcdef", cameras);
+    id: "00000000-0000-4000-8000-000000000002",
+  }, "00000000-0000-4000-8000-000000000002", cameras);
   assert.doesNotThrow(() => assertAlarmVideoAssociationUnique(second, [first]));
   assert.throws(() => assertAlarmVideoAssociationUnique(first, [first]), /generated more than once/);
   assert.throws(() => assertAlarmVideoAssociationUnique({...second, paths: first.paths}, [first]),

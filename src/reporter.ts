@@ -1,6 +1,7 @@
 import {mkdirSync, writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {toCsv} from "./csv.js";
+import {OSCAR_COMPOSE_SERVICES} from "./types.js";
 import type {
   AggregateRow,
   ErrorRecord,
@@ -19,7 +20,8 @@ const ERROR_COLUMNS: readonly (keyof ErrorRecord)[] = [
   "runId", "timestamp", "scenario", "source", "severity", "message", "evidence",
 ];
 const METRIC_COLUMNS: readonly (keyof MetricSample)[] = [
-  "runId", "timestamp", "phase", "source", "target", "cpuPercent", "memoryUsedBytes",
+  "runId", "timestamp", "phase", "source", "target", "composeService", "containerId",
+  "containerState", "containerHealth", "containerStatsAvailable", "cpuPercent", "memoryUsedBytes",
   "memoryLimitBytes", "memoryPercent", "pids", "restartCount", "oomKilled", "load1m",
   "hostMemoryAvailableBytes", "note",
 ];
@@ -35,12 +37,36 @@ const STORAGE_METRIC_COLUMNS: readonly (keyof StorageMetricSample)[] = [
   "observationInsertRows", "observationRowsPerCall", "activeArchiveGenerations",
   "sealedArchiveGenerations", "archiveRows", "archiveBytes", "failedArchiveJobs",
   "failedParityReceipts", "activeHolds", "verifiedBackups", "journalBytes",
-  "dailyFileBytes", "retainedMediaBytes", "backupBytes", "note",
+  "dailyFileBytes", "retainedMediaBytes", "retainedMediaManifestFiles",
+  "retainedMediaJpegFiles", "processedObservationIndexFiles",
+  "processedObservationIndexBytes", "deletionIndexFiles", "deletionIndexBytes",
+  "legacyProcessedMarkerFiles", "legacyDeletionTombstones",
+  "mediaMetadataCheckpointBytes", "backupBytes", "note",
 ];
 
-function mean(values: number[]): number | null {
+/** Unweighted arithmetic mean of the available point-in-time samples. */
+function arithmeticSampleMean(values: number[]): number | null {
   if (!values.length) return null;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function performanceGroup(sample: MetricSample): string {
+  if (sample.source !== "oscar-container") return `${sample.source}:${sample.target}`;
+  return [
+    sample.source,
+    sample.composeService ?? "unresolved-service",
+    sample.containerId ?? "missing-container",
+    sample.target,
+  ].join(":");
+}
+
+function containerSampleLabel(sample: MetricSample): string {
+  const identity = sample.containerId ? sample.containerId.slice(0, 12) : "missing";
+  return `${sample.phase}/${sample.composeService ?? "unresolved"}/${identity}`;
+}
+
+function unavailableNumber(value: number | null): boolean {
+  return value === null || !Number.isFinite(value);
 }
 
 function maximum(values: number[]): number | null {
@@ -66,6 +92,8 @@ export class RunReporter {
   readonly downloadDir: string;
   private readonly secrets: string[];
   private readonly metadata: RunMetadata;
+  private readonly requiredRemoteMetricPhases = new Set<string>();
+  private remoteMetricTarget: string | undefined;
 
   constructor(
     readonly runId: string,
@@ -84,6 +112,16 @@ export class RunReporter {
 
   addMetadata(values: Partial<RunMetadata>): void {
     Object.assign(this.metadata, values);
+  }
+
+  requireRemoteMetricPhase(phase: string): void {
+    const normalized = oneLine(phase);
+    if (normalized) this.requiredRemoteMetricPhases.add(normalized);
+  }
+
+  setRemoteMetricTarget(target: string): void {
+    const normalized = oneLine(target);
+    if (normalized) this.remoteMetricTarget = normalized;
   }
 
   redact(value: unknown): string {
@@ -175,11 +213,13 @@ export class RunReporter {
       });
     }
 
-    const targets = new Set(this.metrics.map((item) => `${item.source}:${item.target}`));
+    const targets = new Set(this.metrics.map((item) => performanceGroup(item)));
     for (const target of targets) {
-      const subset = this.metrics.filter((item) => `${item.source}:${item.target}` === target);
-      const cpu = subset.flatMap((item) => item.cpuPercent === null ? [] : [item.cpuPercent]);
-      const memory = subset.flatMap((item) => item.memoryUsedBytes === null ? [] : [item.memoryUsedBytes]);
+      const subset = this.metrics.filter((item) => performanceGroup(item) === target);
+      const cpu = subset.flatMap((item) =>
+        item.cpuPercent !== null && Number.isFinite(item.cpuPercent) ? [item.cpuPercent] : []);
+      const memory = subset.flatMap((item) =>
+        item.memoryUsedBytes !== null && Number.isFinite(item.memoryUsedBytes) ? [item.memoryUsedBytes] : []);
       rows.push({
         runId: this.runId,
         section: "performance",
@@ -191,8 +231,8 @@ export class RunReporter {
         accuracyPercent: null,
         peakCpuPercent: rounded(maximum(cpu)),
         peakMemoryBytes: rounded(maximum(memory), 0),
-        averageCpuPercent: rounded(mean(cpu)),
-        averageMemoryBytes: rounded(mean(memory), 0),
+        averageCpuPercent: rounded(arithmeticSampleMean(cpu)),
+        averageMemoryBytes: rounded(arithmeticSampleMean(memory), 0),
       });
     }
     return rows;
@@ -200,35 +240,130 @@ export class RunReporter {
 
   private addPerformanceHealthChecks(): void {
     if (!this.metadata.remoteMetricsExpected) return;
-    const containers = this.metrics.filter((item) => item.source === "oscar-container");
-    this.outcome(
-      "performance", "performance", "capture OSCAR container metrics", this.metadata.oscarBaseUrl,
-      "at least one OSCAR container sample is captured", `${containers.length} container samples`,
-      containers.length ? "correct" : "incorrect", 0,
-    );
-    if (!containers.length) return;
-    const oomTargets = [...new Set(containers.filter((item) => item.oomKilled).map((item) => item.target))];
-    this.outcome(
-      "performance", "performance", "detect container OOM kills", this.metadata.oscarBaseUrl,
-      "no sampled container is OOM-killed", oomTargets.length ? `OOM-killed: ${oomTargets.join(", ")}` : "none",
-      oomTargets.length ? "incorrect" : "correct", 0,
-    );
-    const increased: string[] = [];
-    for (const target of new Set(containers.map((item) => item.target))) {
-      const counts = containers
-        .filter((item) => item.target === target && item.restartCount !== null)
-        .map((item) => item.restartCount as number);
-      if (counts.length > 1 && (counts.at(-1) ?? 0) > (counts[0] ?? 0)) increased.push(target);
+    const containers = this.metrics.filter((item) =>
+      item.source === "oscar-container" && item.composeService !== null &&
+      OSCAR_COMPOSE_SERVICES.includes(item.composeService));
+    const requiredPhases = [...this.requiredRemoteMetricPhases];
+    const remoteTarget = this.remoteMetricTarget
+      ?? this.metrics.find((item) => item.source === "oscar-host")?.target
+      ?? "configured OSCAR_SSH_TARGET";
+    const missingCoverage: string[] = [];
+    if (!requiredPhases.length) missingCoverage.push("no required phases were registered");
+    for (const phase of requiredPhases) {
+      for (const service of OSCAR_COMPOSE_SERVICES) {
+        const serviceSamples = containers.filter((item) =>
+          item.phase === phase && item.composeService === service);
+        if (!serviceSamples.some((item) => item.containerId !== null) ||
+            serviceSamples.some((item) => item.containerId === null)) {
+          missingCoverage.push(`${phase}/${service}`);
+        }
+      }
     }
     this.outcome(
-      "performance", "performance", "detect container restarts", this.metadata.oscarBaseUrl,
-      "no sampled container restart count increases during the run",
-      increased.length ? `restart count increased: ${increased.join(", ")}` : "no restart count increased",
-      increased.length ? "incorrect" : "correct", 0,
+      "performance", "performance", "capture exact OSCAR Compose service metrics", remoteTarget,
+      "gateway, oscar, and postgres identities are sampled in every required phase",
+      missingCoverage.length
+        ? `missing phase/service coverage: ${missingCoverage.join(", ")}`
+        : `${requiredPhases.length * OSCAR_COMPOSE_SERVICES.length} required phase/service pairs covered`,
+      missingCoverage.length ? "incorrect" : "correct", 0,
+    );
+
+    const incomplete = containers.filter((item) => {
+      const identityMissing = item.containerId === null || item.containerState === null ||
+        item.containerHealth === null || item.restartCount === null || item.oomKilled === null;
+      const runningStatsMissing = item.containerState === "running" && (
+        item.containerStatsAvailable !== true || unavailableNumber(item.cpuPercent) ||
+        unavailableNumber(item.memoryUsedBytes) || unavailableNumber(item.memoryLimitBytes) ||
+        unavailableNumber(item.memoryPercent) || unavailableNumber(item.pids)
+      );
+      return identityMissing || runningStatsMissing;
+    });
+    this.outcome(
+      "performance", "performance", "validate OSCAR container metric samples", remoteTarget,
+      "every observed service has complete identity, state, health, restart, OOM, and running resource data",
+      incomplete.length
+        ? `incomplete samples: ${[...new Set(incomplete.map(containerSampleLabel))].join(", ")}`
+        : "all required container samples are complete",
+      incomplete.length ? "incorrect" : "correct", 0,
+    );
+
+    const stopped = containers.filter((item) =>
+      item.containerId !== null && item.containerState !== null && item.containerState !== "running");
+    this.outcome(
+      "performance", "performance", "detect stopped OSCAR containers", remoteTarget,
+      "gateway, oscar, and postgres remain running in every sample",
+      stopped.length
+        ? `non-running: ${[...new Set(stopped.map((item) =>
+          `${containerSampleLabel(item)}=${item.containerState}`))].join(", ")}`
+        : "all observed service containers remained running",
+      stopped.length ? "incorrect" : "correct", 0,
+    );
+
+    const unhealthy = containers.filter((item) =>
+      item.containerId !== null && item.containerHealth !== null && item.containerHealth !== "healthy");
+    this.outcome(
+      "performance", "performance", "detect unhealthy OSCAR containers", remoteTarget,
+      "gateway, oscar, and postgres remain healthy in every sample",
+      unhealthy.length
+        ? `not healthy: ${[...new Set(unhealthy.map((item) =>
+          `${containerSampleLabel(item)}=${item.containerHealth}`))].join(", ")}`
+        : "all observed service containers remained healthy",
+      unhealthy.length ? "incorrect" : "correct", 0,
+    );
+
+    const oomTargets = [...new Set(containers
+      .filter((item) => item.oomKilled)
+      .map((item) => containerSampleLabel(item)))];
+    this.outcome(
+      "performance", "performance", "detect container OOM kills", remoteTarget,
+      "no sampled OSCAR service container is OOM-killed",
+      oomTargets.length ? `OOM-killed: ${oomTargets.join(", ")}` : "none",
+      oomTargets.length ? "incorrect" : "correct", 0,
+    );
+
+    const changedRestarts: string[] = [];
+    const restartIdentities = new Set(containers.flatMap((item) =>
+      item.containerId && item.composeService ? [`${item.composeService}/${item.containerId}`] : []));
+    for (const identity of restartIdentities) {
+      const counts = new Set(containers
+        .filter((item) => `${item.composeService}/${item.containerId}` === identity && item.restartCount !== null)
+        .map((item) => item.restartCount as number));
+      if (counts.size > 1) changedRestarts.push(`${identity.split("/")[0]}/${identity.split("/")[1]?.slice(0, 12)}`);
+    }
+    this.outcome(
+      "performance", "performance", "detect container restarts", remoteTarget,
+      "each OSCAR container identity keeps a constant restart count during the run",
+      changedRestarts.length
+        ? `restart count changed: ${changedRestarts.join(", ")}`
+        : "no restart count changed",
+      changedRestarts.length ? "incorrect" : "correct", 0,
+    );
+
+    const identityIssues: string[] = [];
+    for (const service of OSCAR_COMPOSE_SERVICES) {
+      const serviceSamples = containers.filter((item) => item.composeService === service);
+      const identities = [...new Set(serviceSamples.flatMap((item) =>
+        item.containerId ? [item.containerId] : []))];
+      if (identities.length > 1) {
+        identityIssues.push(`${service} used multiple container IDs (${identities.map((id) => id.slice(0, 12)).join(", ")})`);
+      }
+      const absentPhases = requiredPhases.filter((phase) => {
+        const phaseSamples = serviceSamples.filter((item) => item.phase === phase);
+        return !phaseSamples.some((item) => item.containerId !== null) ||
+          phaseSamples.some((item) => item.containerId === null);
+      });
+      if (absentPhases.length) identityIssues.push(`${service} absent in ${absentPhases.join(",")}`);
+    }
+    this.outcome(
+      "performance", "performance", "detect service disappearance or recreation", remoteTarget,
+      "each OSCAR Compose service keeps one container identity and is present in every required phase",
+      identityIssues.length ? identityIssues.join("; ") : "service identities remained present and stable",
+      identityIssues.length ? "incorrect" : "correct", 0,
     );
   }
 
   finalize(startedAt: Date, finishedAt = new Date()): {exitCode: number; outputDir: string} {
+    const nonPerformanceCheckCount = this.functional.filter((item) => item.scenario !== "performance").length;
     this.addPerformanceHealthChecks();
     const aggregate = this.aggregate();
     writeFileSync(join(this.outputDir, "functional-results.csv"), toCsv(this.functional, FUNCTIONAL_COLUMNS));
@@ -251,7 +386,7 @@ export class RunReporter {
     const topMemory = [...performance]
       .filter((row) => row.peakMemoryBytes !== null)
       .sort((a, b) => (b.peakMemoryBytes ?? 0) - (a.peakMemoryBytes ?? 0))[0];
-    const status = failures.length === 0 && fatalErrors.length === 0 && this.functional.length > 0 ? "PASS" : "FAIL";
+    const status = failures.length === 0 && fatalErrors.length === 0 && nonPerformanceCheckCount > 0 ? "PASS" : "FAIL";
     const durationSeconds = (finishedAt.getTime() - startedAt.getTime()) / 1_000;
     const failureLines = failures.slice(0, 10).map((item) =>
       `- ${item.scenario} / ${item.action}: expected ${item.expected}; observed ${item.observed || item.error || "no result"}`,
@@ -272,7 +407,9 @@ export class RunReporter {
       "",
       ...(failureLines.length ? failureLines : fatalErrors.length
         ? [`No functional assertion failed, but ${fatalErrors.length} runtime error(s) made this run fail.`]
-        : this.functional.length === 0 ? ["No functional checks were evaluated; an empty run is invalid."] : ["None."]),
+        : nonPerformanceCheckCount === 0
+          ? ["No non-performance functional checks were evaluated; an empty run is invalid."]
+          : ["None."]),
       "",
       "## Report files",
       "",

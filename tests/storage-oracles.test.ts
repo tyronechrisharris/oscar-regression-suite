@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
 import test from "node:test";
 import {
+  archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratch,
   assessDailyFilePublication,
   assessJpeg,
+  assessMediaMetadataHealth,
   assessRetainedMediaResponse,
   assessStoragePlatform,
   encodeOshBigId,
+  mediaMetadataHealthIsSafe,
+  OSCAR_STORAGE_SCHEMA_CHECKSUM,
   parseBaselineJpeg,
   storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
@@ -16,7 +21,7 @@ import {
 const digest = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
 
 function retainedResponse() {
-  const eventId = "event-1";
+  const eventId = "00000000-0000-4000-8000-000000000001";
   const laneUid = "lane-01";
   const cameraUid = "camera-01";
   const cameraToken = Buffer.from(cameraUid).toString("base64url");
@@ -88,7 +93,7 @@ test("retained-media oracle requires unique deterministic lowercase SHA-256 medi
 
 test("retained-media oracle rejects event path traversal and duplicate positions", () => {
   const fixture = retainedResponse();
-  fixture.response.mediaSets[0]!.assets[0]!.path = "media/event-1/../frame-01.jpg";
+  fixture.response.mediaSets[0]!.assets[0]!.path = `media/${fixture.eventId}/../frame-01.jpg`;
   assert.throws(() => assessRetainedMediaResponse(fixture.response, fixture.eventId), /whitelist/);
   const duplicate = retainedResponse();
   duplicate.response.mediaSets[0]!.manifest.assets[1]!.position = "FIRST";
@@ -104,12 +109,14 @@ test("retained-media oracle rejects event path traversal and duplicate positions
     /duplicate frame position/);
 
   const wrongCameraPath = retainedResponse();
-  wrongCameraPath.response.mediaSets[0]!.assets[0]!.path = "media/event-1/another-camera/frame-01.jpg";
+  wrongCameraPath.response.mediaSets[0]!.assets[0]!.path =
+    `media/${wrongCameraPath.eventId}/another-camera/frame-01.jpg`;
   assert.throws(() => assessRetainedMediaResponse(wrongCameraPath.response, wrongCameraPath.eventId),
     /event whitelist/);
 
   const wrongManifestPath = retainedResponse();
-  wrongManifestPath.response.mediaSets[0]!.manifestPath = "media/event-1/another-camera/manifest.json";
+  wrongManifestPath.response.mediaSets[0]!.manifestPath =
+    `media/${wrongManifestPath.eventId}/another-camera/manifest.json`;
   assert.throws(() => assessRetainedMediaResponse(wrongManifestPath.response, wrongManifestPath.eventId),
     /manifest path does not match/);
 
@@ -248,23 +255,67 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     postgisImage: {...image, reference: "oscar-postgis:3.9.2", storageProfileLabel: "3.9.2"},
     gatewayImage: {...image, reference: "nginxinc/nginx-unprivileged:1.28.1-alpine", versionLabel: ""},
     dataChecksums: "on", pgStatStatementsInstalled: true,
-    pgStatStatementsPreloaded: true, schemaVersion: 4,
+    pgStatStatementsPreloaded: true, schemaVersion: 5,
+    schemaChecksum: OSCAR_STORAGE_SCHEMA_CHECKSUM,
     archiveMarker: {present: true, exact: true, format: "oscar-storage-profile", version: "3.9.2",
       dataChecksums: "on", initializedAt: "2026-10-17T12:00:00Z"},
-    batchRewriteConfigured: true, dailyJournalConfigured: true, archiveIntervalMinutes: 1,
+    batchRewriteConfigured: true, batchRewriteObservedCalls: 2,
+    batchRewriteObservedRows: 100, dailyJournalConfigured: true, archiveIntervalMinutes: 1,
     deleteHotAfterArchive: true, rollbackGraceDays: 1,
+    archiveResources: {memoryLimitMegabytes: 256, threads: 2,
+      maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
+      sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"},
+    archiveScratch: {present: true, realDirectory: true, ownerUid: 10001, ownerGid: 10001,
+      mode: "700", archiveDisjoint: true, entryCount: 0},
+    dailyJournal: {rootDirectory: "files", journalDirectory: ".dailyfile-journal",
+      publicationDirectory: "dailyfiles", zoneId: "UTC", observationMode: "LATEST",
+      fsyncIntervalMillis: 1000, maxUnforcedRecords: 128, maxUnforcedBytes: 1048576,
+      maxSegmentBytes: 67108864, maxSegmentAgeSeconds: 900, maxRecordBytes: 4194304,
+      sealedJournalRetentionDays: 30, observationLifecycleDelegated: true, purgeWorkLimit: 50},
     videoRetention: {enabled: true, timeToRetentionDays: 0, queryPeriodMinutes: 1,
-      frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24}});
-  assert.equal(platform.schemaVersion, 4);
+      frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
+      metadataReclamationWorkLimit: 200}});
+  assert.equal(platform.schemaVersion, 5);
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
   assert.equal(platform.storageRoots.walArchive.rootKind, "wal-archive");
   assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
   assert.deepEqual(platform.videoRetention, {enabled: true, timeToRetentionDays: 0,
-    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24});
+    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
+    metadataReclamationWorkLimit: 200});
+  assert.deepEqual(platform.archiveResources, {memoryLimitMegabytes: 256, threads: 2,
+    maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
+    sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"});
+  assert.equal(archiveScratchIsSafe(platform.archiveScratch, true), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(platform, "3.9.2"), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, configuredRelease: "4.0.0"},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, schemaVersion: 6},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, schemaChecksum: `sha256:${"0".repeat(64)}`},
+    "3.9.2",
+  ), false);
+  const activeScratch = {...platform.archiveScratch, entryCount: 1};
+  assert.equal(archiveScratchIsSafe(activeScratch, false), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, archiveScratch: activeScratch},
+    "3.9.2",
+  ), true, "release identity permits a transient active operation; scenario hygiene must poll empty");
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, archiveResources: {...platform.archiveResources, maximumConcurrentSessions: 3}},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, archiveResources: {...platform.archiveResources, sessionAcquireTimeoutSeconds: 31}},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, dailyJournal: {...platform.dailyJournal, observationMode: "FULL"}},
     "3.9.2",
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
@@ -337,6 +388,25 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     observationInsertRows: 20, observationRowsPerCall: 10});
   assert.equal(metric.databaseSizeBytes, 100);
   assert.equal(metric.observationRowsPerCall, 10);
+});
+
+test("archive scratch and retained-media metadata contracts fail closed", () => {
+  assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
+    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), false), true);
+  assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
+    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), true), false);
+  const metadataHealth = assessMediaMetadataHealth({rootPresent: true, checkpointPresent: true,
+    checkpointValid: true, checkpointSchemaVersion: 2, processedIndexFiles: 1,
+    processedIndexBytes: 52, deletionIndexFiles: 0, deletionIndexBytes: 0,
+    retainedManifestFiles: 1, retainedJpegFiles: 5, legacyProcessedMarkerFiles: 0,
+    legacyDeletionTombstones: 0, partialArtifacts: 0, unsafeEntries: 0,
+    indexFormatFailures: 0});
+  assert.equal(mediaMetadataHealthIsSafe(metadataHealth, true), true);
+  assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, indexFormatFailures: 1}, false), false);
+  assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointSchemaVersion: 1}, true), false);
+  assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointPresent: false,
+    checkpointValid: false, checkpointSchemaVersion: null}, false), false);
+  assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, retainedJpegFiles: 4}, true), false);
 });
 
 test("archive health counts partial archive and WAL artifacts independently", () => {

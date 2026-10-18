@@ -1,4 +1,5 @@
-const EVENT_ID_MAX_LENGTH = 128;
+import {canonicalProductUuid} from "./product-uuid.js";
+
 const SAFE_CAMERA_UID = /^[A-Za-z0-9._:-]+$/;
 const CAMERA_TOKEN = /^[A-Za-z0-9._-]+$/;
 const CLIP_NAME = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])_([01]\d|2[0-3])-([0-5]\d)-([0-5]\d)_(\d{3})-g([1-9]\d*)\.mp4$/;
@@ -139,13 +140,15 @@ export function assessAlarmVideoObservation(
   expectedEventId: string,
   configuredCameraUids: readonly string[],
 ): AlarmVideoAssociation {
-  const eventId = requiredText(expectedEventId, "expected event ID");
-  if (eventId.length > EVENT_ID_MAX_LENGTH) throw new Error("expected event ID is too long");
+  const eventId = canonicalProductUuid(expectedEventId, "expected event UUID");
   const observation = record(value, "occupancy observation");
   const properties = observation.properties && typeof observation.properties === "object"
     ? record(observation.properties, "occupancy observation properties")
     : observation;
-  const actualEventId = requiredText(observation.id ?? properties.id, "occupancy observation ID");
+  const actualEventId = canonicalProductUuid(
+    observation.id ?? properties.id,
+    "occupancy observation UUID",
+  );
   if (actualEventId !== eventId) throw new Error("occupancy observation ID does not match the selected alarm UUID");
 
   const resultValue = properties.result ?? observation.result;
@@ -208,10 +211,13 @@ export function assertAlarmVideoAssociationUnique(
   candidate: AlarmVideoAssociation,
   existing: readonly AlarmVideoAssociation[],
 ): void {
-  const eventId = requiredText(candidate.eventId, "candidate alarm event ID");
+  const eventId = canonicalProductUuid(candidate.eventId, "candidate alarm event UUID");
   const ownerByPath = new Map<string, string>();
   for (const association of existing) {
-    const existingEventId = requiredText(association.eventId, "existing alarm event ID");
+    const existingEventId = canonicalProductUuid(
+      association.eventId,
+      "existing alarm event UUID",
+    );
     if (existingEventId === eventId) {
       throw new Error(`alarm event UUID ${eventId} was generated more than once`);
     }

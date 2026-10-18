@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_ALL=C
+umask 077
 
 # Privileged target-side helper for the OSCAR 3.9.2 storage regression. It is copied to
 # /tmp for one run and is never installed into the deployment. Ordinary
@@ -14,7 +16,10 @@ set -Eeuo pipefail
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ ${1:-} == --release-dir ]] || fail 'Expected --release-dir.'
 release_dir=${2:-}; shift 2
-[[ $release_dir == /* && $release_dir != *'/../'* && -f $release_dir/oscar.sh ]] ||
+canonical_release=$(realpath -e -- "$release_dir" 2>/dev/null || true)
+[[ $release_dir == /* && $release_dir != / && $release_dir != *'/../'* &&
+   -d $release_dir && ! -L $release_dir && $canonical_release == "$release_dir" &&
+   -f $release_dir/oscar.sh && ! -L $release_dir/oscar.sh ]] ||
   fail 'Release directory is not a configured OSCAR release.'
 action=${1:-}; (($#)) && shift
 [[ ${EUID:-$(id -u)} -eq 0 ]] || fail 'Storage probe requires passwordless sudo.'
@@ -38,22 +43,25 @@ psql_admin() {
 scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" | tr -d '[:space:]'; }
 json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
-valid_uuid() { [[ $1 =~ ^[0-9a-fA-F-]{36}$ ]]; }
+valid_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
 retention_hold_id_from_output() {
-  local output=$1 expected_store=$2 expected_scope=$3 line hold_id='' store_key='' id_scope='' matches=0
+  local output=$1 expected_store=$2 expected_scope=$3 expected_resolution=$4
+  local line hold_id='' store_key='' id_scope='' resolution='' matches=0
   while IFS= read -r line; do
-    if [[ $line =~ ^Retention\ hold\ created:\ ([0-9a-fA-F-]{36})\ \(store=([a-z_][a-z0-9_]{0,62}),\ id-scope=(-?[0-9]+)\)$ ]]; then
+    if [[ $line =~ ^Retention\ hold\ created:\ ([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\ \(store=([a-z_][a-z0-9_]{0,62}),\ id-scope=(-?[0-9]+),\ resolution=(GENERATION_EXACT|HOT_EXACT|COLD_RANGE_CONSERVATIVE)\)$ ]]; then
       hold_id=${BASH_REMATCH[1]}
       store_key=${BASH_REMATCH[2]}
       id_scope=${BASH_REMATCH[3]}
+      resolution=${BASH_REMATCH[4]}
       matches=$((matches+1))
     fi
   done <<<"$output"
-  [[ $matches -eq 1 && $store_key == "$expected_store" && $id_scope == "$expected_scope" ]] || return 1
+  [[ $matches -eq 1 && $store_key == "$expected_store" && $id_scope == "$expected_scope" &&
+     $resolution == "$expected_resolution" ]] || return 1
   valid_uuid "$hold_id" || return 1
   printf '%s' "$hold_id"
 }
-valid_deployment_id() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
+valid_deployment_id() { valid_uuid "$1"; }
 valid_store_key() { [[ $1 =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; }
 valid_id_scope() { [[ $1 =~ ^-?[0-9]+$ && $1 -ge -2147483648 && $1 -le 2147483647 ]]; }
 valid_media_token() { [[ $1 =~ ^[A-Za-z0-9_-]+$ ]]; }
@@ -91,9 +99,118 @@ env_value() {
   value=$(awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' .env)
   printf '%s' "${value:-$fallback}"
 }
-config_text_matches() {
-  local text=$1 pattern=$2
-  grep -Eq -- "$pattern" <<<"$text"
+platform_config_fields() {
+  local config_path=$1
+  {
+    cat <<'SQL'
+\set ON_ERROR_STOP on
+CREATE TEMP TABLE oscar_config_input (sequence bigserial, line text NOT NULL);
+\copy oscar_config_input(line) FROM STDIN
+SQL
+    compose exec -T oscar base64 "$config_path"
+    printf '\\.\n'
+    cat <<'SQL'
+WITH payload AS (
+  SELECT convert_from(decode(string_agg(line, '' ORDER BY sequence), 'base64'), 'UTF8') AS text
+  FROM oscar_config_input
+), document AS (
+  SELECT text::json AS raw FROM payload WHERE left(ltrim(text), 1) = '['
+), items AS (
+  SELECT item AS raw, ordinal
+  FROM document, LATERAL json_array_elements(raw) WITH ORDINALITY AS entry(item, ordinal)
+), expected(kind, class_name) AS (
+  VALUES
+    ('daily', 'com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig'),
+    ('oscar', 'com.botts.impl.service.oscar.OSCARServiceConfig'),
+    ('database', 'org.sensorhub.impl.database.system.SystemDriverDatabaseConfig')
+), candidates AS (
+  SELECT expected.kind, items.ordinal, items.raw
+  FROM items CROSS JOIN expected
+  WHERE json_typeof(items.raw) = 'object'
+    AND EXISTS (
+      SELECT 1 FROM json_each(items.raw) pair
+      WHERE pair.key = 'objClass' AND json_typeof(pair.value) = 'string'
+        AND pair.value #>> '{}' = expected.class_name
+    )
+), selected AS (
+  SELECT daily.raw AS daily, oscar.raw AS oscar, database.raw AS database
+  FROM candidates daily CROSS JOIN candidates oscar CROSS JOIN candidates database
+  WHERE daily.kind = 'daily' AND oscar.kind = 'oscar' AND database.kind = 'database'
+    AND (SELECT count(*) FROM candidates WHERE kind = 'daily') = 1
+    AND (SELECT count(*) FROM candidates WHERE kind = 'oscar') = 1
+    AND (SELECT count(*) FROM candidates WHERE kind = 'database') = 1
+), nested AS (
+  SELECT daily, oscar, database,
+    oscar->'videoRetentionConfig' AS media,
+    database->'dbConfig' AS db_config,
+    (database->'dbConfig')->'archive' AS archive
+  FROM selected
+), valid AS (
+  SELECT * FROM nested
+  WHERE NOT EXISTS (SELECT key FROM json_each(daily) GROUP BY key HAVING count(*) <> 1)
+    AND NOT EXISTS (SELECT key FROM json_each(oscar) GROUP BY key HAVING count(*) <> 1)
+    AND NOT EXISTS (SELECT key FROM json_each(database) GROUP BY key HAVING count(*) <> 1)
+    AND json_typeof(media) = 'object'
+    AND json_typeof(db_config) = 'object'
+    AND json_typeof(archive) = 'object'
+    AND NOT EXISTS (SELECT key FROM json_each(media) GROUP BY key HAVING count(*) <> 1)
+    AND NOT EXISTS (SELECT key FROM json_each(db_config) GROUP BY key HAVING count(*) <> 1)
+    AND NOT EXISTS (SELECT key FROM json_each(archive) GROUP BY key HAVING count(*) <> 1)
+    AND daily->>'moduleClass' = 'com.botts.impl.service.dailyfile.DailyFileJournalService'
+    AND oscar->>'moduleClass' = 'com.botts.impl.service.oscar.OSCARServiceModule'
+    AND database->>'moduleClass' = 'org.sensorhub.impl.database.system.SystemDriverDatabase'
+    AND db_config->>'objClass' = 'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig'
+    AND db_config->>'moduleClass' = 'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabase'
+    AND archive->>'objClass' = 'org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig'
+    AND media->>'objClass' = 'com.botts.impl.service.oscar.video.VideoRetentionConfig'
+    AND json_typeof(db_config->'useBatch') = 'boolean' AND (db_config->>'useBatch')::boolean
+    AND json_typeof(media->'enableFrameRetention') = 'boolean'
+    AND json_typeof(archive->'deleteHotAfterArchive') = 'boolean'
+    AND json_typeof(oscar->'delegateObservationLifecycleToDatabase') = 'boolean'
+    AND json_typeof(daily->'rootDirectory') = 'string'
+    AND json_typeof(daily->'journalDirectory') = 'string'
+    AND json_typeof(daily->'publicationDirectory') = 'string'
+    AND json_typeof(daily->'zoneId') = 'string'
+    AND json_typeof(daily->'dailyFileObservationMode') = 'string'
+    AND json_typeof(archive->'duckDbTemporaryDirectory') = 'string'
+    AND json_typeof(archive->'intervalMinutes') = 'number' AND archive->>'intervalMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'rollbackGraceDays') = 'number' AND archive->>'rollbackGraceDays' ~ '^[0-9]+$'
+    AND json_typeof(archive->'duckDbMemoryLimitMegabytes') = 'number' AND archive->>'duckDbMemoryLimitMegabytes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'duckDbThreads') = 'number' AND archive->>'duckDbThreads' ~ '^[0-9]+$'
+    AND json_typeof(archive->'duckDbMaximumTemporaryMegabytes') = 'number' AND archive->>'duckDbMaximumTemporaryMegabytes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'duckDbMaximumConcurrentSessions') = 'number' AND archive->>'duckDbMaximumConcurrentSessions' ~ '^[0-9]+$'
+    AND json_typeof(archive->'duckDbSessionAcquireTimeoutSeconds') = 'number' AND archive->>'duckDbSessionAcquireTimeoutSeconds' ~ '^[0-9]+$'
+    AND json_typeof(media->'timeToRetention') = 'number' AND media->>'timeToRetention' ~ '^[0-9]+$'
+    AND json_typeof(media->'videoQueryPeriod') = 'number' AND media->>'videoQueryPeriod' ~ '^[0-9]+$'
+    AND json_typeof(media->'frameRetentionCount') = 'number' AND media->>'frameRetentionCount' ~ '^[0-9]+$'
+    AND json_typeof(media->'jpegQuality') = 'number' AND media->>'jpegQuality' ~ '^[0-9]+$'
+    AND json_typeof(media->'sourceRollbackGraceHours') = 'number' AND media->>'sourceRollbackGraceHours' ~ '^[0-9]+$'
+    AND json_typeof(media->'metadataReclamationWorkLimit') = 'number' AND media->>'metadataReclamationWorkLimit' ~ '^[0-9]+$'
+    AND json_typeof(daily->'fsyncIntervalMillis') = 'number' AND daily->>'fsyncIntervalMillis' ~ '^[0-9]+$'
+    AND json_typeof(daily->'maxUnforcedRecords') = 'number' AND daily->>'maxUnforcedRecords' ~ '^[0-9]+$'
+    AND json_typeof(daily->'maxUnforcedBytes') = 'number' AND daily->>'maxUnforcedBytes' ~ '^[0-9]+$'
+    AND json_typeof(daily->'maxSegmentBytes') = 'number' AND daily->>'maxSegmentBytes' ~ '^[0-9]+$'
+    AND json_typeof(daily->'maxSegmentAgeSeconds') = 'number' AND daily->>'maxSegmentAgeSeconds' ~ '^[0-9]+$'
+    AND json_typeof(daily->'maxRecordBytes') = 'number' AND daily->>'maxRecordBytes' ~ '^[0-9]+$'
+    AND json_typeof(daily->'sealedJournalRetentionDays') = 'number' AND daily->>'sealedJournalRetentionDays' ~ '^[0-9]+$'
+    AND json_typeof(oscar->'dailyFilePurgeWorkLimit') = 'number' AND oscar->>'dailyFilePurgeWorkLimit' ~ '^[0-9]+$'
+)
+SELECT concat_ws('|',
+  archive->>'intervalMinutes', archive->>'rollbackGraceDays',
+  archive->>'duckDbMemoryLimitMegabytes', archive->>'duckDbThreads',
+  archive->>'duckDbMaximumTemporaryMegabytes', archive->>'duckDbMaximumConcurrentSessions',
+  archive->>'duckDbSessionAcquireTimeoutSeconds', archive->>'duckDbTemporaryDirectory',
+  media->>'timeToRetention', media->>'videoQueryPeriod', media->>'frameRetentionCount',
+  media->>'jpegQuality', media->>'sourceRollbackGraceHours', media->>'metadataReclamationWorkLimit',
+  media->>'enableFrameRetention', archive->>'deleteHotAfterArchive',
+  daily->>'rootDirectory', daily->>'journalDirectory', daily->>'publicationDirectory',
+  daily->>'zoneId', daily->>'dailyFileObservationMode', daily->>'fsyncIntervalMillis',
+  daily->>'maxUnforcedRecords', daily->>'maxUnforcedBytes', daily->>'maxSegmentBytes',
+  daily->>'maxSegmentAgeSeconds', daily->>'maxRecordBytes', daily->>'sealedJournalRetentionDays',
+  oscar->>'delegateObservationLifecycleToDatabase', oscar->>'dailyFilePurgeWorkLimit')
+FROM valid;
+SQL
+  } | psql_admin --quiet --tuples-only --no-align | tail -n 1
 }
 entrypoint_has_managed_tmp_contract() {
   local entrypoint=$1
@@ -139,6 +256,160 @@ directory_bytes() {
   [[ -d $1 ]] || { printf 0; return; }
   du -sb -- "$1" 2>/dev/null | awk '{print $1+0}'
 }
+archive_scratch_json() {
+  local scratch_path=$1 archive_path=$2
+  compose exec -T oscar sh -eu -c '
+    scratch=$1; archive=$2
+    if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then
+      printf "{\"present\":false,\"realDirectory\":false,\"ownerUid\":null,\"ownerGid\":null,\"mode\":\"\",\"archiveDisjoint\":true,\"entryCount\":0}\n"
+      exit 0
+    fi
+    real_directory=false
+    if [ -d "$scratch" ] && [ ! -L "$scratch" ]; then real_directory=true; fi
+    owner=$(stat -c %u -- "$scratch" 2>/dev/null || printf -1)
+    group=$(stat -c %g -- "$scratch" 2>/dev/null || printf -1)
+    mode=$(stat -c %a -- "$scratch" 2>/dev/null || printf missing)
+    entries=0
+    if [ "$real_directory" = true ]; then
+      entries=$(find "$scratch" -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d "[:space:]")
+    fi
+    disjoint=false
+    if [ "$real_directory" = true ] && [ -d "$archive" ] && [ ! -L "$archive" ]; then
+      scratch_real=$(realpath -e -- "$scratch")
+      archive_real=$(realpath -e -- "$archive")
+      case "$scratch_real/" in "$archive_real/"*) ;; *)
+        case "$archive_real/" in "$scratch_real/"*) ;; *) disjoint=true ;; esac
+      esac
+    fi
+    printf "{\"present\":true,\"realDirectory\":%s,\"ownerUid\":%s,\"ownerGid\":%s,\"mode\":\"%s\",\"archiveDisjoint\":%s,\"entryCount\":%s}\n" \
+      "$real_directory" "$owner" "$group" "$mode" "$disjoint" "${entries:-0}"
+  ' scratch-health "$scratch_path" "$archive_path"
+}
+media_metadata_health_json() {
+  local checkpoint=/var/lib/oscar/files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json
+  local checkpoint_present=false checkpoint_valid=false checkpoint_schema=null checkpoint_encoded='' checkpoint_result=''
+  checkpoint_encoded=$(compose exec -T oscar sh -eu -c '
+    path=$1
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then exit 0; fi
+    [ -f "$path" ] && [ ! -L "$path" ] || exit 20
+    size=$(stat -c %s -- "$path")
+    [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || exit 21
+    openssl base64 -A -in "$path"
+  ' media-metadata-checkpoint "$checkpoint") || fail 'Media metadata checkpoint is linked, non-regular, empty, or over 1 MiB.'
+  if [[ -n $checkpoint_encoded ]]; then
+    checkpoint_present=true
+    [[ $checkpoint_encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#checkpoint_encoded} -le 1398104 ]] ||
+      fail 'Media metadata checkpoint is not bounded canonical base64.'
+    checkpoint_result=$(scalar "WITH source AS (
+        SELECT convert_from(decode('$checkpoint_encoded','base64'),'UTF8') AS text),
+      doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source)
+      SELECT coalesce(value->>'schemaVersion','')||'|'||(
+        jsonb_typeof(value)='object'
+        AND (SELECT count(*) FROM json_object_keys(raw))=3
+        AND value ?& ARRAY['schemaVersion','earliestProcessedObservationEpochHour','updatedAt']
+        AND value->'schemaVersion'='2'::jsonb
+        AND (jsonb_typeof(value->'earliestProcessedObservationEpochHour')='null' OR
+          (jsonb_typeof(value->'earliestProcessedObservationEpochHour')='number'
+           AND value->>'earliestProcessedObservationEpochHour' ~ '^(0|[1-9][0-9]*)$'
+           AND (value->>'earliestProcessedObservationEpochHour')::numeric <= 8765802740110))
+        AND jsonb_typeof(value->'updatedAt')='string'
+        AND value->>'updatedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+        AND (value->>'updatedAt')::timestamptz IS NOT NULL
+      )::text FROM doc;")
+    IFS='|' read -r checkpoint_schema checkpoint_valid_text <<<"$checkpoint_result"
+    [[ $checkpoint_schema =~ ^[0-9]+$ ]] || checkpoint_schema=null
+    [[ $checkpoint_valid_text == true ]] && checkpoint_valid=true
+  fi
+  compose exec -T oscar sh -eu -c '
+    checkpoint_present=$1; checkpoint_valid=$2; checkpoint_schema=$3
+    root=/var/lib/oscar/files/videos/retained-media/v1
+    if [ ! -e "$root" ] && [ ! -L "$root" ]; then
+      printf "{\"rootPresent\":false,\"checkpointPresent\":false,\"checkpointValid\":false,\"checkpointSchemaVersion\":null,\"processedIndexFiles\":0,\"processedIndexBytes\":0,\"deletionIndexFiles\":0,\"deletionIndexBytes\":0,\"retainedManifestFiles\":0,\"retainedJpegFiles\":0,\"legacyProcessedMarkerFiles\":0,\"legacyDeletionTombstones\":0,\"partialArtifacts\":0,\"unsafeEntries\":0,\"indexFormatFailures\":0}\n"
+      exit 0
+    fi
+    [ -d "$root" ] && [ ! -L "$root" ] || exit 20
+    total_entries=$(find "$root" -mindepth 1 -print | wc -l | tr -d "[:space:]")
+    [ "${total_entries:-0}" -le 100000 ] || exit 21
+    partials=$(find "$root" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
+    unsafe=$(find "$root" -type l -print | wc -l | tr -d "[:space:]")
+    processed_files=0; processed_bytes=0; deletion_files=0; deletion_bytes=0; format_failures=0
+    processed_root="$root/retention-processed-index"
+    if [ -e "$processed_root" ] || [ -L "$processed_root" ]; then
+      if [ ! -d "$processed_root" ] || [ -L "$processed_root" ]; then unsafe=$((unsafe+1)); else
+        while IFS= read -r index; do
+          [ "$index" ] || continue
+          name=${index##*/}; processed_files=$((processed_files+1))
+          size=$(stat -c %s -- "$index" 2>/dev/null || printf 0)
+          processed_bytes=$((processed_bytes+size))
+          header=$(od -An -tx1 -N16 -- "$index" 2>/dev/null | tr -d " [:space:]")
+          if ! printf "%s" "$name" | grep -Eq "^[0-9]{19}-(0[0-9]|1[01])[.]idx$" ||
+             [ "$size" -lt 16 ] || [ $(((size-16)%36)) -ne 0 ] ||
+             [ "$header" != 4f534341524d50490000000100000024 ]; then
+            format_failures=$((format_failures+1))
+          fi
+        done <<EOF
+$(find "$processed_root" -mindepth 1 -maxdepth 1 -type f -name "*.idx" -print | LC_ALL=C sort)
+EOF
+        unexpected=$(find "$processed_root" -mindepth 1 -maxdepth 1 ! -type f -print | wc -l | tr -d "[:space:]")
+        unexpected_files=$(find "$processed_root" -mindepth 1 -maxdepth 1 -type f ! -name "*.idx" ! -name ".index.lock" -print | wc -l | tr -d "[:space:]")
+        unsafe=$((unsafe+unexpected+unexpected_files))
+        lock="$processed_root/.index.lock"
+        if [ -e "$lock" ] || [ -L "$lock" ]; then
+          if [ ! -f "$lock" ] || [ -L "$lock" ] || [ "$(stat -c %s -- "$lock" 2>/dev/null || printf -1)" -ne 0 ]; then
+            unsafe=$((unsafe+1))
+          fi
+        fi
+      fi
+    fi
+    deletion_root="$root/deletion-index"
+    if [ -e "$deletion_root" ] || [ -L "$deletion_root" ]; then
+      if [ ! -d "$deletion_root" ] || [ -L "$deletion_root" ]; then unsafe=$((unsafe+1)); else
+        while IFS= read -r index; do
+          [ "$index" ] || continue
+          relative=${index#"$deletion_root"/}; shard=${relative%%/*}; name=${relative##*/}
+          deletion_files=$((deletion_files+1))
+          size=$(stat -c %s -- "$index" 2>/dev/null || printf 0)
+          deletion_bytes=$((deletion_bytes+size))
+          header=$(od -An -tx1 -N16 -- "$index" 2>/dev/null | tr -d " [:space:]")
+          index_prefix=$(printf "%s" "${name%.idx}" | cut -c1-2)
+          if ! printf "%s/%s" "$shard" "$name" | grep -Eq "^[0-9a-f]{2}/[0-9a-f]{4}[.]idx$" ||
+             [ "$index_prefix" != "$shard" ]; then
+            format_failures=$((format_failures+1))
+          fi
+          if [ "$size" -lt 16 ] || [ $(((size-16)%36)) -ne 0 ] ||
+             [ "$header" != 4f534341524d44490000000100000024 ]; then
+            format_failures=$((format_failures+1))
+          fi
+        done <<EOF
+$(find "$deletion_root" -mindepth 2 -maxdepth 2 -type f -name "*.idx" -print | LC_ALL=C sort)
+EOF
+        unexpected=$(find "$deletion_root" -mindepth 1 -maxdepth 1 ! -type d -print | wc -l | tr -d "[:space:]")
+        invalid_shards=$(find "$deletion_root" -mindepth 1 -maxdepth 1 -type d ! -name "[0-9a-f][0-9a-f]" -print | wc -l | tr -d "[:space:]")
+        unexpected_files=$(find "$deletion_root" -mindepth 2 -maxdepth 2 -type f ! -name "*.idx" ! -name ".index.lock" -print | wc -l | tr -d "[:space:]")
+        unexpected_members=$(find "$deletion_root" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
+        unexpected_deep=$(find "$deletion_root" -mindepth 3 -print | wc -l | tr -d "[:space:]")
+        invalid_locks=0
+        while IFS= read -r lock; do
+          [ "$lock" ] || continue
+          if [ ! -f "$lock" ] || [ -L "$lock" ] || [ "$(stat -c %s -- "$lock" 2>/dev/null || printf -1)" -ne 0 ]; then
+            invalid_locks=$((invalid_locks+1))
+          fi
+        done <<EOF
+$(find "$deletion_root" -mindepth 2 -maxdepth 2 -name ".index.lock" -print | LC_ALL=C sort)
+EOF
+        unsafe=$((unsafe+unexpected+invalid_shards+unexpected_files+unexpected_members+unexpected_deep+invalid_locks))
+      fi
+    fi
+    legacy_processed=$(find "$root/retention-processed" -type f -name "*.json" 2>/dev/null | wc -l | tr -d "[:space:]")
+    legacy_deleted=$(find "$root/events" -type f -name ".deleted.json" 2>/dev/null | wc -l | tr -d "[:space:]")
+    manifests=$(find "$root/events" -type f -name "manifest.json" 2>/dev/null | wc -l | tr -d "[:space:]")
+    jpegs=$(find "$root/events" -type f -name "frame-0[1-5].jpg" 2>/dev/null | wc -l | tr -d "[:space:]")
+    printf "{\"rootPresent\":true,\"checkpointPresent\":%s,\"checkpointValid\":%s,\"checkpointSchemaVersion\":%s,\"processedIndexFiles\":%s,\"processedIndexBytes\":%s,\"deletionIndexFiles\":%s,\"deletionIndexBytes\":%s,\"retainedManifestFiles\":%s,\"retainedJpegFiles\":%s,\"legacyProcessedMarkerFiles\":%s,\"legacyDeletionTombstones\":%s,\"partialArtifacts\":%s,\"unsafeEntries\":%s,\"indexFormatFailures\":%s}\n" \
+      "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema" "$processed_files" "$processed_bytes" \
+      "$deletion_files" "$deletion_bytes" "${manifests:-0}" "${jpegs:-0}" "${legacy_processed:-0}" \
+      "${legacy_deleted:-0}" "${partials:-0}" "${unsafe:-0}" "$format_failures"
+  ' media-metadata-health "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema"
+}
 safe_json_text() {
   [[ ${1:-} =~ ^[A-Za-z0-9._/:@+,-]*$ ]] || fail "Unsafe value in probe JSON: ${1:-}"
 }
@@ -146,6 +417,264 @@ sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$1" | awk '{print $1}'
   else shasum --algorithm 256 -- "$1" | awk '{print $1}'
   fi
+}
+valid_backup_relative_path() {
+  local relative=$1 segment remainder
+  [[ $relative =~ ^[A-Za-z0-9._/-]+$ && $relative != /* && $relative != *'//' ]] || return 1
+  remainder=$relative
+  while :; do
+    case $remainder in */*) segment=${remainder%%/*}; remainder=${remainder#*/} ;; *) segment=$remainder; remainder='' ;; esac
+    [[ -n $segment && $segment != . && $segment != .. ]] || return 1
+    [[ -n $remainder ]] || break
+  done
+}
+calculate_backup_manifest_hmac() {
+  local root=$1 key_file=$2 image=$3
+  sudo docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --user 0 --entrypoint sh \
+    --volume "$root:/backup:ro" --volume "$key_file:/backup-key.txt:ro" "$image" -eu -c '
+      key=$(cat /backup-key.txt)
+      openssl dgst -sha256 -hmac "$key" -binary /backup/SHA256SUMS | openssl base64 -A
+    ' | tr -d '\r\n'
+}
+verify_backup_core_authentication() (
+  set -Eeuo pipefail
+  local root=$1 key_file=$2 image=$3 root_real expected actual line digest relative candidate resolved
+  local work manifest_paths actual_paths count=0
+  [[ -d $root && ! -L $root && -f $root/SHA256SUMS && ! -L $root/SHA256SUMS &&
+     -s $root/SHA256SUMS && -f $root/SHA256SUMS.hmac && ! -L $root/SHA256SUMS.hmac &&
+     -s $root/SHA256SUMS.hmac && -f $key_file && ! -L $key_file && -n $image ]] || {
+    printf 'Independent backup authentication inputs are unsafe.\n' >&2; return 1; }
+  [[ $(file_size "$root/SHA256SUMS") -le 16777216 ]] || {
+    printf 'Authenticated checksum manifest exceeds 16 MiB.\n' >&2; return 1; }
+  root_real=$(realpath -e -- "$root")
+  [[ $root_real == "$root" ]] || {
+    printf 'Backup root is not canonical.\n' >&2; return 1; }
+  expected=$(tr -d '\r\n' <"$root/SHA256SUMS.hmac")
+  [[ $expected =~ ^[A-Za-z0-9+/]{43}=$ ]] || {
+    printf 'Backup core HMAC is malformed.\n' >&2; return 1; }
+  actual=$(calculate_backup_manifest_hmac "$root" "$key_file" "$image")
+  [[ $actual == "$expected" ]] || {
+    printf 'Independent SHA256SUMS HMAC verification failed.\n' >&2; return 1; }
+  work=$(mktemp -d /tmp/oscar-regression-backup-auth.XXXXXXXX)
+  trap 'rm -rf -- "$work"' EXIT HUP INT TERM
+  manifest_paths=$work/manifest-paths
+  actual_paths=$work/actual-paths
+  : >"$manifest_paths"; : >"$actual_paths"
+  while IFS= read -r line || [[ -n $line ]]; do
+    count=$((count+1)); [[ $count -le 10000 ]] || {
+      printf 'Authenticated checksum manifest exceeds 10,000 entries.\n' >&2; return 1; }
+    [[ $line =~ ^([0-9a-f]{64})\ \ \./([A-Za-z0-9._/-]+)$ ]] || {
+      printf 'Authenticated checksum entry is noncanonical.\n' >&2; return 1; }
+    digest=${BASH_REMATCH[1]}; relative=${BASH_REMATCH[2]}
+    valid_backup_relative_path "$relative" || {
+      printf 'Authenticated checksum path is unsafe.\n' >&2; return 1; }
+    candidate="$root/$relative"
+    [[ -f $candidate && ! -L $candidate ]] || {
+      printf 'Authenticated backup object is missing, linked, or non-regular.\n' >&2; return 1; }
+    resolved=$(realpath -e -- "$candidate")
+    [[ $resolved == "$root_real"/* ]] || {
+      printf 'Authenticated backup object escapes its root.\n' >&2; return 1; }
+    [[ $(sha256_file "$candidate") == "$digest" ]] || {
+      printf 'Authenticated backup object checksum mismatch.\n' >&2; return 1; }
+    printf '%s\n' "$relative" >>"$manifest_paths"
+  done <"$root/SHA256SUMS"
+  [[ $count -gt 0 && -z $(LC_ALL=C sort "$manifest_paths" | uniq -d) ]] || {
+    printf 'Authenticated checksum manifest is empty or has duplicate paths.\n' >&2; return 1; }
+  while IFS= read -r -d '' candidate; do
+    [[ ! -L $candidate && ( -f $candidate || -d $candidate ) ]] || {
+      printf 'Backup tree contains a link or special entry.\n' >&2; return 1; }
+    [[ -f $candidate ]] || continue
+    relative=${candidate#"$root/"}
+    case $relative in VERIFIED|JOURNAL_CONFIRMED|SHA256SUMS|SHA256SUMS.hmac) continue ;; esac
+    valid_backup_relative_path "$relative" || {
+      printf 'Backup filesystem contains an unsafe path.\n' >&2; return 1; }
+    printf '%s\n' "$relative" >>"$actual_paths"
+  done < <(find "$root" -mindepth 1 -print0)
+  LC_ALL=C sort -o "$manifest_paths" "$manifest_paths"
+  LC_ALL=C sort -o "$actual_paths" "$actual_paths"
+  cmp -s "$manifest_paths" "$actual_paths" || {
+    printf 'Authenticated manifest does not exactly cover backup payload files.\n' >&2; return 1; }
+  printf verified
+)
+credential_tree_inventory() {
+  local root=$1 output=$2 entry relative kind uid gid mode bytes digest count=0
+  [[ -d $root && ! -L $root && -f $root/.env && ! -L $root/.env &&
+     -d $root/secrets && ! -L $root/secrets && -d $root/tls && ! -L $root/tls ]] || return 1
+  : >"$output"
+  while IFS= read -r -d '' entry; do
+    count=$((count+1)); [[ $count -le 4096 ]] || return 1
+    [[ ! -L $entry ]] || return 1
+    relative=${entry#"$root/"}
+    [[ $relative =~ ^([.]env|secrets|tls)(/[A-Za-z0-9._-]+)*$ &&
+       $relative != *'/../'* && $relative != *'//' ]] || return 1
+    uid=$(stat -c %u -- "$entry"); gid=$(stat -c %g -- "$entry"); mode=$(stat -c %a -- "$entry")
+    if [[ -d $entry ]]; then
+      kind=D; bytes=-; digest=-
+    elif [[ -f $entry ]]; then
+      kind=F; bytes=$(stat -c %s -- "$entry"); digest=$(sha256_file "$entry")
+      [[ $bytes =~ ^[0-9]+$ && $digest =~ ^[0-9a-f]{64}$ ]] || return 1
+    else return 1
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$relative" "$uid" "$gid" "$mode" "$bytes" "$digest" >>"$output"
+  done < <(find "$root/.env" "$root/secrets" "$root/tls" -mindepth 0 -print0)
+  [[ $count -gt 0 ]] || return 1
+  LC_ALL=C sort -o "$output" "$output"
+  [[ -z $(cut -d'|' -f2 "$output" | LC_ALL=C sort | uniq -d) ]]
+}
+file_size() {
+  if stat -c %s "$1" >/dev/null 2>&1; then stat -c %s "$1"; else stat -f %z "$1"; fi
+}
+journal_prefix_matches() {
+  local expected_sha=$1 expected_bytes=$2 candidate=$3 actual_size actual_sha
+  [[ $expected_sha =~ ^[0-9a-f]{64}$ && $expected_bytes =~ ^[1-9][0-9]*$ &&
+     -f $candidate && ! -L $candidate ]] || return 1
+  actual_size=$(wc -c <"$candidate" | tr -d '[:space:]')
+  [[ $actual_size =~ ^[0-9]+$ && $actual_size -ge $expected_bytes ]] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_sha=$(head -c "$expected_bytes" -- "$candidate" | sha256sum | awk '{print $1}')
+  else
+    actual_sha=$(head -c "$expected_bytes" -- "$candidate" | shasum --algorithm 256 | awk '{print $1}')
+  fi
+  [[ $actual_sha == "$expected_sha" ]]
+}
+emit_command_diagnostics() {
+  local label=$1 log=$2
+  [[ -f $log && ! -L $log ]] || return 0
+  printf '%s failed; bounded diagnostics follow:\n' "$label" >&2
+  tail -n 200 -- "$log" >&2 || true
+}
+append_live_backup_member() {
+  local inventory=$1 kind=$2 member=$3 expected_sha=${4:-} expected_bytes=${5:-}
+  local live result_sha result_bytes
+  [[ $kind =~ ^(M|J|C|P|D)$ ]] || fail 'Retained backup expectation has an invalid member kind.'
+  [[ $member =~ ^files/videos/retained-media/v1/[A-Za-z0-9._/-]+$ &&
+     $member != *'/../'* && $member != */.. && $member != *'//' ]] ||
+    fail 'Retained backup expectation has an unsafe member path.'
+  live=$(compose exec -T oscar sh -eu -c '
+    path=/var/lib/oscar/$1
+    [ -f "$path" ] && [ ! -L "$path" ]
+    size=$(stat -c %s -- "$path")
+    [ "$size" -gt 0 ]
+    sha=$(sha256sum -- "$path" | awk "{print \\$1}")
+    printf "%s|%s\\n" "$sha" "$size"
+  ' retained-backup-member "$member") || fail "Expected retained backup member is missing or unsafe: $member"
+  IFS='|' read -r result_sha result_bytes extra <<<"$live"
+  [[ -z ${extra:-} && $result_sha =~ ^[0-9a-f]{64}$ && $result_bytes =~ ^[1-9][0-9]*$ ]] ||
+    fail 'Retained backup member snapshot returned invalid hash/size metadata.'
+  [[ -z $expected_sha || $result_sha == "$expected_sha" ]] ||
+    fail "Live retained frame hash does not match its authenticated API manifest: $member"
+  [[ -z $expected_bytes || $result_bytes == "$expected_bytes" ]] ||
+    fail "Live retained frame size does not match its authenticated API manifest: $member"
+  printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
+}
+verify_retained_backup_members() {
+  local archive=$1 inventory=$2 work=$3 listing member_file line kind member expected_sha expected_bytes
+  local lookup matches raw verbose actual_sha actual_bytes header verified=0
+  [[ -f $archive && ! -L $archive && -f $inventory && ! -L $inventory && -s $inventory &&
+     -d $work && ! -L $work ]] || fail 'Retained backup verification inputs are missing or unsafe.'
+  listing=$work/state-members.txt
+  tar -tzf "$archive" >"$listing"
+  [[ $(wc -l <"$listing" | tr -d '[:space:]') -le 200000 ]] ||
+    fail 'OSCAR state backup member inventory exceeds its 200,000-entry safety bound.'
+  ! grep -Eq '(^/|(^|/)[.][.](/|$))' "$listing" ||
+    fail 'OSCAR state backup contains an absolute or traversal member.'
+  [[ $(cut -d'|' -f2 "$inventory" | LC_ALL=C sort | uniq -d | wc -l | tr -d '[:space:]') == 0 ]] ||
+    fail 'Retained backup expectation contains duplicate member identities.'
+  while IFS='|' read -r kind member expected_sha expected_bytes extra; do
+    [[ -z ${extra:-} && $kind =~ ^(M|J|C|P|D)$ &&
+       $member =~ ^files/videos/retained-media/v1/[A-Za-z0-9._/-]+$ &&
+       $expected_sha =~ ^[0-9a-f]{64}$ && $expected_bytes =~ ^[1-9][0-9]*$ ]] ||
+      fail 'Retained backup expectation inventory is malformed.'
+    lookup=$(awk -v expected="$member" '
+      { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
+        if (normalized==expected) { count++; raw=$0 } }
+      END { printf "%d|%s", count+0, raw }
+    ' "$listing")
+    IFS='|' read -r matches raw <<<"$lookup"
+    [[ $matches == 1 && -n $raw ]] ||
+      fail "Backup must contain exactly one expected retained member: $member"
+    verbose=$(tar -tvzf "$archive" -- "$raw")
+    [[ $(printf '%s\n' "$verbose" | wc -l | tr -d '[:space:]') == 1 ]] ||
+      fail "Backup retained member has an ambiguous archive type: $member"
+    [[ ${verbose:0:1} == - ]] || fail "Backup retained member is not a regular file: $member"
+    member_file=$work/member-$verified
+    tar -xOf "$archive" -- "$raw" >"$member_file"
+    [[ -f $member_file && ! -L $member_file ]] || fail "Could not stream retained backup member: $member"
+    actual_sha=$(sha256_file "$member_file")
+    actual_bytes=$(file_size "$member_file")
+    [[ $actual_sha == "$expected_sha" && $actual_bytes == "$expected_bytes" ]] ||
+      fail "Retained backup member hash or size changed: $member"
+    case $kind in
+      J)
+        header=$(od -An -tx1 -N2 -- "$member_file" | tr -d ' [:space:]')
+        [[ $header == ffd8 && $(tail -c 2 -- "$member_file" | od -An -tx1 | tr -d ' [:space:]') == ffd9 ]] ||
+          fail "Retained backup JPEG has an invalid content type: $member"
+        ;;
+      M|C)
+        grep -Eq '^[[:space:]]*[{]' "$member_file" && grep -Eq '[}][[:space:]]*$' "$member_file" ||
+          fail "Retained backup JSON has an invalid content type: $member"
+        ;;
+      P)
+        header=$(od -An -tx1 -N16 -- "$member_file" | tr -d ' [:space:]')
+        [[ $header == 4f534341524d50490000000100000024 && $actual_bytes -ge 16 &&
+           $(((actual_bytes-16)%36)) -eq 0 ]] ||
+          fail "Retained backup processed index has an invalid content type: $member"
+        ;;
+      D)
+        header=$(od -An -tx1 -N16 -- "$member_file" | tr -d ' [:space:]')
+        [[ $header == 4f534341524d44490000000100000024 && $actual_bytes -ge 16 &&
+           $(((actual_bytes-16)%36)) -eq 0 ]] ||
+          fail "Retained backup deletion index has an invalid content type: $member"
+        ;;
+    esac
+    verified=$((verified+1))
+  done <"$inventory"
+  printf '%s' "$verified"
+}
+verify_daily_receipt_backup_members() {
+  local archive=$1 listing=$2 directory_id=$3 day=$4 inventory=$5 work=$6
+  local expected_names actual_names prefix name expected_bytes expected_sha lookup matches raw verbose member
+  local actual_bytes actual_sha verified=0
+  [[ -f $archive && ! -L $archive && -f $listing && ! -L $listing &&
+     $directory_id =~ ^[A-Za-z0-9._-]+$ &&
+     $day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && -s $inventory ]] || return 1
+  expected_names=$(mktemp "$work/expected-segments.XXXXXXXX")
+  actual_names=$(mktemp "$work/actual-segments.XXXXXXXX")
+  : >"$expected_names"; : >"$actual_names"
+  prefix="files/.dailyfile-journal/segments/$directory_id/$day/"
+  while IFS='|' read -r name expected_bytes expected_sha extra; do
+    [[ -z ${extra:-} && $name =~ ^[0-9]{6}[.]seg$ &&
+       $expected_bytes =~ ^[1-9][0-9]*$ && $expected_sha =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$name" >>"$expected_names"
+    lookup=$(awk -v expected="$prefix$name" '
+      { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
+        if (normalized==expected) { count++; raw=$0 } }
+      END { printf "%d|%s", count+0, raw }
+    ' "$listing")
+    IFS='|' read -r matches raw <<<"$lookup"
+    [[ $matches == 1 && -n $raw ]] || return 1
+    verbose=$(tar -tvzf "$archive" -- "$raw")
+    [[ $(printf '%s\n' "$verbose" | wc -l | tr -d '[:space:]') == 1 && ${verbose:0:1} == - ]] || return 1
+    member=$(mktemp "$work/daily-segment.XXXXXXXX")
+    tar -xOf "$archive" -- "$raw" >"$member"
+    actual_bytes=$(file_size "$member"); actual_sha=$(sha256_file "$member")
+    [[ $actual_bytes == "$expected_bytes" && $actual_sha == "$expected_sha" ]] || return 1
+    rm -f -- "$member"
+    verified=$((verified+1))
+  done <"$inventory"
+  [[ $verified -gt 0 && -z $(LC_ALL=C sort "$expected_names" | uniq -d) ]] || return 1
+  awk -v prefix="$prefix" '
+    { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
+      if (index(normalized,prefix)==1) {
+        name=substr(normalized,length(prefix)+1)
+        if (name ~ /^[0-9]{6}[.](seg|open)$/) print name
+      }
+    }
+  ' "$listing" | LC_ALL=C sort >"$actual_names"
+  LC_ALL=C sort -o "$expected_names" "$expected_names"
+  cmp -s "$expected_names" "$actual_names" || return 1
+  printf '%s' "$verified"
 }
 file_owner_id() { if stat -c %u "$1" >/dev/null 2>&1; then stat -c %u "$1"; else stat -f %u "$1"; fi; }
 file_group_id() { if stat -c %g "$1" >/dev/null 2>&1; then stat -c %g "$1"; else stat -f %g "$1"; fi; }
@@ -756,21 +1285,30 @@ case $action in
     app_digests=$(repo_digests_json "$app_image")
     postgis_digests=$(repo_digests_json "$postgis_image")
     gateway_digests=$(repo_digests_json "$gateway_image")
-    config=$(compose exec -T oscar sh -c 'find /var/lib/oscar -maxdepth 2 -type f -name "*.json" -print0 2>/dev/null | xargs -0 grep -l "OscarTieredObsSystemDatabase\|DailyFileJournalService" 2>/dev/null | head -n1' || true)
-    config_text=''
-    [[ -n $config ]] && config_text=$(compose exec -T oscar sh -c "cat -- '$config'" 2>/dev/null || true)
-    interval=$(printf '%s' "$config_text" | sed -n 's/.*"intervalMinutes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    grace=$(printf '%s' "$config_text" | sed -n 's/.*"rollbackGraceDays"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    media_retention=$(printf '%s' "$config_text" | sed -n 's/.*"timeToRetention"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    media_query_period=$(printf '%s' "$config_text" | sed -n 's/.*"videoQueryPeriod"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    media_frame_count=$(printf '%s' "$config_text" | sed -n 's/.*"frameRetentionCount"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    media_jpeg_quality=$(printf '%s' "$config_text" | sed -n 's/.*"jpegQuality"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    media_source_grace=$(printf '%s' "$config_text" | sed -n 's/.*"sourceRollbackGraceHours"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
-    media_enabled=null; config_text_matches "$config_text" '"enableFrameRetention"[[:space:]]*:[[:space:]]*true' && media_enabled=true || true
-    config_text_matches "$config_text" '"enableFrameRetention"[[:space:]]*:[[:space:]]*false' && media_enabled=false || true
-    delete_hot=null; config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true' && delete_hot=true || true
-    config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*false' && delete_hot=false || true
+    config=/var/lib/oscar/config.json
+    compose exec -T oscar sh -eu -c '
+      path=$1
+      test -f "$path" && test ! -L "$path"
+      size=$(stat -c %s -- "$path")
+      test "$size" -gt 0 && test "$size" -le 16777216
+    ' config-contract "$config" || fail 'The live OSCAR config is missing, linked, empty, or over 16 MiB.'
+    config_fields=$(platform_config_fields "$config") ||
+      fail 'The live OSCAR config failed structural JSON extraction.'
+    [[ -n $config_fields ]] ||
+      fail 'The live OSCAR config does not contain exactly one correctly typed storage module set.'
+    IFS='|' read -r interval grace duck_memory duck_threads duck_temp_limit duck_max_sessions \
+      duck_acquire_timeout duck_temp_dir media_retention media_query_period media_frame_count \
+      media_jpeg_quality media_source_grace media_metadata_work media_enabled delete_hot \
+      daily_root daily_journal daily_publication daily_zone daily_mode daily_fsync daily_records \
+      daily_unforced_bytes daily_segment_bytes daily_segment_age daily_record_bytes daily_retention \
+      lifecycle_delegated daily_purge_work unexpected_config_field <<<"$config_fields"
+    [[ -z ${unexpected_config_field:-} ]] || fail 'The structural OSCAR config result is ambiguous.'
+    for value in "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode"; do
+      safe_json_text "$value"
+    done
     schema=$(scalar "SELECT coalesce(max(version),0) FROM oscar_storage_schema_version;")
+    schema_checksum=$(scalar "SELECT coalesce((SELECT checksum FROM oscar_storage_schema_version WHERE version=5),'');")
+    safe_json_text "$schema_checksum"
     checksums=$(scalar "SHOW data_checksums;")
     installed=$(scalar "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements');")
     preloaded=$(scalar "SELECT position('pg_stat_statements' in current_setting('shared_preload_libraries'))>0;")
@@ -789,13 +1327,21 @@ case $action in
         marker_exact=true
       fi
     fi
-    for value in "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"; do safe_json_text "$value"; done
+    for value in "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized" "$duck_temp_dir"; do safe_json_text "$value"; done
+    archive_scratch=$(archive_scratch_json "$duck_temp_dir" /var/lib/oscar/archive)
+    batch_evidence=$(psql_admin --quiet --tuples-only --no-align --command "
+      WITH rewritten AS (
+        SELECT coalesce(sum(calls),0)::bigint calls,coalesce(sum(rows),0)::bigint rows
+        FROM pg_stat_statements
+        WHERE query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+(public[.])?obs[[:space:]]*[(]'
+          AND query ~ '[)][[:space:]]*,[[:space:]]*[(]')
+      SELECT calls||'|'||rows FROM rewritten;" | tail -n 1)
+    IFS='|' read -r batch_calls batch_rows batch_extra <<<"$batch_evidence"
+    [[ -z ${batch_extra:-} && $batch_calls =~ ^[0-9]+$ && $batch_rows =~ ^[0-9]+$ ]] ||
+      fail 'Could not obtain bounded PostgreSQL batch-rewrite execution evidence.'
     batch=false
-    # The 3.9.2 tiered database config sets reWriteBatchedInserts=true in code;
-    # explicit serialized properties are also accepted for forward compatibility.
-    config_text_matches "$config_text" 'OscarTieredObsSystemDatabase|reWriteBatchedInserts[^A-Za-z]*(true|"true")' && batch=true || true
-    journal=false
-    config_text_matches "$config_text" 'DailyFileJournalService' && journal=true || true
+    if [[ $batch_calls -gt 0 && $batch_rows -gt $batch_calls ]]; then batch=true; fi
+    journal=true
     printf '{"expectedRelease":"%s","configuredRelease":"%s","templateRelease":"%s","deploymentId":"%s",' \
       "$expected_release" "$configured_release" "$template_release" "$deployment_id"
     printf '"storageRoots":{"archive":%s,"backup":%s,"walArchive":%s},' \
@@ -834,15 +1380,33 @@ case $action in
       "$postgis_image" "$postgis_id" "$postgis_container_id" "$postgis_digests" "$postgis_version_label" "$postgis_profile_label"
     printf '"gatewayImage":{"reference":"%s","imageId":"%s","containerImageId":"%s","repoDigests":%s,"versionLabel":"%s","storageProfileLabel":""},' \
       "$gateway_image" "$gateway_id" "$gateway_container_id" "$gateway_digests" "$gateway_version_label"
-    printf '"dataChecksums":"%s","pgStatStatementsInstalled":%s,"pgStatStatementsPreloaded":%s,"schemaVersion":%s,' \
-      "$checksums" "$([[ $installed == t ]] && echo true || echo false)" "$([[ $preloaded == t ]] && echo true || echo false)" "$schema"
+    printf '"dataChecksums":"%s","pgStatStatementsInstalled":%s,"pgStatStatementsPreloaded":%s,"schemaVersion":%s,"schemaChecksum":"%s",' \
+      "$checksums" "$([[ $installed == t ]] && echo true || echo false)" "$([[ $preloaded == t ]] && echo true || echo false)" "$schema" "$schema_checksum"
     printf '"archiveMarker":{"present":%s,"exact":%s,"format":"%s","version":"%s","dataChecksums":"%s","initializedAt":"%s"},' \
       "$marker_present" "$marker_exact" "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"
-    printf '"batchRewriteConfigured":%s,"dailyJournalConfigured":%s,"archiveIntervalMinutes":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
-      "$batch" "$journal" "${interval:-null}" "$delete_hot" "${grace:-null}"
-    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"frameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s}}\n' \
+    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveIntervalMinutes":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
+      "$batch" "$batch_calls" "$batch_rows" "$journal" "${interval:-null}" "$delete_hot" "${grace:-null}"
+    printf '"archiveResources":{"memoryLimitMegabytes":%s,"threads":%s,"maximumTemporaryMegabytes":%s,"maximumConcurrentSessions":%s,"sessionAcquireTimeoutSeconds":%s,"temporaryDirectory":"%s"},' \
+      "${duck_memory:-null}" "${duck_threads:-null}" "${duck_temp_limit:-null}" \
+      "${duck_max_sessions:-null}" "${duck_acquire_timeout:-null}" "$duck_temp_dir"
+    printf '"archiveScratch":%s,' "$archive_scratch"
+    printf '"dailyJournal":{"rootDirectory":"%s","journalDirectory":"%s","publicationDirectory":"%s","zoneId":"%s","observationMode":"%s","fsyncIntervalMillis":%s,"maxUnforcedRecords":%s,"maxUnforcedBytes":%s,"maxSegmentBytes":%s,"maxSegmentAgeSeconds":%s,"maxRecordBytes":%s,"sealedJournalRetentionDays":%s,"observationLifecycleDelegated":%s,"purgeWorkLimit":%s},' \
+      "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode" \
+      "${daily_fsync:-null}" "${daily_records:-null}" "${daily_unforced_bytes:-null}" \
+      "${daily_segment_bytes:-null}" "${daily_segment_age:-null}" "${daily_record_bytes:-null}" \
+      "${daily_retention:-null}" "$lifecycle_delegated" "${daily_purge_work:-null}"
+    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"frameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s}}\n' \
       "$media_enabled" "${media_retention:-null}" "${media_query_period:-null}" \
-      "${media_frame_count:-null}" "${media_jpeg_quality:-null}" "${media_source_grace:-null}"
+      "${media_frame_count:-null}" "${media_jpeg_quality:-null}" "${media_source_grace:-null}" \
+      "${media_metadata_work:-null}"
+    ;;
+
+  archive-scratch-health)
+    archive_scratch_json /var/lib/oscar/duckdb-tmp /var/lib/oscar/archive
+    ;;
+
+  media-metadata-health)
+    media_metadata_health_json
     ;;
 
   snapshot)
@@ -851,6 +1415,34 @@ case $action in
     journal_bytes=$(compose exec -T oscar sh -c "du -sb /var/lib/oscar/files/.dailyfile-journal 2>/dev/null | awk '{print \$1+0}'" || echo 0)
     daily_bytes=$(compose exec -T oscar sh -c "du -sb /var/lib/oscar/files/dailyfiles 2>/dev/null | awk '{print \$1+0}'" || echo 0)
     media_bytes=$(compose exec -T oscar sh -c "du -sb /var/lib/oscar/files/videos/retained-media 2>/dev/null | awk '{print \$1+0}'" || echo 0)
+    metadata_stats=$(compose exec -T oscar sh -eu -c '
+      root=/var/lib/oscar/files/videos/retained-media/v1
+      count() { path=$1; shift; find "$path" "$@" 2>/dev/null | wc -l | tr -d "[:space:]"; }
+      bytes() { path=$1; shift; find "$path" "$@" -printf "%s\n" 2>/dev/null | awk "{sum+=\$1} END {print sum+0}"; }
+      manifests=$(count "$root/events" -type f -name manifest.json)
+      jpegs=$(count "$root/events" -type f -name "frame-0[1-5].jpg")
+      processed=$(count "$root/retention-processed-index" -mindepth 1 -maxdepth 1 -type f -name "*.idx")
+      processed_bytes=$(bytes "$root/retention-processed-index" -mindepth 1 -maxdepth 1 -type f -name "*.idx")
+      deleted=$(count "$root/deletion-index" -mindepth 2 -maxdepth 2 -type f -name "*.idx")
+      deleted_bytes=$(bytes "$root/deletion-index" -mindepth 2 -maxdepth 2 -type f -name "*.idx")
+      legacy_processed=$(count "$root/retention-processed" -type f -name "*.json")
+      legacy_deleted=$(count "$root/events" -type f -name .deleted.json)
+      checkpoint=0
+      checkpoint_path="$root/.metadata-reclamation-checkpoint.json"
+      if [ -f "$checkpoint_path" ] && [ ! -L "$checkpoint_path" ]; then
+        checkpoint=$(stat -c %s -- "$checkpoint_path")
+      fi
+      printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$manifests" "$jpegs" "$processed" \
+        "$processed_bytes" "$deleted" "$deleted_bytes" "$legacy_processed" "$legacy_deleted" "$checkpoint"
+    ' metadata-stats)
+    IFS='|' read -r media_manifests media_jpegs processed_indexes processed_index_bytes \
+      deletion_indexes deletion_index_bytes legacy_markers legacy_tombstones metadata_checkpoint_bytes \
+      <<<"$metadata_stats"
+    for value in "$media_manifests" "$media_jpegs" "$processed_indexes" "$processed_index_bytes" \
+      "$deletion_indexes" "$deletion_index_bytes" "$legacy_markers" "$legacy_tombstones" \
+      "$metadata_checkpoint_bytes"; do
+      [[ $value =~ ^[0-9]+$ ]] || fail 'Media metadata inventory returned a nonnumeric field.'
+    done
     archive_bytes=$(directory_bytes "$archive_dir"); backup_bytes=$(directory_bytes "$backup_dir")
     json_query "WITH db AS (
       SELECT pg_database_size(current_database()) database_size,
@@ -873,13 +1465,26 @@ case $action in
       'activeArchiveGenerations',catalog.active,'sealedArchiveGenerations',catalog.sealed,'archiveRows',catalog.rows,
       'archiveBytes',$archive_bytes,'failedArchiveJobs',jobs.failed,'failedParityReceipts',parity.failed,
       'activeHolds',holds.active,'verifiedBackups',backups.verified,'journalBytes',${journal_bytes:-0},
-      'dailyFileBytes',${daily_bytes:-0},'retainedMediaBytes',${media_bytes:-0},'backupBytes',$backup_bytes)
+      'dailyFileBytes',${daily_bytes:-0},'retainedMediaBytes',${media_bytes:-0},
+      'retainedMediaManifestFiles',$media_manifests,'retainedMediaJpegFiles',$media_jpegs,
+      'processedObservationIndexFiles',$processed_indexes,'processedObservationIndexBytes',$processed_index_bytes,
+      'deletionIndexFiles',$deletion_indexes,'deletionIndexBytes',$deletion_index_bytes,
+      'legacyProcessedMarkerFiles',$legacy_markers,'legacyDeletionTombstones',$legacy_tombstones,
+      'mediaMetadataCheckpointBytes',$metadata_checkpoint_bytes,'backupBytes',$backup_bytes)
     FROM db,stats,wal,statements,catalog,jobs,parity,holds,backups;"
     ;;
 
   archive-health)
+    archive_verify_work=$(mktemp -d /tmp/oscar-regression-archive-verify.XXXXXXXX)
+    cleanup_archive_verify() { rm -rf -- "$archive_verify_work"; }
+    trap cleanup_archive_verify EXIT
+    archive_verify_log=$archive_verify_work/archive-verify.log
     verify_passed=false
-    sudo bash oscar.sh archive verify >/tmp/oscar-regression-archive-verify.log 2>&1 && verify_passed=true
+    if sudo bash oscar.sh archive verify >"$archive_verify_log" 2>&1; then
+      verify_passed=true
+    else
+      emit_command_diagnostics 'OSCAR archive verification' "$archive_verify_log"
+    fi
     archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ../oscar-storage/archive)")")
     wal_archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_WAL_ARCHIVE_DIR ../oscar-storage/wal-archive)")")
     archive_partials=$(find "$archive_dir" -mindepth 1 \( -name '*.partial' -o -name '*.partial.*' -o -name '*.tmp' -o -name '*.tmp.*' \) -print | wc -l | tr -d '[:space:]')
@@ -909,39 +1514,196 @@ case $action in
         'walPartialArtifacts',$wal_partials,
         'checksumVerificationPassed',$verify_passed)
       FROM generations,objects,incomplete;"
+    cleanup_archive_verify
+    trap - EXIT
     ;;
 
   journal-status)
-    compose exec -T oscar sh -eu -c '
+    inventory=$(compose exec -T oscar sh -eu -c '
       root=/var/lib/oscar/files; pubs="$root/dailyfiles"; journal="$root/.dailyfile-journal"
-      partial=$(find "$pubs" "$journal" -type f \( -name "*.partial" -o -name "*.tmp" \) 2>/dev/null | wc -l)
-      manifests=$(find "$pubs" -type f -name "*.manifest.v1.json" 2>/dev/null | wc -l)
-      publications=$(find "$pubs" -type f -name "*.csv" 2>/dev/null | wc -l)
-      open=$(find "$journal" -type f -name "*.open" 2>/dev/null | wc -l)
-      segments=$(find "$journal" -type f -name "*.seg" 2>/dev/null | wc -l)
-      validated=0; failures=0
-      for manifest in $(find "$pubs" -type f -name "*.manifest.v1.json" 2>/dev/null); do
-        csv=${manifest%.manifest.v1.json}
-        expected_sha=$(sed -n "s/.*\"sha256\"[[:space:]]*:[[:space:]]*\"\([0-9a-f][0-9a-f]*\)\".*/\1/p" "$manifest" | head -n1)
-        expected_bytes=$(sed -n "s/.*\"byteCount\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$manifest" | head -n1)
-        expected_records=$(sed -n "s/.*\"recordCount\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$manifest" | head -n1)
-        if [ -f "$csv" ]; then
-          digest_line=$(sha256sum "$csv")
-          actual_sha=${digest_line%% *}
-          actual_bytes=$(wc -c <"$csv" | tr -d "[:space:]")
-          actual_records=$(wc -l <"$csv" | tr -d "[:space:]")
-        else actual_sha=missing; actual_bytes=-1; actual_records=-1; fi
-        if [ -n "$expected_sha" ] && [ "$actual_sha" = "$expected_sha" ] &&
-           [ "$actual_bytes" = "$expected_bytes" ] && [ "$actual_records" = "$expected_records" ]; then
-          validated=$((validated+1))
-        else failures=$((failures+1)); fi
+      for path in "$root" "$pubs" "$journal"; do
+        [ -d "$path" ] && [ ! -L "$path" ] || exit 20
       done
-      printf "{\"publications\":%s,\"manifests\":%s,\"validatedManifests\":%s,\"manifestFailures\":%s,\"partialFiles\":%s,\"openSegments\":%s,\"sealedSegments\":%s}\n" "$publications" "$manifests" "$validated" "$failures" "$partial" "$open" "$segments"
-    '
+    total=$(find "$pubs" "$journal" -mindepth 1 -print | wc -l | tr -d "[:space:]")
+    [ "$total" -le 100000 ] || exit 21
+    partial=$(find "$pubs" "$journal" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
+    manifests=$(find "$pubs" -mindepth 1 -maxdepth 1 -type f -name "*.manifest.v1.json" -print | wc -l | tr -d "[:space:]")
+    publications=$(find "$pubs" -mindepth 1 -maxdepth 1 -type f -name "*.csv" -print | wc -l | tr -d "[:space:]")
+    open=$(find "$journal" -type f -name "*.open" -print | wc -l | tr -d "[:space:]")
+    segments=$(find "$journal" -type f -name "*.seg" -print | wc -l | tr -d "[:space:]")
+    links=$(find "$pubs" "$journal" -type l -print | wc -l | tr -d "[:space:]")
+    publication_nonfiles=$(find "$pubs" -mindepth 1 -maxdepth 1 ! -type f -print | wc -l | tr -d "[:space:]")
+    publication_nested=$(find "$pubs" -mindepth 2 -print | wc -l | tr -d "[:space:]")
+    publication_bad_names=$(find "$pubs" -mindepth 1 -maxdepth 1 -type f -printf "%f\n" |
+      grep -Evc "^[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}[.]csv([.]manifest[.]v1[.]json)?$" || true)
+    unsafe=$((publication_nonfiles+publication_nested+publication_bad_names))
+    printf "%s|%s|%s|%s|%s|%s|%s\n" "$publications" "$manifests" "$partial" "$open" "$segments" "$links" "$unsafe"
+  ' journal-inventory) || fail 'Daily-file roots are missing, linked, or exceed the 100,000-entry safety bound.'
+    IFS='|' read -r publications manifests partial open segments unsafe_links unsafe_entries <<<"$inventory"
+    for value in "$publications" "$manifests" "$partial" "$open" "$segments" "$unsafe_links" "$unsafe_entries"; do
+      [[ $value =~ ^[0-9]+$ ]] || fail 'Daily-file inventory returned a nonnumeric field.'
+    done
+    manifest_listing=$(compose exec -T oscar find /var/lib/oscar/files/dailyfiles \
+      -mindepth 1 -maxdepth 1 -type f -name '*.manifest.v1.json' -print | LC_ALL=C sort)
+    validated=0; failures=0
+    while IFS= read -r manifest; do
+      [[ -n $manifest ]] || continue
+      if [[ ! $manifest =~ ^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}\.csv\.manifest\.v1\.json$ ]]; then
+        failures=$((failures+1)); continue
+      fi
+      csv=${manifest%.manifest.v1.json}
+      csv_name=${csv##*/}
+      csv_day=${csv_name%.csv}; csv_day=${csv_day##*_}
+      [[ $csv_day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+        failures=$((failures+1)); continue;
+      }
+      manifest_size=$(compose exec -T oscar stat -c %s -- "$manifest" 2>/dev/null || printf 0)
+      [[ $manifest_size =~ ^[0-9]+$ && $manifest_size -gt 0 && $manifest_size -le 1048576 ]] || {
+        failures=$((failures+1)); continue;
+      }
+      manifest_encoded=$(compose exec -T oscar openssl base64 -A -in "$manifest" | tr -d '\r\n')
+      if [[ ! $manifest_encoded =~ ^[A-Za-z0-9+/]+=*$ || ${#manifest_encoded} -gt 1398104 ]]; then
+        failures=$((failures+1)); continue
+      fi
+      csv_stats=$(compose exec -T oscar sh -eu -c '
+        path=$1
+        [ -f "$path" ] && [ ! -L "$path" ] || exit 20
+        digest=$(sha256sum "$path"); digest=${digest%% *}
+        bytes=$(wc -c <"$path" | tr -d "[:space:]")
+        records=$(wc -l <"$path" | tr -d "[:space:]")
+        printf "%s|%s|%s\n" "$digest" "$bytes" "$records"
+      ' journal-csv "$csv" 2>/dev/null || true)
+      IFS='|' read -r actual_sha actual_bytes actual_records <<<"$csv_stats"
+      if [[ ! $actual_sha =~ ^[0-9a-f]{64}$ || ! $actual_bytes =~ ^[0-9]+$ || ! $actual_records =~ ^[0-9]+$ ]]; then
+        failures=$((failures+1)); continue
+      fi
+      manifest_valid=$(scalar "WITH source AS (
+          SELECT convert_from(decode('$manifest_encoded','base64'),'UTF8') AS text),
+        doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source)
+        SELECT jsonb_typeof(value)='object'
+          AND (SELECT count(*) FROM json_object_keys(raw))=12
+          AND value ?& ARRAY['schemaVersion','format','laneId','zoneId','windowStartInclusive',
+            'windowEndExclusive','recordCount','byteCount','checksumAlgorithm','sha256','dataFile','publishedAt']
+          AND value->'schemaVersion'='1'::jsonb
+          AND value->>'format'='OSCAR_LEGACY_DAILY_CSV'
+          AND jsonb_typeof(value->'laneId')='string' AND length(value->>'laneId') BETWEEN 1 AND 256
+          AND value->>'zoneId'='UTC'
+          AND value->>'windowStartInclusive' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+          AND value->>'windowEndExclusive' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+          AND (value->>'windowStartInclusive')::timestamptz < (value->>'windowEndExclusive')::timestamptz
+          AND (value->>'windowStartInclusive')::timestamptz =
+            ('$csv_day'::date::timestamp AT TIME ZONE 'UTC')
+          AND (value->>'windowEndExclusive')::timestamptz =
+            ((('$csv_day'::date + 1)::timestamp) AT TIME ZONE 'UTC')
+          AND jsonb_typeof(value->'recordCount')='number' AND value->>'recordCount' ~ '^(0|[1-9][0-9]*)$'
+          AND (value->>'recordCount')::bigint=$actual_records
+          AND jsonb_typeof(value->'byteCount')='number' AND value->>'byteCount' ~ '^(0|[1-9][0-9]*)$'
+          AND (value->>'byteCount')::bigint=$actual_bytes
+          AND value->>'checksumAlgorithm'='SHA-256'
+          AND value->>'sha256'='$actual_sha'
+          AND value->>'dataFile'='$csv_name'
+          AND value->>'dataFile' ~ '^[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}[.]csv$'
+          AND value->>'publishedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+          AND (value->>'publishedAt')::timestamptz IS NOT NULL
+          AND (value->>'publishedAt')::timestamptz >=
+            (value->>'windowEndExclusive')::timestamptz
+        FROM doc;")
+      if [[ $manifest_valid == t ]]; then validated=$((validated+1)); else failures=$((failures+1)); fi
+    done <<<"$manifest_listing"
+    printf '{"publications":%s,"manifests":%s,"validatedManifests":%s,"manifestFailures":%s,"partialFiles":%s,"unsafeLinks":%s,"unsafeEntries":%s,"bounded":true,"openSegments":%s,"sealedSegments":%s}\n' \
+      "$publications" "$manifests" "$validated" "$failures" "$partial" "$unsafe_links" "$unsafe_entries" "$open" "$segments"
+    ;;
+
+  journal-lane-state)
+    lane_uid=${1:-}
+    [[ $lane_uid =~ ^urn:osh:system:lane:[A-Za-z0-9._-]{1,200}$ ]] ||
+      fail 'Direct-journal lane UID is outside the canonical regression fixture namespace.'
+    safe_lane=$(printf '%s' "$lane_uid" | sed 's/[^A-Za-z0-9._-]/_/g')
+    if ((${#safe_lane} > 120)); then safe_lane=${safe_lane:0:120}; fi
+    lane_hash=$(printf '%s' "$lane_uid" | sha256sum | cut -c1-12)
+    directory_id="$safe_lane-$lane_hash"
+    [[ $directory_id =~ ^[A-Za-z0-9._-]+$ ]] || fail 'Could not derive the direct-journal lane directory.'
+    compose exec -T oscar sh -eu -c '
+      directory_id=$1; lane_uid=$2
+      root=/var/lib/oscar/files/.dailyfile-journal/segments
+      [ -d "$root" ] && [ ! -L "$root" ] || exit 20
+      lane="$root/$directory_id"
+      if [ ! -e "$lane" ] && [ ! -L "$lane" ]; then
+        printf "{\"directoryId\":\"%s\",\"present\":false,\"files\":0,\"bytes\":0,\"openSegments\":0,\"sealedSegments\":0,\"partialFiles\":0,\"unsafeEntries\":0,\"segments\":[]}\n" "$directory_id"
+        exit 0
+      fi
+      [ -d "$lane" ] && [ ! -L "$lane" ] || exit 21
+      entries=$(find "$lane" -mindepth 1 -print | wc -l | tr -d "[:space:]")
+      [ "$entries" -le 10000 ] || exit 22
+      identity_bad=0
+      if [ ! -f "$lane/lane.id" ] || [ -L "$lane/lane.id" ] ||
+         [ "$(wc -c <"$lane/lane.id" | tr -d "[:space:]")" -gt 4096 ] ||
+         [ "$(cat -- "$lane/lane.id")" != "$lane_uid" ]; then identity_bad=1; fi
+      invalid_days=$(find "$lane" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" |
+        grep -Evc "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" || true)
+      unexpected_root=$(find "$lane" -mindepth 1 -maxdepth 1 ! -type d ! -name lane.id -print | wc -l | tr -d "[:space:]")
+      unexpected_deep=$(find "$lane" -mindepth 3 -print | wc -l | tr -d "[:space:]")
+      invalid_segments=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -printf "%f\n" |
+        grep -Evc "^[0-9]{6}[.](open|seg)$" || true)
+      nonfiles=$(find "$lane" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
+      files=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | wc -l | tr -d "[:space:]")
+      [ "$files" -le 512 ] || exit 23
+      bytes=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -printf "%s\n" | awk "{sum+=\$1} END {print sum+0}")
+      open=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.open" -print | wc -l | tr -d "[:space:]")
+      sealed=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.seg" -print | wc -l | tr -d "[:space:]")
+      partial=$(find "$lane" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
+      links=$(find "$lane" -type l -print | wc -l | tr -d "[:space:]")
+      unsafe=$((identity_bad+invalid_days+unexpected_root+unexpected_deep+invalid_segments+nonfiles+links))
+      printf "{\"directoryId\":\"%s\",\"present\":true,\"files\":%s,\"bytes\":%s,\"openSegments\":%s,\"sealedSegments\":%s,\"partialFiles\":%s,\"unsafeEntries\":%s,\"segments\":[" \
+        "$directory_id" "$files" "$bytes" "$open" "$sealed" "$partial" "$unsafe"
+      first=true
+      find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | LC_ALL=C sort |
+        while IFS= read -r segment; do
+          relative=${segment#"$lane/"}; day=${relative%%/*}; name=${relative##*/}
+          [ "$relative" = "$day/$name" ] &&
+            printf "%s" "$relative" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}[.](open|seg)$" || exit 24
+          size=$(stat -c %s -- "$segment"); sha=$(sha256sum -- "$segment" | awk "{print \$1}")
+          kind=${name##*.}
+          $first || printf ","
+          first=false
+          printf "{\"path\":\"%s\",\"kind\":\"%s\",\"bytes\":%s,\"sha256\":\"%s\"}" \
+            "$relative" "$kind" "$size" "$sha"
+        done
+      printf "]}\n"
+    ' journal-lane-state "$directory_id" "$lane_uid"
     ;;
 
   journal-restart)
-    before=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files/.dailyfile-journal -type f 2>/dev/null | wc -l')
+    lane_uid=${1:-}
+    [[ $lane_uid =~ ^urn:osh:system:lane:[A-Za-z0-9._-]{1,200}$ ]] ||
+      fail 'Journal restart requires the canonical reserved-lane UID.'
+    safe_lane=$(printf '%s' "$lane_uid" | sed 's/[^A-Za-z0-9._-]/_/g')
+    if ((${#safe_lane} > 120)); then safe_lane=${safe_lane:0:120}; fi
+    lane_hash=$(printf '%s' "$lane_uid" | sha256sum | cut -c1-12)
+    directory_id="$safe_lane-$lane_hash"
+    restart_work=$(mktemp -d /tmp/oscar-regression-journal-restart.XXXXXXXX)
+    before_inventory=$restart_work/before.tsv
+    cleanup_journal_restart() { rm -rf -- "$restart_work"; }
+    trap cleanup_journal_restart EXIT
+    compose exec -T oscar sh -eu -c '
+      lane="/var/lib/oscar/files/.dailyfile-journal/segments/$1"
+      [ -d "$lane" ] && [ ! -L "$lane" ]
+      count=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | wc -l | tr -d "[:space:]")
+      [ "$count" -gt 0 ] && [ "$count" -le 512 ]
+      find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | LC_ALL=C sort |
+        while IFS= read -r segment; do
+          [ -f "$segment" ] && [ ! -L "$segment" ]
+          relative=${segment#"$lane/"}
+          printf "%s" "$relative" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}[.](open|seg)$"
+          size=$(stat -c %s -- "$segment"); [ "$size" -gt 0 ]
+          sha=$(sha256sum -- "$segment" | awk "{print \$1}")
+          printf "%s|%s|%s\n" "$relative" "$size" "$sha"
+        done
+    ' journal-restart-before "$directory_id" >"$before_inventory" ||
+      fail 'Could not capture the bounded pre-restart segment inventory.'
+    segments_before=$(wc -l <"$before_inventory" | tr -d '[:space:]')
+    [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 512 ]] ||
+      fail 'Pre-restart segment inventory is empty or exceeds its bound.'
     compose restart oscar >/dev/null
     deadline=$((SECONDS+180)); healthy=false
     while ((SECONDS < deadline)); do
@@ -949,10 +1711,50 @@ case $action in
       [[ $state == *healthy* ]] && { healthy=true; break; }
       sleep 2
     done
-    after=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files/.dailyfile-journal -type f 2>/dev/null | wc -l')
-    partial=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files -type f \( -name "*.partial" -o -name "*.tmp" \) 2>/dev/null | wc -l')
+    segments_preserved=0; segment_failures=0
+    while IFS='|' read -r relative before_bytes before_sha extra; do
+      [[ -z ${extra:-} && $relative =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}\.(open|seg)$ &&
+         $before_bytes =~ ^[1-9][0-9]*$ && $before_sha =~ ^[0-9a-f]{64}$ ]] ||
+        fail 'Pre-restart segment inventory is malformed.'
+      lane_root="/var/lib/oscar/files/.dailyfile-journal/segments/$directory_id"
+      preserved=false
+      if [[ $relative == *.seg ]]; then
+        result=$(compose exec -T oscar sh -eu -c '
+          candidate="$1/$2"; expected_bytes=$3; expected_sha=$4
+          [ -f "$candidate" ] && [ ! -L "$candidate" ]
+          [ "$(stat -c %s -- "$candidate")" = "$expected_bytes" ]
+          [ "$(sha256sum -- "$candidate" | awk "{print \$1}")" = "$expected_sha" ]
+          printf preserved
+        ' journal-restart-sealed "$lane_root" "$relative" "$before_bytes" "$before_sha" 2>/dev/null || true)
+        [[ $result == preserved ]] && preserved=true
+      else
+        sealed_relative=${relative%.open}.seg
+        result=$(compose exec -T oscar sh -eu -c '
+          root=$1; open=$2; sealed=$3; expected_bytes=$4; expected_sha=$5
+          matches=0; candidate=
+          for relative in "$open" "$sealed"; do
+            path="$root/$relative"
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              [ -f "$path" ] && [ ! -L "$path" ]; matches=$((matches+1)); candidate=$path
+            fi
+          done
+          [ "$matches" -eq 1 ]
+          size=$(stat -c %s -- "$candidate"); [ "$size" -ge "$expected_bytes" ]
+          prefix_sha=$(head -c "$expected_bytes" -- "$candidate" | sha256sum | awk "{print \$1}")
+          [ "$prefix_sha" = "$expected_sha" ]
+          printf preserved
+        ' journal-restart-open "$lane_root" "$relative" "$sealed_relative" "$before_bytes" "$before_sha" 2>/dev/null || true)
+        [[ $result == preserved ]] && preserved=true
+      fi
+      if $preserved; then segments_preserved=$((segments_preserved+1));
+      else segment_failures=$((segment_failures+1)); fi
+    done <"$before_inventory"
+    partial=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) 2>/dev/null | wc -l')
     recovery_errors=$(compose logs --since 5m oscar 2>&1 | grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' || true)
-    printf '{"healthy":%s,"journalFilesBefore":%s,"journalFilesAfter":%s,"partialFiles":%s,"recoveryErrors":%s}\n' "$healthy" "${before:-0}" "${after:-0}" "${partial:-0}" "$recovery_errors"
+    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s}\n' \
+      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors"
+    cleanup_journal_restart
+    trap - EXIT
     ;;
 
   fixture-create)
@@ -975,13 +1777,17 @@ case $action in
     function_name="oscar_regression_activation_fn_$suffix"
     holder_app="oscar_regression_holder_$suffix"
     lock_class=$((16#${suffix:0:6})); lock_object=$((16#${suffix:6:6}))
-    holder_log="/tmp/oscar-regression-activation-holder-$suffix.log"
+    race_work=$(mktemp -d "/tmp/oscar-regression-activation-$suffix.XXXXXXXX")
+    holder_log="$race_work/holder.log"
     holder_client=''; race_fixture_created=false; race_success=false
     cleanup_activation_race() {
       psql_admin --command "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='$holder_app' AND pid<>pg_backend_pid();" >/dev/null 2>&1 || true
       if [[ -n $holder_client ]]; then wait "$holder_client" >/dev/null 2>&1 || true; fi
       psql_admin --command "DROP TRIGGER IF EXISTS $trigger_name ON obs; DROP FUNCTION IF EXISTS $function_name();" >/dev/null 2>&1 || true
-      rm -f -- "$holder_log"
+      if [[ $race_success != true && -s $holder_log ]]; then
+        emit_command_diagnostics 'PostgreSQL activation barrier holder' "$holder_log"
+      fi
+      rm -rf -- "$race_work"
       if [[ $race_fixture_created == true && $race_success != true ]]; then
         psql_admin --command "WITH f AS (DELETE FROM oscar_regression_fixture WHERE run_id='$run' RETURNING cold_id,hot_id)
           DELETE FROM obs WHERE id IN (SELECT cold_id FROM f UNION ALL SELECT hot_id FROM f);" >/dev/null 2>&1 || true
@@ -1206,6 +2012,51 @@ case $action in
       "$wal_name" "$mismatch_rejected" "$helper_partials" "$final_removed"
     ;;
 
+  fixture-hot-hold-create)
+    run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
+    generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
+    valid_uuid "$generation" || fail 'Fixture has no archive generation.'
+    store_key=$(scalar "SELECT store_key FROM oscar_archive_generation WHERE id='$generation';")
+    id_scope=$(scalar "SELECT id_scope FROM oscar_archive_generation WHERE id='$generation';")
+    hot_id=$(scalar "SELECT hot_id FROM oscar_regression_fixture WHERE run_id='$run';")
+    valid_store_key "$store_key" && valid_id_scope "$id_scope" || fail 'Fixture has an invalid store identity.'
+    [[ $hot_id =~ ^[1-9][0-9]{0,18}$ ]] || fail 'Fixture has no valid hot observation ID.'
+    [[ $(scalar "SELECT count(*) FROM \"$store_key\" WHERE id=$hot_id;") == 1 ]] ||
+      fail 'Fixture hot observation is no longer present.'
+    hot_hold=''; keep_hot_hold=false
+    cleanup_hot_hold_create() {
+      if [[ $keep_hot_hold != true ]] && valid_uuid "$hot_hold"; then
+        sudo bash oscar.sh archive hold release --id "$hot_hold" --released-by oscar-regression-cleanup >/dev/null 2>&1 || true
+      fi
+    }
+    trap cleanup_hot_hold_create EXIT
+    hot_output=$(sudo bash oscar.sh archive hold create --store-key "$store_key" --id-scope "$id_scope" \
+      --observation "$hot_id" --reason "regression-hot-$run" --created-by oscar-regression)
+    hot_hold=$(retention_hold_id_from_output "$hot_output" "$store_key" "$id_scope" HOT_EXACT) ||
+      fail 'Hot observation hold did not return one canonical HOT_EXACT ID.'
+    [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$hot_hold' AND store_key='$store_key' AND id_scope=$id_scope AND subject_type='OBSERVATION' AND subject_id='$hot_id' AND resolution_mode='HOT_EXACT' AND reason='regression-hot-$run' AND created_by='oscar-regression' AND released_at IS NULL;") == 1 ]] ||
+      fail 'Created hot observation hold is not exact or active.'
+    hot_list=$(sudo bash oscar.sh archive hold list)
+    hot_listed=false
+    grep -Eq "^[[:space:]]*$hot_hold[[:space:]|]+$store_key[[:space:]|]+$id_scope[[:space:]|]+OBSERVATION[[:space:]|]+$hot_id[[:space:]|]+HOT_EXACT([[:space:]|]+|$)" <<<"$hot_list" && hot_listed=true
+    [[ $hot_listed == true ]] || fail 'Created HOT_EXACT hold is absent from the operator list.'
+    keep_hot_hold=true
+    trap - EXIT
+    printf '{"holdId":"%s","storeKey":"%s","idScope":%s,"hotId":"%s","resolution":"HOT_EXACT","listed":true}\n' \
+      "$hot_hold" "$store_key" "$id_scope" "$hot_id"
+    ;;
+
+  fixture-hot-hold-release)
+    run=${1:-}; hot_hold=${2:-}; valid_run "$run" || fail 'Invalid run ID.'
+    valid_uuid "$hot_hold" || fail 'Invalid hot-hold ID.'; ensure_fixture_table
+    exact=$(scalar "SELECT count(*) FROM oscar_retention_hold h JOIN oscar_regression_fixture f ON f.run_id='$run' JOIN oscar_archive_generation g ON g.id=f.generation_id WHERE h.id='$hot_hold' AND h.store_key=g.store_key AND h.id_scope=g.id_scope AND h.subject_type='OBSERVATION' AND h.subject_id=f.hot_id::text AND h.resolution_mode='HOT_EXACT' AND h.reason='regression-hot-$run' AND h.created_by='oscar-regression' AND h.released_at IS NULL;")
+    [[ $exact == 1 ]] || fail 'Hot hold does not match the registered disposable fixture.'
+    sudo bash oscar.sh archive hold release --id "$hot_hold" --released-by oscar-regression >/dev/null
+    released=false
+    [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$hot_hold' AND released_at IS NOT NULL AND released_by='oscar-regression';") == 1 ]] && released=true
+    printf '{"holdId":"%s","released":%s}\n' "$hot_hold" "$released"
+    ;;
+
   fixture-controls)
     run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
     generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
@@ -1217,15 +2068,18 @@ case $action in
     valid_store_key "$store_key" && valid_id_scope "$id_scope" ||
       fail 'Fixture archive generation has an invalid store identity.'
     [[ $cold_id =~ ^[1-9][0-9]{0,18}$ ]] || fail 'Fixture has no valid archived observation ID.'
+    cutoff=$(psql_admin --tuples-only --no-align --command "SELECT to_char(window_end+interval '1 second','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM oscar_archive_generation WHERE id='$generation';" | tr -d '[:space:]')
+    [[ $cutoff =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+      fail 'Fixture archive generation has no canonical deletion cutoff.'
     generation_hold=''; observation_hold=''
     cleanup_control_holds() {
       set +e
       for pending_hold in "$generation_hold" "$observation_hold"; do
-        [[ $pending_hold =~ ^[0-9a-fA-F-]{36}$ ]] || continue
+        valid_uuid "$pending_hold" || continue
         sudo bash oscar.sh archive hold release --id "$pending_hold" --released-by oscar-regression-cleanup >/dev/null 2>&1
       done
       while IFS= read -r pending_hold; do
-        [[ $pending_hold =~ ^[0-9a-fA-F-]{36}$ ]] || continue
+        valid_uuid "$pending_hold" || continue
         sudo bash oscar.sh archive hold release --id "$pending_hold" --released-by oscar-regression-cleanup >/dev/null 2>&1
       done < <(psql_admin --quiet --tuples-only --no-align --command "
         SELECT id::text FROM oscar_retention_hold
@@ -1239,25 +2093,52 @@ case $action in
     trap cleanup_control_holds EXIT
     hold_output=$(sudo bash oscar.sh archive hold create --store-key "$store_key" --id-scope "$id_scope" \
       --generation "$generation" --reason "regression-$run" --created-by oscar-regression)
-    hold=$(retention_hold_id_from_output "$hold_output" "$store_key" "$id_scope") ||
-      fail 'Hold create did not return one canonical scoped ID.'
+    hold=$(retention_hold_id_from_output "$hold_output" "$store_key" "$id_scope" GENERATION_EXACT) ||
+      fail 'Hold create did not return one canonical exact-generation ID.'
     generation_hold=$hold
-    [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$hold' AND released_at IS NULL;") == 1 ]] || fail 'Created hold is not listed.'
+    [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$hold' AND subject_type='ARCHIVE_GENERATION' AND resolution_mode='GENERATION_EXACT' AND released_at IS NULL;") == 1 ]] || fail 'Created exact-generation hold is not listed.'
+    generation_hold_listed=false
+    hold_list=$(sudo bash oscar.sh archive hold list)
+    grep -Eq "^[[:space:]]*$hold[[:space:]|]+$store_key[[:space:]|]+$id_scope[[:space:]|]+ARCHIVE_GENERATION[[:space:]|]+$generation[[:space:]|]+GENERATION_EXACT([[:space:]|]+|$)" <<<"$hold_list" &&
+      generation_hold_listed=true
+    generation_held_dry=$(sudo bash oscar.sh archive dry-run --store-key "$store_key" --id-scope "$id_scope" \
+      --before "$cutoff" --requested-by oscar-regression)
+    generation_held_plan=$(printf '%s' "$generation_held_dry" | sed -n 's/^Deletion plan: //p')
+    valid_uuid "$generation_held_plan" || fail 'Generation-held dry run did not return a plan.'
+    generation_hold_enforced=false
+    if [[ $(scalar "SELECT count(*) FROM oscar_deletion_plan_item WHERE plan_id='$generation_held_plan';") == 0 &&
+          $(scalar "SELECT hold_count FROM oscar_deletion_plan WHERE id='$generation_held_plan';") == 1 ]]; then
+      generation_hold_enforced=true
+    fi
+    psql_admin --command "DELETE FROM oscar_deletion_plan WHERE id='$generation_held_plan' AND state='PLANNED';" >/dev/null
     sudo bash oscar.sh archive hold release --id "$hold" --released-by oscar-regression >/dev/null
     [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$hold' AND released_at IS NOT NULL;") == 1 ]] || fail 'Hold was not released.'
     generation_hold=''
     observation_hold_output=$(sudo bash oscar.sh archive hold create --store-key "$store_key" --id-scope "$id_scope" \
       --observation "$cold_id" --reason "regression-observation-$run" --created-by oscar-regression)
-    observation_hold=$(retention_hold_id_from_output "$observation_hold_output" "$store_key" "$id_scope") ||
-      fail 'Observation hold create did not return one canonical scoped ID.'
-    [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$observation_hold' AND subject_type='OBSERVATION' AND subject_id='$cold_id' AND released_at IS NULL;") == 1 ]] ||
+    observation_hold=$(retention_hold_id_from_output "$observation_hold_output" "$store_key" "$id_scope" COLD_RANGE_CONSERVATIVE) ||
+      fail 'Observation hold create did not return one canonical conservative cold-range ID.'
+    [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$observation_hold' AND subject_type='OBSERVATION' AND subject_id='$cold_id' AND resolution_mode='COLD_RANGE_CONSERVATIVE' AND released_at IS NULL;") == 1 ]] ||
       fail 'Created observation hold is not listed.'
+    observation_hold_listed=false
+    hold_list=$(sudo bash oscar.sh archive hold list)
+    grep -Eq "^[[:space:]]*$observation_hold[[:space:]|]+$store_key[[:space:]|]+$id_scope[[:space:]|]+OBSERVATION[[:space:]|]+$cold_id[[:space:]|]+COLD_RANGE_CONSERVATIVE([[:space:]|]+|$)" <<<"$hold_list" &&
+      observation_hold_listed=true
+    observation_held_dry=$(sudo bash oscar.sh archive dry-run --store-key "$store_key" --id-scope "$id_scope" \
+      --before "$cutoff" --requested-by oscar-regression)
+    observation_held_plan=$(printf '%s' "$observation_held_dry" | sed -n 's/^Deletion plan: //p')
+    valid_uuid "$observation_held_plan" || fail 'Observation-held dry run did not return a plan.'
+    observation_hold_enforced=false
+    if [[ $(scalar "SELECT count(*) FROM oscar_deletion_plan_item WHERE plan_id='$observation_held_plan';") == 0 &&
+          $(scalar "SELECT hold_count FROM oscar_deletion_plan WHERE id='$observation_held_plan';") == 1 ]]; then
+      observation_hold_enforced=true
+    fi
+    psql_admin --command "DELETE FROM oscar_deletion_plan WHERE id='$observation_held_plan' AND state='PLANNED';" >/dev/null
     sudo bash oscar.sh archive hold release --id "$observation_hold" --released-by oscar-regression >/dev/null
     [[ $(scalar "SELECT count(*) FROM oscar_retention_hold WHERE id='$observation_hold' AND released_at IS NOT NULL;") == 1 ]] ||
       fail 'Observation hold was not released.'
     observation_hold=''
     trap - EXIT
-    cutoff=$(psql_admin --tuples-only --no-align --command "SELECT to_char(window_end+interval '1 second','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM oscar_archive_generation WHERE id='$generation';" | tr -d '[:space:]')
     dry=$(sudo bash oscar.sh archive dry-run --store-key "$store_key" --id-scope "$id_scope" \
       --before "$cutoff" --requested-by oscar-regression)
     plan=$(printf '%s' "$dry" | sed -n 's/^Deletion plan: //p'); token=$(printf '%s' "$dry" | sed -n 's/^Confirmation token (shown once): //p')
@@ -1278,7 +2159,11 @@ case $action in
     sudo bash oscar.sh archive purge --store-key "$store_key" --id-scope "$id_scope" \
       --plan "$plan" --token "$token" >/dev/null 2>&1 || replay_rejected=true
     json_query "SELECT json_build_object('holdCreated',true,'holdListed',true,'holdReleased',true,
-      'generationHoldCreated',true,'observationHoldCreated',true,'dryRunPlan','$plan',
+      'generationHoldCreated',true,'generationHoldResolution','GENERATION_EXACT',
+      'generationHoldListed',$generation_hold_listed,'generationHoldEnforced',$generation_hold_enforced,
+      'observationHoldCreated',true,'observationHoldResolution','COLD_RANGE_CONSERVATIVE',
+      'observationHoldListed',$observation_hold_listed,'coldObservationHoldEnforced',$observation_hold_enforced,
+      'dryRunPlan','$plan',
       'wrongTokenRejected',true,'purged',g.state='PURGED','objectsDeleted',NOT EXISTS(SELECT 1 FROM oscar_archive_object o WHERE o.generation_id=g.id AND o.state<>'DELETED'),
       'tombstonePresent',EXISTS(SELECT 1 FROM oscar_tombstone t WHERE t.generation_id=g.id),
       'ledgerPresent',EXISTS(SELECT 1 FROM oscar_deletion_ledger l WHERE l.plan_id='$plan' AND l.outcome='DELETED'),
@@ -1286,6 +2171,71 @@ case $action in
     ;;
 
   backup-check)
+    (($# > 0 && $# <= 8)) ||
+      fail 'Backup certification requires one to eight exact retained-media set expectations.'
+    backup_work=$(mktemp -d /tmp/oscar-regression-backup-check.XXXXXXXX)
+    cleanup_backup_check() { rm -rf -- "$backup_work"; }
+    trap cleanup_backup_check EXIT
+    expected_inventory=$backup_work/expected-retained-members.txt
+    : >"$expected_inventory"
+    expected_sets=0
+    for retained_record in "$@"; do
+      IFS='.' read -r event_token lane_token camera_token \
+        frame_1_sha frame_1_bytes frame_2_sha frame_2_bytes frame_3_sha frame_3_bytes \
+        frame_4_sha frame_4_bytes frame_5_sha frame_5_bytes extra <<<"$retained_record"
+      [[ -z ${extra:-} ]] && valid_media_token "$event_token" && valid_media_token "$lane_token" &&
+        valid_media_token "$camera_token" || fail 'Retained-media backup expectation has an invalid identity.'
+      frame_shas=("$frame_1_sha" "$frame_2_sha" "$frame_3_sha" "$frame_4_sha" "$frame_5_sha")
+      frame_bytes=("$frame_1_bytes" "$frame_2_bytes" "$frame_3_bytes" "$frame_4_bytes" "$frame_5_bytes")
+      base="files/videos/retained-media/v1/events/$event_token/lanes/$lane_token/cameras/$camera_token"
+      append_live_backup_member "$expected_inventory" M "$base/manifest.json"
+      for frame_index in 0 1 2 3 4; do
+        [[ ${frame_shas[$frame_index]} =~ ^[0-9a-f]{64}$ &&
+           ${frame_bytes[$frame_index]} =~ ^[1-9][0-9]*$ ]] ||
+          fail 'Retained-media backup expectation has an invalid frame hash or size.'
+        frame_name=$(printf 'frame-%02d.jpg' "$((frame_index+1))")
+        append_live_backup_member "$expected_inventory" J "$base/$frame_name" \
+          "${frame_shas[$frame_index]}" "${frame_bytes[$frame_index]}"
+      done
+      expected_sets=$((expected_sets+1))
+    done
+    metadata_paths=$(compose exec -T oscar sh -eu -c '
+      root=/var/lib/oscar/files/videos/retained-media/v1
+      checkpoint=$root/.metadata-reclamation-checkpoint.json
+      [ -f "$checkpoint" ] && [ ! -L "$checkpoint" ]
+      printf "%s\\n" "$checkpoint"
+      find "$root/retention-processed-index" -mindepth 1 -maxdepth 1 -type f -name "*.idx" -print
+      if [ -d "$root/deletion-index" ] && [ ! -L "$root/deletion-index" ]; then
+        find "$root/deletion-index" -mindepth 2 -maxdepth 2 -type f -name "*.idx" -print
+      fi
+    ' retained-backup-metadata) || fail 'Required retained-media checkpoint/index metadata is missing or unsafe.'
+    processed_expected=0
+    deletion_expected=0
+    while IFS= read -r metadata_path; do
+      [[ -n $metadata_path && $metadata_path == /var/lib/oscar/files/videos/retained-media/v1/* ]] ||
+        fail 'Retained-media metadata inventory escaped its expected root.'
+      metadata_member=${metadata_path#/var/lib/oscar/}
+      case $metadata_member in
+        files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json)
+          append_live_backup_member "$expected_inventory" C "$metadata_member"
+          ;;
+        files/videos/retained-media/v1/retention-processed-index/*.idx)
+          [[ ${metadata_member##*/} =~ ^[0-9]{19}-(0[0-9]|1[01])[.]idx$ ]] ||
+            fail 'Retained-media processed index has a noncanonical name.'
+          append_live_backup_member "$expected_inventory" P "$metadata_member"
+          processed_expected=$((processed_expected+1))
+          ;;
+        files/videos/retained-media/v1/deletion-index/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f][0-9a-f].idx)
+          append_live_backup_member "$expected_inventory" D "$metadata_member"
+          deletion_expected=$((deletion_expected+1))
+          ;;
+        *) fail 'Retained-media metadata inventory contains an unexpected path.' ;;
+      esac
+    done <<<"$metadata_paths"
+    ((processed_expected > 0)) || fail 'Backup certification requires at least one processed-observation index.'
+    expected_member_count=$(wc -l <"$expected_inventory" | tr -d '[:space:]')
+    [[ $expected_member_count == $((expected_sets * 6 + 1 + processed_expected + deletion_expected)) ]] ||
+      fail 'Retained backup expectation inventory has an inconsistent exact member count.'
     output=$(sudo bash oscar.sh backup)
     backup=$(printf '%s' "$output" | sed -n 's#^Backup created: .*/##p' | tail -n1)
     [[ $backup =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]] || fail 'Backup command did not return a backup ID.'
@@ -1293,10 +2243,23 @@ case $action in
     retention=$(env_value OSCAR_BACKUP_RETENTION_COUNT 14)
     verified=$(find "$backup_dir" -mindepth 2 -maxdepth 2 -type f -name VERIFIED | wc -l)
     root=$backup_dir/$backup
-    for required in VERIFIED JOURNAL_CONFIRMED SHA256SUMS SHA256SUMS.hmac epoch.json image-inventory.txt archive-generation-ids.txt; do
+    for required in VERIFIED JOURNAL_CONFIRMED SHA256SUMS SHA256SUMS.hmac epoch.json image-inventory.txt; do
       [[ -f $root/$required && ! -L $root/$required && -s $root/$required ]] ||
         fail "Backup marker is missing, empty, linked, or non-regular: $required"
     done
+    [[ -f $root/archive-generation-ids.txt && ! -L $root/archive-generation-ids.txt ]] ||
+      fail 'Archive-generation inventory is missing, linked, or non-regular.'
+    backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
+    app_image=''
+    while IFS= read -r candidate_image; do
+      case $candidate_image in
+        oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
+      esac
+    done < <(compose config --images)
+    [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file ]] ||
+      fail 'Cannot independently authenticate the backup core.'
+    [[ $(verify_backup_core_authentication "$root" "$backup_key_file" "$app_image") == verified ]] ||
+      fail 'Independent backup HMAC/checksum/inventory verification failed.'
     hmac=$(tr -d '\r\n' <"$root/SHA256SUMS.hmac")
     [[ $hmac =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail 'Backup HMAC marker is malformed.'
     verified_at=$(tr -d '\r\n' <"$root/VERIFIED")
@@ -1308,9 +2271,11 @@ case $action in
     epoch_version=$(awk -F'[: ,]+' '/"version"/ {print $3; exit}' "$root/epoch.json")
     epoch_release=$(awk -F'"' '/"oscarVersion"/ {print $4; exit}' "$root/epoch.json")
     epoch_state=$(awk -F'"' '/"state"/ {print $4; exit}' "$root/epoch.json")
+    epoch_created=$(awk -F'"' '/"createdAt"/ {print $4; exit}' "$root/epoch.json")
     valid_uuid "$epoch_id" || fail 'Backup epoch UUID is invalid.'
     [[ $epoch_backup == "$backup" && $epoch_format == oscar-backup-epoch && $epoch_version == 1 &&
-          $epoch_release == 3.9.2 && $epoch_state == CREATED ]] ||
+          $epoch_release == 3.9.2 && $epoch_state == CREATED &&
+          $epoch_created =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
       fail 'Backup epoch identity, format, state, or release is invalid.'
     oscar_state_sha=$(awk '$2=="./oscar-state.tar.gz" {print $1}' "$root/SHA256SUMS")
     [[ $oscar_state_sha =~ ^[0-9a-f]{64}$ ]] || fail 'Authenticated manifest has no unique OSCAR state checksum.'
@@ -1318,23 +2283,29 @@ case $action in
       fail 'Authenticated manifest must contain exactly one OSCAR state entry.'
     [[ $(awk '$2=="./archive-generation-ids.txt" {count++} END {print count+0}' "$root/SHA256SUMS") == 1 ]] ||
       fail 'Authenticated manifest must contain exactly one archive-generation inventory.'
-    generation_bytes=$(wc -c <"$root/archive-generation-ids.txt" | tr -d '[:space:]')
+    generation_bytes=$(stat -c %s -- "$root/archive-generation-ids.txt")
     [[ $generation_bytes =~ ^[0-9]+$ && $generation_bytes -le 37000000 ]] ||
       fail 'Archive-generation inventory exceeds its 37,000,000-byte safety bound.'
     if [[ $generation_bytes -gt 0 ]]; then
       [[ $(tail -c 1 "$root/archive-generation-ids.txt" | od -An -t x1 | tr -d '[:space:]') == 0a ]] ||
         fail 'Archive-generation inventory is not canonically newline terminated.'
     fi
-    generation_count=$(wc -l <"$root/archive-generation-ids.txt" | tr -d '[:space:]')
-    [[ $generation_count =~ ^[0-9]+$ && $generation_count -le 1000000 ]] ||
-      fail 'Archive-generation inventory exceeds its one-million-entry safety bound.'
-    if grep -Evq '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
-        "$root/archive-generation-ids.txt"; then
-      fail 'Archive-generation inventory contains a noncanonical UUID.'
-    fi
-    LC_ALL=C sort -c -u "$root/archive-generation-ids.txt" >/dev/null 2>&1 ||
-      fail 'Archive-generation inventory is unsorted or contains duplicates.'
-    inventory_generation_ids=$(paste -sd, "$root/archive-generation-ids.txt")
+    generation_count=0
+    generation_previous=''
+    while IFS= read -r generation_id || [[ -n $generation_id ]]; do
+      generation_count=$((generation_count+1))
+      [[ $generation_count -le 1000000 &&
+         $generation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+        fail 'Archive-generation inventory contains a noncanonical UUID.'
+      [[ -z $generation_previous || $generation_id > $generation_previous ]] ||
+        fail 'Archive-generation inventory is unsorted or contains duplicates.'
+      generation_previous=$generation_id
+    done <"$root/archive-generation-ids.txt"
+    [[ $generation_bytes == $((generation_count * 37)) ]] ||
+      fail 'Archive-generation inventory has noncanonical fixed-width LF framing.'
+    generation_sha=$(sha256_file "$root/archive-generation-ids.txt")
+    [[ $generation_sha =~ ^[0-9a-f]{64}$ ]] ||
+      fail 'Archive-generation inventory SHA-256 is invalid.'
     [[ $(awk '$2=="./JOURNAL_CONFIRMED" {count++} END {print count+0}' "$root/SHA256SUMS") == 0 ]] ||
       fail 'Post-verification journal confirmation must remain outside the authenticated core inventory.'
     [[ $(wc -l <"$root/JOURNAL_CONFIRMED" | tr -d '[:space:]') == 5 &&
@@ -1344,8 +2315,6 @@ case $action in
           $(grep -Fxc "oscar_state_sha256=$oscar_state_sha" "$root/JOURNAL_CONFIRMED") == 1 &&
           $(grep -Ec '^hmac_sha256=[A-Za-z0-9+/]{43}=$' "$root/JOURNAL_CONFIRMED") == 1 ]] ||
       fail 'Journal-confirmation audit sidecar does not match the accepted recovery point.'
-    backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
-    app_image=$(compose config --images | grep -E '^oscar:[^[:space:]]+$' | head -n1)
     [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file ]] ||
       fail 'Cannot authenticate the journal-confirmation audit sidecar.'
     sidecar_expected=$(sed -n 's/^hmac_sha256=//p' "$root/JOURNAL_CONFIRMED")
@@ -1359,20 +2328,54 @@ case $action in
       ' | tr -d '\r\n')
     [[ $sidecar_actual == "$sidecar_expected" ]] ||
       fail 'Journal-confirmation audit sidecar HMAC is invalid.'
-    sudo bash oscar.sh backup-verify "$backup" >/tmp/oscar-regression-backup-verify.log 2>&1
+    backup_verify_log=$backup_work/backup-verify.log
+    if ! sudo bash oscar.sh backup-verify "$backup" >"$backup_verify_log" 2>&1; then
+      emit_command_diagnostics 'OSCAR backup verification' "$backup_verify_log"
+      fail 'Supported backup verification rejected the newly created backup.'
+    fi
+    catalog_inventory=$backup_work/catalog-generation-ids.txt
+    psql_admin --quiet --tuples-only --no-align --command "
+      SELECT id::text FROM oscar_archive_generation
+      WHERE state IN ('ACTIVE','SEALED') AND activated_at <= '$epoch_created'::timestamptz
+      ORDER BY id;" >"$catalog_inventory"
+    cmp -s "$root/archive-generation-ids.txt" "$catalog_inventory" ||
+      fail 'Authenticated archive-generation inventory differs from the captured catalog epoch.'
     epoch=$(scalar "SELECT count(*) FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND manifest_path='$backup/epoch.json';")
-    catalog_generation_ids=$(scalar "SELECT coalesce(array_to_string(archive_generation_ids,','),'') FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND manifest_path='$backup/epoch.json';")
-    [[ $epoch == 1 && $catalog_generation_ids == "$inventory_generation_ids" ]] ||
-      fail 'VERIFIED catalog epoch does not exactly match the authenticated backup-time archive-generation inventory.'
+    catalog_generation_receipt=$(scalar "SELECT archive_generation_count||'|'||archive_generation_inventory_sha256||'|'||archive_generation_inventory_bytes FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND manifest_path='$backup/epoch.json';")
+    [[ $epoch == 1 && $catalog_generation_receipt == "$generation_count|$generation_sha|$generation_bytes" ]] ||
+      fail 'VERIFIED catalog epoch does not exactly match the authenticated backup-time archive-generation receipt.'
     backup_reference="oscar-backup:$backup/oscar-state.tar.gz#sha256=$oscar_state_sha"
-    receipt_count=0; invalid_receipts=0
-    receipt_root=/var/lib/oscar/files/.dailyfile-journal/backup-confirmations
-    confirmation_set=$receipt_root/.sets/$backup.json
-    compose exec -T oscar sh -c 'test -f "$1" && test ! -L "$1"' marker-check "$confirmation_set" ||
-      fail 'Atomic daily-journal confirmation-set marker is missing or unsafe.'
-    set_encoded=$(compose exec -T oscar openssl base64 -A -in "$confirmation_set" | tr -d '\r\n')
-    [[ $set_encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#set_encoded} -le 89478488 ]] ||
-      fail 'Daily-journal confirmation-set marker exceeds the 64 MiB decoded safety bound.'
+    state_listing=$backup_work/state-listing.txt
+    tar -tzf "$root/oscar-state.tar.gz" >"$state_listing"
+    member_count=$(wc -l <"$state_listing" | tr -d '[:space:]')
+    [[ $member_count =~ ^[0-9]+$ && $member_count -le 200000 ]] ||
+      fail 'OSCAR state backup member inventory exceeds its 200,000-entry safety bound.'
+    if grep -Eq '(^/|(^|/)[.][.](/|$))' "$state_listing"; then
+      fail 'OSCAR state backup contains an absolute or traversal member.'
+    fi
+    receipt_count=0; invalid_receipts=0; receipt_segments_verified=0
+    receipt_root=files/.dailyfile-journal/backup-confirmations
+    confirmation_set_member="$receipt_root/.sets/$backup.json"
+    confirmation_set_lookup=$(awk -v expected="$confirmation_set_member" '
+      { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
+        if (normalized==expected) { count++; raw=$0 } }
+      END { printf "%d|%s", count+0, raw }
+    ' "$state_listing")
+    IFS='|' read -r confirmation_set_matches confirmation_set_raw <<<"$confirmation_set_lookup"
+    [[ $confirmation_set_matches == 1 && -n $confirmation_set_raw ]] ||
+      fail 'Authenticated state tar must contain exactly one current daily-journal confirmation set.'
+    confirmation_set_verbose=$(tar -tvzf "$root/oscar-state.tar.gz" -- "$confirmation_set_raw")
+    [[ $(printf '%s\n' "$confirmation_set_verbose" | wc -l | tr -d '[:space:]') == 1 &&
+       ${confirmation_set_verbose:0:1} == - ]] ||
+      fail 'Daily-journal confirmation set in authenticated state tar is not a regular file.'
+    confirmation_set_file=$backup_work/confirmation-set.json
+    tar -xOf "$root/oscar-state.tar.gz" -- "$confirmation_set_raw" >"$confirmation_set_file"
+    set_bytes=$(file_size "$confirmation_set_file")
+    [[ $set_bytes =~ ^[1-9][0-9]*$ && $set_bytes -le 786432 ]] ||
+      fail 'Daily-journal confirmation-set marker exceeds its 768 KiB decoded safety bound.'
+    set_encoded=$(openssl base64 -A -in "$confirmation_set_file" | tr -d '\r\n')
+    [[ $set_encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#set_encoded} -le 1048576 ]] ||
+      fail 'Daily-journal confirmation-set marker has invalid bounded base64.'
     set_valid=$(scalar "WITH source AS (
         SELECT convert_from(decode('$set_encoded','base64'),'UTF8') AS text),
       doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source),
@@ -1387,6 +2390,7 @@ case $action in
         AND value->>'confirmationSet'='$backup'
         AND jsonb_typeof(value->'receiptCount')='number'
         AND (value->>'receiptCount')::bigint=(SELECT count(*) FROM receipts)
+        AND (SELECT count(*) FROM receipts)=(SELECT count(DISTINCT receipt->>'path') FROM receipts)
         AND (value->>'receiptCount')::bigint>0
         AND jsonb_typeof(value->'committedAt')='string'
         AND value->>'committedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
@@ -1398,14 +2402,39 @@ case $action in
           OR receipt->>'sha256' !~ '^[0-9a-f]{64}$')
       FROM doc;")
     [[ $set_valid == t ]] || fail 'Atomic daily-journal confirmation-set marker is invalid.'
-    while IFS= read -r receipt; do
-      [[ -n $receipt ]] || continue
-      [[ $receipt =~ ^/var/lib/oscar/files/\.dailyfile-journal/backup-confirmations/[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}\.json$ ]] ||
-        fail 'Daily-journal receipt path is outside the exact receipt layout.'
-      receipt_day=${receipt##*/}; receipt_day=${receipt_day%.json}
-      encoded=$(compose exec -T oscar openssl base64 -A -in "$receipt" | tr -d '\r\n')
+    receipt_set_rows=$backup_work/receipt-set-rows.txt
+    psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "WITH doc AS (
+        SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
+      SELECT receipt->>'path',receipt->>'sha256' FROM doc,
+        LATERAL jsonb_array_elements(value->'receipts') receipt ORDER BY receipt->>'path';" >"$receipt_set_rows"
+    while IFS='|' read -r receipt_relative receipt_expected_sha receipt_extra; do
+      [[ -z ${receipt_extra:-} &&
+         $receipt_relative =~ ^[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}[.]json$ &&
+         $receipt_expected_sha =~ ^[0-9a-f]{64}$ ]] ||
+        fail 'Authenticated daily-journal receipt identity is outside the exact receipt layout.'
+      receipt_day=${receipt_relative##*/}; receipt_day=${receipt_day%.json}
+      receipt_member="$receipt_root/$receipt_relative"
+      receipt_lookup=$(awk -v expected="$receipt_member" '
+        { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
+          if (normalized==expected) { count++; raw=$0 } }
+        END { printf "%d|%s", count+0, raw }
+      ' "$state_listing")
+      IFS='|' read -r receipt_matches receipt_raw <<<"$receipt_lookup"
+      [[ $receipt_matches == 1 && -n $receipt_raw ]] || {
+        invalid_receipts=$((invalid_receipts+1)); continue; }
+      receipt_verbose=$(tar -tvzf "$root/oscar-state.tar.gz" -- "$receipt_raw")
+      [[ $(printf '%s\n' "$receipt_verbose" | wc -l | tr -d '[:space:]') == 1 &&
+         ${receipt_verbose:0:1} == - ]] || {
+        invalid_receipts=$((invalid_receipts+1)); continue; }
+      receipt_file=$backup_work/receipt-$receipt_count.json
+      tar -xOf "$root/oscar-state.tar.gz" -- "$receipt_raw" >"$receipt_file"
+      receipt_bytes=$(file_size "$receipt_file")
+      [[ $receipt_bytes =~ ^[1-9][0-9]*$ && $receipt_bytes -le 786432 &&
+         $(sha256_file "$receipt_file") == "$receipt_expected_sha" ]] || {
+        invalid_receipts=$((invalid_receipts+1)); continue; }
+      encoded=$(openssl base64 -A -in "$receipt_file" | tr -d '\r\n')
       [[ $encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#encoded} -le 1048576 ]] ||
-        fail 'Daily-journal receipt could not be represented as bounded base64.'
+        fail 'Authenticated daily-journal receipt could not be represented as bounded base64.'
       receipt_reference=$(scalar "WITH doc AS (
         SELECT convert_from(decode('$encoded','base64'),'UTF8')::jsonb AS value)
         SELECT coalesce(value->>'backupReference','') FROM doc;")
@@ -1451,23 +2480,64 @@ case $action in
           AND jsonb_typeof(value->'confirmedAt')='string'
           AND value->>'confirmedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
         FROM doc;")
-      relative=${receipt#"$receipt_root"/}
-      receipt_sha=$(compose exec -T oscar sha256sum "$receipt" | awk '{print $1}')
+      relative=$receipt_relative
+      receipt_sha=$(sha256_file "$receipt_file")
       membership=$(scalar "WITH doc AS (
           SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
         SELECT count(*)=1 FROM doc, LATERAL jsonb_array_elements(value->'receipts') receipt
         WHERE receipt->>'path'='$relative' AND receipt->>'sha256'='$receipt_sha';")
       [[ $receipt_valid == t && $membership == t ]] || invalid_receipts=$((invalid_receipts+1))
-    done < <(compose exec -T oscar find "$receipt_root" -path "$receipt_root/.sets" -prune -o \
-      -mindepth 2 -maxdepth 2 -type f -name '*.json' -print 2>/dev/null || true)
+      receipt_rows=$backup_work/receipt-segments-$receipt_count.txt
+      psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "WITH doc AS (
+          SELECT convert_from(decode('$encoded','base64'),'UTF8')::jsonb AS value)
+        SELECT value->>'laneId',segment->>'name',segment->>'byteCount',segment->>'sha256'
+        FROM doc,LATERAL jsonb_array_elements(value->'sealedSegments') segment
+        ORDER BY segment->>'name';" >"$receipt_rows.with-lane"
+      receipt_lane=''; : >"$receipt_rows"
+      while IFS='|' read -r lane_id segment_name segment_bytes segment_sha segment_extra; do
+        [[ -z ${segment_extra:-} && $lane_id =~ ^urn:osh:system:lane:[A-Za-z0-9._-]{1,200}$ ]] || {
+          invalid_receipts=$((invalid_receipts+1)); continue; }
+        [[ -z $receipt_lane || $receipt_lane == "$lane_id" ]] || invalid_receipts=$((invalid_receipts+1))
+        receipt_lane=$lane_id
+        printf '%s|%s|%s\n' "$segment_name" "$segment_bytes" "$segment_sha" >>"$receipt_rows"
+      done <"$receipt_rows.with-lane"
+      safe_lane=$(printf '%s' "$receipt_lane" | sed 's/[^A-Za-z0-9._-]/_/g')
+      if ((${#safe_lane} > 120)); then safe_lane=${safe_lane:0:120}; fi
+      receipt_directory="$safe_lane-$(printf '%s' "$receipt_lane" | sha256sum | cut -c1-12)"
+      verified_segments=$(verify_daily_receipt_backup_members "$root/oscar-state.tar.gz" \
+        "$state_listing" "$receipt_directory" "$receipt_day" "$receipt_rows" "$backup_work" || true)
+      if [[ $verified_segments =~ ^[1-9][0-9]*$ ]]; then
+        receipt_segments_verified=$((receipt_segments_verified+verified_segments))
+      else invalid_receipts=$((invalid_receipts+1)); fi
+    done <"$receipt_set_rows"
     set_count=$(scalar "WITH doc AS (
         SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
       SELECT (value->>'receiptCount')::bigint FROM doc;")
     [[ $set_count == "$receipt_count" ]] || invalid_receipts=$((invalid_receipts+1))
     [[ $receipt_count =~ ^[0-9]+$ && $receipt_count -gt 0 && $invalid_receipts == 0 ]] ||
       fail 'New backup did not produce valid, authenticated daily-journal receipts.'
-    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"restoreAttempted":false}\n' \
-      "$backup" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)"
+    duck_scratch_excluded=true
+    grep -Eq '^([.]/)?duckdb-tmp(/|$)' "$state_listing" && duck_scratch_excluded=false
+    retained_prefix=false
+    grep -Eq '^([.]/)?files/videos/retained-media/v1(/|$)' "$state_listing" && retained_prefix=true
+    checkpoint_included=false
+    grep -Eq '^([.]/)?files/videos/retained-media/v1/[.]metadata-reclamation-checkpoint[.]json$' "$state_listing" && checkpoint_included=true
+    processed_indexes=$(grep -Ec '^([.]/)?files/videos/retained-media/v1/retention-processed-index/[0-9]{19}-(0[0-9]|1[01])[.]idx$' "$state_listing" || true)
+    deletion_indexes=$(grep -Ec '^([.]/)?files/videos/retained-media/v1/deletion-index/[0-9a-f]{2}/[0-9a-f]{4}[.]idx$' "$state_listing" || true)
+    retained_manifests=$(grep -Ec '^([.]/)?files/videos/retained-media/v1/events/.+/manifest[.]json$' "$state_listing" || true)
+    retained_jpegs=$(grep -Ec '^([.]/)?files/videos/retained-media/v1/events/.+/frame-0[1-5][.]jpg$' "$state_listing" || true)
+    exact_retained_members=$(verify_retained_backup_members \
+      "$root/oscar-state.tar.gz" "$expected_inventory" "$backup_work")
+    [[ $exact_retained_members == "$expected_member_count" &&
+       $processed_indexes == "$processed_expected" && $deletion_indexes == "$deletion_expected" ]] ||
+      fail 'Backup did not preserve the complete exact retained-media expectation inventory.'
+    cleanup_backup_check
+    trap - EXIT
+    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
+      "$backup" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)" \
+      "$duck_scratch_excluded" "$retained_prefix" "$checkpoint_included" "$processed_indexes" \
+      "$deletion_indexes" "$retained_manifests" "$retained_jpegs" "$expected_sets" \
+      "$expected_member_count" "$exact_retained_members" "$processed_expected" "$deletion_expected" "$member_count"
     ;;
 
   restore-drill)
@@ -1498,7 +2568,9 @@ case $action in
     tls_canary="$release_dir/tls/.restore-regression-$run.canary"
     env_canary="# OSCAR_RESTORE_DRILL_CANARY=$marker"
     env_mutated="# OSCAR_RESTORE_DRILL_CANARY=$mutated"
-    wal_baseline=$(mktemp "/tmp/oscar-restore-wal-$run.XXXXXX")
+    restore_work=$(mktemp -d "/tmp/oscar-regression-restore-$run.XXXXXXXX")
+    wal_baseline=$restore_work/source-wal.sha256
+    : >"$wal_baseline"
     compose exec -T oscar sh -eu -c 'test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"' \
       canary "$state_relative" || fail 'An application-state restore-drill canary already exists.'
     [[ ! -e $archive_canary && ! -L $archive_canary && ! -e $secret_canary &&
@@ -1518,7 +2590,7 @@ case $action in
         compose exec -T oscar sh -c "rm -f -- '/var/lib/oscar/$state_relative'; rmdir /var/lib/oscar/files/.restore-regression 2>/dev/null || true" >/dev/null 2>&1
       fi
       rm -f -- "$archive_canary" "$secret_canary" "$tls_canary"
-      rm -f -- "$wal_baseline"
+      rm -rf -- "$restore_work"
       sed -i "/^# OSCAR_RESTORE_DRILL_CANARY=$run:/d" .env 2>/dev/null
       set -e
     }
@@ -1571,7 +2643,23 @@ case $action in
     backup_output=$(sudo bash oscar.sh backup)
     backup=$(printf '%s' "$backup_output" | sed -n 's#^Backup created: .*/##p' | tail -n1)
     [[ $backup =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]] || fail 'Restore drill could not create a backup.'
-    sudo bash oscar.sh backup-verify "$backup" >/tmp/oscar-regression-restore-backup-verify.log 2>&1
+    backup_root=$backup_dir/$backup
+    backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
+    app_image=''
+    while IFS= read -r candidate_image; do
+      case $candidate_image in
+        oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
+      esac
+    done < <(compose config --images)
+    [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file &&
+       $(verify_backup_core_authentication "$backup_root" "$backup_key_file" "$app_image") == verified ]] ||
+      fail 'Restore drill backup failed independent core authentication.'
+    authenticated_backup_reverified=true
+    restore_backup_verify_log=$restore_work/backup-verify.log
+    if ! sudo bash oscar.sh backup-verify "$backup" >"$restore_backup_verify_log" 2>&1; then
+      emit_command_diagnostics 'OSCAR restore-drill backup verification' "$restore_backup_verify_log"
+      fail 'Restore drill refused a backup that failed supported verification.'
+    fi
 
     psql_admin --command "UPDATE oscar_regression_fixture SET restore_marker='$mutated' WHERE run_id='$run';" >/dev/null
     future_segment=$(scalar 'SELECT pg_walfile_name(pg_switch_wal());')
@@ -1593,8 +2681,15 @@ case $action in
     printf '%s\n' "$mutated" >"$tls_canary"
     sed -i "s|^# OSCAR_RESTORE_DRILL_CANARY=$marker$|$env_mutated|" .env
     grep -Fqx "$env_mutated" .env || fail 'Could not mutate the restore-drill deployment canary.'
+    expected_safety_inventory=$restore_work/pre-restore-expected.tsv
+    credential_tree_inventory "$release_dir" "$expected_safety_inventory" ||
+      fail 'Could not capture the exact mutated credential tree before restore.'
 
-    sudo bash oscar.sh restore --backup "$backup" --confirm "$backup" >/tmp/oscar-regression-restore.log 2>&1
+    restore_log=$restore_work/restore.log
+    if ! sudo bash oscar.sh restore --backup "$backup" --confirm "$backup" >"$restore_log" 2>&1; then
+      emit_command_diagnostics 'OSCAR destructive restore' "$restore_log"
+      fail 'OSCAR restore command failed.'
+    fi
     database_restored=false
     [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run' AND restore_marker='$marker';") == 1 ]] && database_restored=true
     state_restored=false
@@ -1612,7 +2707,12 @@ case $action in
         services_healthy=false
     done
     archive_verified=false
-    sudo bash oscar.sh archive verify >/tmp/oscar-regression-restore-archive-verify.log 2>&1 && archive_verified=true
+    restore_archive_verify_log=$restore_work/archive-verify.log
+    if sudo bash oscar.sh archive verify >"$restore_archive_verify_log" 2>&1; then
+      archive_verified=true
+    else
+      emit_command_diagnostics 'Post-restore archive verification' "$restore_archive_verify_log"
+    fi
     restored_timeline=$(scalar "SELECT timeline_id FROM pg_control_checkpoint();")
     fresh_timeline=false
     restored_prefix=''
@@ -1668,35 +2768,88 @@ case $action in
     epoch_id=$(awk -F'"' '/"backupEpochId"/ {print $4; exit}' "$backup_dir/$backup/epoch.json")
     epoch_lsn=$(awk -F'"' '/"postgresLsn"/ {print $4; exit}' "$backup_dir/$backup/epoch.json")
     epoch_sha=$(sha256_file "$backup_dir/$backup/epoch.json")
+    restored_generation_inventory=$backup_dir/$backup/archive-generation-ids.txt
+    [[ -f $restored_generation_inventory && ! -L $restored_generation_inventory ]] ||
+      fail 'Restored backup archive-generation inventory is missing or unsafe.'
+    restored_generation_bytes=$(stat -c %s -- "$restored_generation_inventory")
+    [[ $restored_generation_bytes =~ ^[0-9]+$ && $restored_generation_bytes -le 37000000 ]] ||
+      fail 'Restored archive-generation inventory exceeds its byte bound.'
+    if [[ $restored_generation_bytes -gt 0 ]]; then
+      [[ $(tail -c 1 "$restored_generation_inventory" | od -An -t x1 | tr -d '[:space:]') == 0a ]] ||
+        fail 'Restored archive-generation inventory is not LF terminated.'
+    fi
+    restored_generation_count=0
+    restored_generation_previous=''
+    while IFS= read -r restored_generation_id || [[ -n $restored_generation_id ]]; do
+      restored_generation_count=$((restored_generation_count+1))
+      [[ $restored_generation_count -le 1000000 &&
+         $restored_generation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+        fail 'Restored archive-generation inventory is noncanonical or exceeds its entry bound.'
+      [[ -z $restored_generation_previous || $restored_generation_id > $restored_generation_previous ]] ||
+        fail 'Restored archive-generation inventory is unsorted or contains duplicates.'
+      restored_generation_previous=$restored_generation_id
+    done <"$restored_generation_inventory"
+    [[ $restored_generation_bytes == $((restored_generation_count * 37)) ]] ||
+      fail 'Restored archive-generation inventory has noncanonical fixed-width LF framing.'
+    restored_generation_sha=$(sha256_file "$restored_generation_inventory")
+    [[ $restored_generation_sha =~ ^[0-9a-f]{64}$ ]] ||
+      fail 'Restored archive-generation inventory SHA-256 is invalid.'
     valid_uuid "$epoch_id" && [[ $epoch_lsn =~ ^[0-9A-F]+/[0-9A-F]+$ && $epoch_sha =~ ^[0-9a-f]{64}$ ]] ||
       fail 'Restored backup has invalid authenticated epoch fields.'
     verified_epoch_restored=false
-    [[ $(scalar "SELECT count(*) FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND postgres_lsn='$epoch_lsn' AND manifest_path='$backup/epoch.json' AND sha256='$epoch_sha' AND verified_at IS NOT NULL;") == 1 ]] &&
+    [[ $(scalar "SELECT count(*) FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND postgres_lsn='$epoch_lsn' AND archive_generation_count=$restored_generation_count AND archive_generation_inventory_sha256='$restored_generation_sha' AND archive_generation_inventory_bytes=$restored_generation_bytes AND manifest_path='$backup/epoch.json' AND sha256='$epoch_sha' AND verified_at IS NOT NULL;") == 1 ]] &&
       verified_epoch_restored=true
     safety="$release_dir/pre-restore-$backup"
-    [[ -d $safety && ! -L $safety && $(stat -c '%a' -- "$safety") == 700 &&
+    [[ -d $safety && ! -L $safety && $(stat -c '%u:%g:%a' -- "$safety") == 0:0:700 &&
           -f $safety/.env && ! -L $safety/.env &&
           -d $safety/secrets && ! -L $safety/secrets &&
           -d $safety/tls && ! -L $safety/tls ]] ||
       fail 'Restore did not preserve a private, complete pre-restore credential safety directory.'
+    actual_safety_inventory=$restore_work/pre-restore-actual.tsv
+    pre_restore_safety_copy_verified=false
+    if credential_tree_inventory "$safety" "$actual_safety_inventory" &&
+       cmp -s "$expected_safety_inventory" "$actual_safety_inventory" &&
+       [[ $(cat -- "$safety/secrets/.restore-regression-$run.canary") == "$mutated" &&
+          $(cat -- "$safety/tls/.restore-regression-$run.canary") == "$mutated" &&
+          $(grep -Fxc "$env_mutated" "$safety/.env") == 1 ]]; then
+      pre_restore_safety_copy_verified=true
+    fi
     all_restored=false
     if $database_restored && $state_restored && $archive_restored && $wal_restored &&
        $credentials_restored && $services_healthy && $archive_verified && $fresh_timeline &&
        $timeline_history_archived && $new_timeline_wal_archived && $prior_wal_preserved &&
        $post_backup_wal_preserved &&
-       $archiver_failure_free && $recovery_settings_cleared && $verified_epoch_restored; then all_restored=true; fi
-    printf '{"backupId":"%s","databaseRestored":%s,"applicationStateRestored":%s,"archiveRestored":%s,"walRestored":%s,"credentialsRestored":%s,"servicesHealthy":%s,"archiveVerified":%s,"freshTimeline":%s,"sourceTimeline":%s,"restoredTimeline":%s,"timelineHistoryArchived":%s,"newTimelineWalArchived":%s,"priorWalPreserved":%s,"postBackupWalPreserved":%s,"archiverFailureFree":%s,"recoverySettingsCleared":%s,"verifiedEpochRestored":%s,"allCanariesRestored":%s,"preRestoreSafetyDirectory":"%s"}\n' \
-      "$backup" "$database_restored" "$state_restored" "$archive_restored" "$wal_restored" \
+       $archiver_failure_free && $recovery_settings_cleared && $verified_epoch_restored &&
+       $pre_restore_safety_copy_verified; then all_restored=true; fi
+    printf '{"backupId":"%s","authenticatedBackupReverified":%s,"databaseRestored":%s,"applicationStateRestored":%s,"archiveRestored":%s,"walRestored":%s,"credentialsRestored":%s,"servicesHealthy":%s,"archiveVerified":%s,"freshTimeline":%s,"sourceTimeline":%s,"restoredTimeline":%s,"timelineHistoryArchived":%s,"newTimelineWalArchived":%s,"priorWalPreserved":%s,"postBackupWalPreserved":%s,"archiverFailureFree":%s,"recoverySettingsCleared":%s,"verifiedEpochRestored":%s,"allCanariesRestored":%s,"preRestoreSafetyCopyVerified":%s,"preRestoreSafetyDirectory":"%s"}\n' \
+      "$backup" "$authenticated_backup_reverified" "$database_restored" "$state_restored" "$archive_restored" "$wal_restored" \
       "$credentials_restored" "$services_healthy" "$archive_verified" "$fresh_timeline" \
       "$source_timeline" "$restored_timeline" "$timeline_history_archived" "$new_timeline_wal_archived" \
       "$prior_wal_preserved" "$post_backup_wal_preserved" "$archiver_failure_free" "$recovery_settings_cleared" \
-      "$verified_epoch_restored" "$all_restored" "$safety"
+      "$verified_epoch_restored" "$all_restored" "$pre_restore_safety_copy_verified" "$safety"
     cleanup_restore_drill
     trap - EXIT
     ;;
 
   fixture-cleanup)
     run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
+    while IFS= read -r fixture_hold; do
+      [[ -n $fixture_hold ]] || continue
+      valid_uuid "$fixture_hold" || fail 'Fixture cleanup found a malformed regression hold ID.'
+      sudo bash oscar.sh archive hold release --id "$fixture_hold" --released-by oscar-regression-cleanup >/dev/null
+    done < <(psql_admin --quiet --tuples-only --no-align --command "
+      SELECT h.id::text FROM oscar_retention_hold h
+      JOIN oscar_regression_fixture f ON f.run_id='$run'
+      LEFT JOIN oscar_archive_generation g ON g.id=f.generation_id
+      WHERE h.released_at IS NULL AND h.created_by='oscar-regression'
+        AND h.store_key=g.store_key AND h.id_scope=g.id_scope
+        AND ((h.subject_type='ARCHIVE_GENERATION' AND h.subject_id=f.generation_id::text
+              AND h.reason='regression-$run')
+          OR (h.subject_type='OBSERVATION' AND h.subject_id=f.cold_id::text
+              AND h.reason='regression-observation-$run')
+          OR (h.subject_type='OBSERVATION' AND h.subject_id=f.hot_id::text
+              AND h.reason='regression-hot-$run'))
+      ORDER BY h.id;")
     # Only registered hot/cold rows are touched. Catalog evidence from a purged
     # generation is deliberately retained for auditability.
     deleted=$(scalar "WITH f AS (DELETE FROM oscar_regression_fixture WHERE run_id='$run' RETURNING cold_id,hot_id),

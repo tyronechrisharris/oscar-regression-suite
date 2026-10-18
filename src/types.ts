@@ -1,10 +1,14 @@
 import type {LaneConfigOracle} from "./lane-config.js";
 
-export type Profile = "smoke" | "full" | "restore-drill";
+export type Profile = "smoke" | "full" | "3.9.2-release" | "restore-drill";
 
 export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type ResultStatus = "correct" | "incorrect" | "skipped";
+
+export const OSCAR_COMPOSE_SERVICES = ["gateway", "oscar", "postgres"] as const;
+
+export type OscarComposeService = typeof OSCAR_COMPOSE_SERVICES[number];
 
 export interface SuiteConfig {
   profile: Profile;
@@ -48,6 +52,7 @@ export interface SuiteConfig {
   restoreWalArchiveDirectory?: string;
   restoreBackupDirectory?: string;
   oscarReleaseDirectory?: string;
+  releaseRestoreEvidenceDirectory?: string;
   storageRetainedEventId?: string;
   storageLegacyEventId?: string;
   storageEventNodeId?: string;
@@ -90,6 +95,11 @@ export interface MetricSample {
   phase: string;
   source: "oscar-container" | "oscar-host" | "test-runner" | "test-runner-host";
   target: string;
+  composeService: OscarComposeService | null;
+  containerId: string | null;
+  containerState: string | null;
+  containerHealth: string | null;
+  containerStatsAvailable: boolean | null;
   cpuPercent: number | null;
   memoryUsedBytes: number | null;
   memoryLimitBytes: number | null;
@@ -131,6 +141,15 @@ export interface StorageMetricSample {
   journalBytes: number | null;
   dailyFileBytes: number | null;
   retainedMediaBytes: number | null;
+  retainedMediaManifestFiles: number | null;
+  retainedMediaJpegFiles: number | null;
+  processedObservationIndexFiles: number | null;
+  processedObservationIndexBytes: number | null;
+  deletionIndexFiles: number | null;
+  deletionIndexBytes: number | null;
+  legacyProcessedMarkerFiles: number | null;
+  legacyDeletionTombstones: number | null;
+  mediaMetadataCheckpointBytes: number | null;
   backupBytes: number | null;
   note: string;
 }
@@ -177,11 +196,24 @@ export interface RunMetadata {
   storageExpectedRelease: "3.9.2";
   storageBackupWorkflow: CapabilityMode;
   oscarReleaseDirectory?: string;
+  releaseRestoreEvidenceDirectory?: string;
+  releaseRestoreEvidenceRunId?: string;
+  releaseRestoreEvidenceBackupId?: string;
   storageRetainedEventId?: string;
   storageLegacyEventId?: string;
   storageEventNodeId?: string;
   reservedRpmConfigSha256?: string;
   remoteMetricsExpected: boolean;
+  restoreDrillCertification?: RestoreDrillCertification;
+}
+
+export interface RestoreDrillCertification {
+  schemaVersion: 1;
+  backupId: string;
+  authenticatedBackupReverified: true;
+  allCanariesRestored: true;
+  immutableImageIdentityPreserved: true;
+  preRestoreSafetyCopyVerified: true;
 }
 
 export interface RpmConfig {

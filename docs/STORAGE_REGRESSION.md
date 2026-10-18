@@ -7,11 +7,16 @@ external archive/WAL/backup paths dedicated to that deployment.
 
 ## Profiles and interlocks
 
-`storage-health` is the read-only smoke scenario. It checks data checksums,
-`pg_stat_statements`, storage schema v4, the initialization marker, JDBC batch
-rewrite, journal configuration, archive catalog health and object hashes,
-daily-file publication state, retained JPEGs, Viewer gallery/fallback behavior,
-and a point-in-time storage/resource snapshot.
+`storage-health` is non-destructive but not strictly read-only: its atomic-
+publisher proof creates and removes private temporary data, so the host-wide
+remote suite lease covers the whole invocation. It checks data checksums,
+`pg_stat_statements`, storage schema v5 with checksum
+`sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`,
+the initialization marker, JDBC batch rewrite, exact journal and bounded DuckDB
+configuration, archive catalog health and object hashes, daily-file publication
+state, retained JPEG/metadata health, Viewer gallery/fallback behavior, and a
+point-in-time storage/resource snapshot. The same exact v5/checksum gate runs
+before and after the isolated restore drill.
 Generation counts/rows and object bytes are aggregated in separate catalog CTEs
 so a generation with multiple objects cannot multiply its row/count totals;
 incomplete-object failures are counted once per affected active/sealed generation.
@@ -73,6 +78,37 @@ missing mount, wrong ownership/mode/cap, changed
 mount option, extra Java process, or overridden effective property rejects the
 release identity before the lifecycle creates any fixture.
 
+The persisted live config must be the regular, non-symlink
+`/var/lib/oscar/config.json` and no larger than 16 MiB. Structural JSON extraction
+requires exactly one expected daily-file, OSCAR, and system-database module and
+rejects decoys, duplicate modules, duplicate selected/nested keys, and JSON type
+mismatches. No line-oriented text match may supply a value. `useBatch=true` is
+necessary but not sufficient: `pg_stat_statements` must show a multi-values
+`obs` INSERT with affected rows greater than calls, proving effective runtime
+batch rewriting. The gate requires the
+archive resource policy exactly: 256 MiB DuckDB memory, two threads, 4,096 MiB
+maximum spill, at most two process-wide concurrent sessions with a 30-second
+admission timeout, and `/var/lib/oscar/duckdb-tmp`. That scratch root may be absent
+before first use; once used it must be a real archive-disjoint directory owned
+by UID/GID 10001, mode `0700`, with no remaining per-operation entries. The
+full lifecycle checks it after export, parity, cold query/count, and hot-delete
+work. A backup must exclude `duckdb-tmp` entirely.
+
+The suite gates the persisted two-session/30-second admission controls but does
+not intentionally hold native queries open for 30 seconds to saturate them.
+Fair-wait, timeout, and permit-recovery timing remain product integration tests;
+the release E2E gate proves exact configuration and that completed operations
+leave no scratch directories behind.
+
+The exact daily-file production profile is `rootDirectory=files`,
+`journalDirectory=.dailyfile-journal`, `publicationDirectory=dailyfiles`, UTC,
+`dailyFileObservationMode=LATEST`, `fsyncIntervalMillis=1000`,
+`maxUnforcedRecords=128`, `maxUnforcedBytes=1048576`,
+`maxSegmentBytes=67108864`, `maxSegmentAgeSeconds=900`,
+`maxRecordBytes=4194304`, and `sealedJournalRetentionDays=30`. The OSCAR service
+must also set `delegateObservationLifecycleToDatabase=true` and
+`dailyFilePurgeWorkLimit=50`.
+
 A locally built/offline-loaded image may legitimately have no repository digest;
 its immutable image ID and required OCI labels remain the gate. Set `auto` only
 for an explicit legacy run with no storage target configured; it is not the
@@ -82,9 +118,18 @@ for an explicit legacy run with no storage target configured; it is not the
 OSCAR/emulator acknowledgements, it requires:
 
 ```text
+OSCAR_SSH_TARGET=<user@ssh-host>
 OSCAR_RELEASE_DIR=/absolute/path/to/disposable/release
-OSCAR_STORAGE_TARGET_ACK=<OSCAR_BASE_URL host>:<OSCAR_RELEASE_DIR>:DISPOSABLE-STORAGE
+OSCAR_STORAGE_TARGET_ACK=<viewer-host>|<user@ssh-host>|<remotely-canonical-release-dir>|DISPOSABLE-STORAGE
 ```
+
+This exact binding applies to every storage probe, including smoke/non-lifecycle
+`storage-health`, not only the mutating lifecycle. Before any remote mutation or
+probe upload, the runner resolves the release directory on the named SSH target
+and refuses a missing, root, symlinked, or non-canonical path, or a missing,
+linked, or non-regular `oscar.sh`. The exact Viewer host, SSH target, and
+canonical release path are rechecked before every probe action. Probe files and
+command captures use a fresh mode-0700 private workspace with mode-0600 files.
 
 The target must use the regression-only accelerated archive profile:
 `intervalMinutes=1`, `rollbackGraceDays=1`, `deleteHotAfterArchive=true`, while
@@ -101,7 +146,8 @@ existing OSCAR service `videoRetentionConfig` before OSCAR starts:
   "enableFrameRetention": true,
   "frameRetentionCount": 5,
   "jpegQuality": 85,
-  "sourceRollbackGraceHours": 24
+  "sourceRollbackGraceHours": 24,
+  "metadataReclamationWorkLimit": 200
 }
 ```
 
@@ -109,7 +155,7 @@ This is regression-only acceleration: zero days makes alarms from the current
 run eligible on the next one-minute query, while 24 hours keeps each exact source
 MP4 available for the end-of-run ownership/decodability oracle. Preserve all
 other `videoRetentionConfig` fields. Full-profile preflight reads the persisted live
-config and requires all six values before retained-media polling or cold-fixture
+config and requires all seven values before retained-media polling or cold-fixture
 creation, so a normal seven-day deployment fails early instead of timing out.
 Do not change the packaged default; use `timeToRetention=7` in production.
 The platform preflight also requires the archive purge helper to read from
@@ -137,8 +183,25 @@ to a fresh, disposable database and must never run against a production store.
 
 It verifies a self-contained export,
 accelerates only that registered generation's grace timestamp, proves the cold
-row remains API-queryable alongside the hot row, and then tests hold
-create/list/release plus dry-run/token purge. Before purge it queries the frozen
+row remains API-queryable alongside the hot row, and tests all live hold
+resolutions. A generation hold must resolve to `GENERATION_EXACT`; an archived
+observation hold must resolve to `COLD_RANGE_CONSERVATIVE`; and the still-hot
+control row must resolve to `HOT_EXACT`. The generation and cold-observation
+holds must each be visible in the operator list and cause a deletion dry run to
+report one held generation with zero plan items. While `HOT_EXACT` is active,
+an authenticated observation DELETE must fail and a GET must still succeed;
+after release the same DELETE must succeed and GET must return 404. The CLI is
+never allowed to create `LEGACY_UNKNOWN`. Schema v5 retains that fourth value
+only for observation holds migrated from pre-v5 catalogs; migrated generation
+holds must be normalized to `GENERATION_EXACT`.
+
+This live lifecycle runs the required accelerated archive-enabled profile. It
+does not rewrite/restart the target into an archive-disabled profile merely to
+repeat `HOT_EXACT` deletion enforcement; that separate configuration is covered
+by product integration tests and remains an environment-specific E2E acceptance
+item if a release policy requires it.
+
+It then tests hold release plus dry-run/token purge. Before purge it queries the frozen
 plan and aborts/deletes that plan unless exactly one item exists and it is the
 registered fixture generation. A wrong token must leave the plan unchanged;
 the valid one must leave object deletion states, ledger entries, and a
@@ -159,6 +222,18 @@ archive rows.
 
 Daily publication is a rotation boundary behavior. Keep the canonical 50-lane
 fixture running across a local-midnight boundary before a 3.9.2 release gate.
+The smoke check bounds the publication/journal inventory to 100,000 entries,
+rejects links and every `.partial*`/`.tmp*` spelling, and requires every regular
+flat `{lane-suffix}-{12-hex-full-UID-hash}_{UTC-date}.csv` to have an exact
+12-key v1 `OSCAR_LEGACY_DAILY_CSV` manifest no larger than 1 MiB.
+Lane/window/UTC/filename/timestamp fields and current SHA-256, byte, and record
+counts must agree. The lifecycle also toggles the reserved emulator RPM,
+derives the journal directory from the full canonical lane UID, and requires
+that lane's direct `{lane-directory}/{UTC-date}/{six-digit}.open|seg` bytes to
+advance. Those bytes and safe layout
+must survive the OSCAR restart. This is evidence of direct live journal capture,
+not a renamed or fabricated publication.
+
 The smoke check requires published CSV/manifest pairs and no partial artifacts;
 archive health also rejects `*.partial`, `*.partial.*`, `*.tmp`, and `*.tmp.*`
 artifacts anywhere below the external archive or WAL roots. The full run restarts
@@ -166,7 +241,7 @@ OSCAR and rejects recovery errors or partial publications, then repeats the
 archive/WAL partial scan after helper, export, and purge coverage.
 Do not fabricate or rename production daily files for this test.
 
-For smoke/read-only validation, provide `STORAGE_RETAINED_EVENT_ID` for an alarm
+For smoke/non-lifecycle validation, provide `STORAGE_RETAINED_EVENT_ID` for an alarm
 already reduced to the new format. An unfiltered full run does not need a
 pre-existing retained event: its early storage-health pass explicitly defers
 this one proof, generates exact alarm UUIDs, and runs the same gallery proof
@@ -180,9 +255,9 @@ the response must remain within the Viewer's per-frame and event-wide byte/pixel
 budgets. The oracle performs a bounded linear marker/segment parse and rejects
 progressive, lossless, arithmetic, multi-scan, malformed-length, truncated, and
 trailing-data payloads. It then fetches and decodes every frame independently in
-Chromium and requires decoded dimensions to match the authenticated manifest;
-component coverage also proves catalog and frame bodies stop at their streaming
-byte limits. The Viewer must render five choices per camera, initially request only
+Chromium and requires decoded dimensions to match the authenticated manifest.
+The network reader aborts before buffering beyond the 4 MiB catalog cap or the
+manifest-declared per-frame cap. The Viewer must render five choices per camera, initially request only
 one selected frame per camera through its shared concurrency limiter, and fetch
 another frame only after the operator selects it. The browser probe delays frame
 responses to measure at most three requests in flight, then requires the newly
@@ -224,10 +299,28 @@ partials present before the run therefore do not falsely fail the gate. The
 marker is removed after comparison and through the validated privileged failure
 cleanup path.
 
+The metadata health probe separately validates
+`retained-media/v1/.metadata-reclamation-checkpoint.json` as schema 2, bounded
+regular JSON. Processed-observation indexes use exactly
+`retention-processed-index/{19-digit-UTC-epoch-hour}-{00..11}.idx`; the twelve
+deterministic five-minute shards keep reclamation work hour-based while bounding
+each cache snapshot. Deletion indexes use
+`deletion-index/{first-two-hex}/{first-four-hex}.idx`. Both formats require their
+16-byte OSCAR header and 36-byte fixed records. The gate rejects malformed
+names/headers/sizes, links, partials, legacy per-event processed JSON, and legacy
+`.deleted.json` tombstones. A required lifecycle never treats an empty media
+state as certification: it must have either generated retained media or an
+explicit `STORAGE_RETAINED_EVENT_ID` that completed the exact API/JPEG/gallery
+proof before mutation. That proof makes checkpoint, processed-index, manifest,
+and five-JPEG population mandatory. These counts and bytes are written to
+`storage-performance.csv`.
+
 ## Backup and performance
 
 The backup check creates a coordinated backup and then invokes the supported
-`backup-verify` command again. It requires regular, non-symlink `VERIFIED`,
+`backup-verify` command again. Independently, it recomputes `SHA256SUMS.hmac`
+with the configured backup key, verifies every listed checksum, and rejects
+unlisted, duplicate, linked, or special payloads. It requires regular, non-symlink `VERIFIED`,
 `JOURNAL_CONFIRMED`, `SHA256SUMS`, `SHA256SUMS.hmac`, `epoch.json`,
 `image-inventory.txt`, and `archive-generation-ids.txt` files. The immutable backup core is authenticated by
 `SHA256SUMS.hmac`; `JOURNAL_CONFIRMED` is deliberately excluded from that core
@@ -237,14 +330,31 @@ authenticated OSCAR-state checksum. The check requires both HMACs to verify;
 an exact backup ID, UUID, `oscar-backup-epoch` v1/`CREATED` identity and 3.9.2
 release; a bounded, canonically sorted, duplicate-free backup-time archive-generation
 UUID inventory covered exactly once by the authenticated manifest; the matching
-live VERIFIED catalog epoch with exact array equality to that inventory; and count retention. It also
+live VERIFIED catalog epoch with exact generation count, lowercase SHA-256, and
+byte-count receipt for that inventory (without loading or embedding its UUIDs in
+SQL), plus exact equality with the captured active/sealed catalog inventory; and
+count retention. It extracts the confirmation set and referenced receipts from
+the authenticated state tar, not the mutable live tree, and
 requires at least one daily-journal confirmation receipt bound to the new backup
 ID and authenticated `oscar-state.tar.gz` SHA-256, with a non-empty sealed-segment
-inventory. Receipts authorize deletion only when their relative path and SHA-256
+inventory. Each recorded segment must be exactly one regular tar member at the
+derived lane/day path with identical size and SHA-256, with no extra `.open` or
+`.seg` member for that receipt. Receipts authorize deletion only when their relative path and SHA-256
 are members of the backup's atomically published confirmation-set marker; partial
 receipt writes without that marker fail closed. This means an overnight
 publication/rotation fixture is a prerequisite for the complete gate. The
-lifecycle check explicitly does not restore. Set
+lifecycle also inventories the authenticated `oscar-state.tar.gz`: it rejects
+absolute/traversal members, caps the listing, proves DuckDB scratch is excluded,
+and requires the exact retained-media checkpoint, every live processed index,
+every live deletion index, and each proved event/lane/camera manifest plus
+`frame-01.jpg` through `frame-05.jpg` to appear exactly once as regular tar
+members. It verifies every expected path, type, byte length, and SHA-256 against
+the pre-backup snapshot. An equal aggregate count for another event cannot
+pass; missing, duplicate, linked, wrong-type, wrong-size, or changed members are
+rejected.
+Those retained-media files are therefore included in the authenticated
+application-state backup rather than treated as disposable cache. The lifecycle
+check explicitly does not restore. Set
 `STORAGE_BACKUP_WORKFLOW=disabled` only when backup duration/capacity is outside
 the current run; do not call that a complete 3.9.2 storage release gate.
 
@@ -268,7 +378,8 @@ OSCAR_RESTORE_PATHS_ACK=<archive>|<wal-archive>|<backup>|DEDICATED-RESTORE-PATHS
 ```
 
 Then, and only then, run `npm run test:restore-drill`. The profile accepts no
-ordinary scenario and uses a separate local target/release lock. Before mutation
+ordinary scenario and uses both a local target/release lock and the host-wide
+remote suite lease. Before mutation
 it requires the exact 3.9.2 image/marker gate. The target-side helper creates
 unique pre-backup canaries in PostgreSQL, OSCAR application state, the external
 cold archive, `.env`, secrets, and TLS, plus real switched WAL fingerprints before
@@ -282,10 +393,34 @@ post-start archiver failure, cleanup of the
 one-time recovery settings/signals, exact reconstruction of the authenticated
 `VERIFIED` epoch receipt, healthy app/PostGIS/gateway containers, archive verification,
 and unchanged immutable running image IDs after restore. Scoped canaries are
-removed after verification. The verified drill backup and OSCAR's mode-0700
-`pre-restore-ID` safety directory remain intentionally. The latter contains
+removed after verification. The verified drill backup and OSCAR's root-owned
+mode-0700 `pre-restore-ID` safety directory remain intentionally. Its `.env`,
+`secrets/`, and `tls/` tree must preserve every exact mutated relative name,
+content/size/hash, owner, group, and mode with no link or special entry. It contains
 plaintext pre-restore `.env`, secrets, and TLS material; record and restrict it,
 then remove it under the disposable site's approved retention policy.
+
+## Strict 3.9.2 release certification
+
+Preserve the complete PASS directory from an unfiltered destructive drill. For
+the same candidate, set all operational-view, event-UUID, Alarm Transfer camera,
+storage, and backup workflows to `required`; set the exact `OSCAR_BUILD_LABEL`;
+set `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` to that directory; and run
+`npm run test:3.9.2-release` without `--scenario`.
+
+This profile refuses filters and requires the full suite. The evidence must be a
+schema-2 restore-drill PASS with zero incorrect/skipped checks, matching suite
+commit, build label, Viewer URL, and release directory, and a complete
+attestation for independent backup reverification, all canaries, unchanged
+immutable images, and the exact pre-restore safety copy. Missing or mismatched
+evidence fails before mutation.
+
+The Linux SSH/Docker path described above is the automated 3.9.2 gate in this
+suite. Native Windows Docker Desktop plus PowerShell (`oscar.bat`) storage and
+restore acceptance is deliberately deferred: do not infer a Windows pass from
+Linux execution, Bash syntax tests, or static inspection of PowerShell. Record a
+separate Windows-native transcript when that acceptance environment is
+available.
 
 If restore fails after services stop, do not improvise deletion. Preserve the
 probe logs in `/tmp`, the backup, and any `pre-restore-ID` directory; use the

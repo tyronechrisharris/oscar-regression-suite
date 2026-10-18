@@ -6,6 +6,8 @@
 - OSCAR is not production and does not control physical RPM hardware
 - reserved RPM/lane is free of another automated or manual test
 - operators understand permanent event/adjudication records will be created
+- every mutating run can acquire the root-owned host-wide remote suite lease;
+  no other runner holds it and no manual operator is changing the target
 
 ## Identity
 
@@ -19,9 +21,14 @@
 - ALARM_TRANSFER_CAMERA_WORKFLOW is `required` when camera scanning is part of
   the Viewer release contract
 - build labels identify both OSCAR and emulator revisions
+- persisted storage config resolves structurally to exactly one expected
+  daily-file, OSCAR, and database module with no duplicate/decoy/type ambiguity;
+  `useBatch=true` is backed by multi-values `obs` execution evidence
 - OSCAR 3.9.2 storage release gates identify the absolute release directory,
   use a disposable database and dedicated storage paths, and set the exact
-  `<host>:<release-dir>:DISPOSABLE-STORAGE` acknowledgement
+  `<viewer-host>|<ssh-target>|<remotely-canonical-release>|DISPOSABLE-STORAGE`
+  acknowledgement; every storage probe remotely rejects a missing, root,
+  non-canonical, or symlinked release and rechecks the binding before each action
 - OSCAR 3.9.2 release identity resolves exactly `oscar:3.9.2`,
   `oscar-postgis:3.9.2`, and the pinned gateway; running IDs match local image
   IDs; application/PostGIS OCI labels, checksum marker, and the archive,
@@ -34,6 +41,12 @@
   PostgreSQL uses the exact helper-backed `archive_command` and the WAL helper's
   flushed-temp atomic no-replace hard-link contract; archive and WAL roots
   contain no partial artifacts
+- schema version is exactly 5 with checksum
+  `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`;
+  DuckDB is fixed at 256 MiB/two threads/4,096 MiB spill/two concurrent sessions/
+  30-second admission timeout and its private
+  archive-disjoint scratch is empty; the direct-daily-file config matches the
+  documented production values
 
 ## Runner
 
@@ -78,30 +91,48 @@
 - no second runner/operator is controlling that RPM
 - storage lifecycle uses one-minute archive cadence/one-day grace only on the
   disposable target; an overnight rotation produced daily CSV/manifest pairs;
-  smoke/read-only uses a reviewed retained-media event ID, while a full run may
+  smoke/non-lifecycle uses a reviewed retained-media event ID, while a full run may
   self-seed that proof from its exact generated alarm UUIDs; a legacy-media event
-  ID is optional compatibility coverage; backup capacity is adequate
+  ID is optional compatibility coverage; lifecycle-only refuses to mutate until
+  the configured retained event completes the exact proof, and required
+  lifecycle certification never passes with zero proved sets; backup capacity
+  is adequate
 - the persisted live OSCAR service, not only a packaged template, uses the
   regression-only media profile `timeToRetention=0`, `videoQueryPeriod=1`,
   `enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
-  `sourceRollbackGraceHours=24`;
+  `sourceRollbackGraceHours=24`, with `metadataReclamationWorkLimit=200`;
   other media settings are preserved and the packaged production default remains
   seven days
 - the disposable lifecycle's controlled stale-activation race, exact-row retry,
   packaged CLI export/purge archive-helper wiring and invocation, and synthetic WAL helper
   idempotency/mismatch checks all completed and cleaned their temporary state
-- both generation and archived-observation retention holds were created, listed,
-  released, and left no active fixture hold before tokenized purge
+- `GENERATION_EXACT` and `COLD_RANGE_CONSERVATIVE` holds were created, listed,
+  excluded the fixture generation from dry-run plans, and released; `HOT_EXACT`
+  rejected authenticated deletion until release; no active fixture hold remains
+  before tokenized purge. `LEGACY_UNKNOWN` is accepted only as migration history
+  on a pre-v5 observation hold and is never new CLI output
 - retained fixtures expose five quality-85 baseline JPEGs per camera and every
   frame passes both the bounded parser and Chromium decode at declared dimensions
-- backup acceptance includes regular `VERIFIED`, `JOURNAL_CONFIRMED`, `SHA256SUMS`,
+- the schema-2 media checkpoint and `%019d-%02d.idx` (00..11) processed indexes
+  pass exact header/36-byte-record checks with no legacy markers or tombstones;
+  a real reserved-lane transition advances direct journal bytes and those bytes
+  survive restart
+- backup acceptance independently recomputes the core HMAC with the backup key,
+  verifies every checksum and exact no-link payload inventory, and also includes regular `VERIFIED`, `JOURNAL_CONFIRMED`, `SHA256SUMS`,
   `SHA256SUMS.hmac`, `epoch.json`, `image-inventory.txt`, and
   `archive-generation-ids.txt`; the journal-confirmation v2 sidecar is deliberately
   outside `SHA256SUMS`, verifies under its own HMAC, and binds the exact backup ID plus
   OSCAR-state checksum; the canonical bounded generation inventory is covered exactly
-  once and exactly equals the VERIFIED catalog epoch's UUID array; supported
+  once and its count, lowercase SHA-256, and byte length exactly equal the VERIFIED
+  catalog epoch's compact receipt without embedding UUIDs in SQL; supported
   `backup-verify`; and at least one daily-journal receipt belongs by exact relative
-  path and SHA-256 to the atomically published confirmation-set marker for the new backup
+  path and SHA-256 to the atomically published confirmation-set marker for the new backup,
+  and every receipt segment is one exact regular authenticated-tar member with
+  matching bytes/SHA-256 and no extra `.open`/`.seg` sibling;
+  DuckDB scratch is excluded; the exact checkpoint, every pre-backup processed
+  and deletion index, and every proved event/lane/camera manifest plus
+  `frame-01.jpg` through `frame-05.jpg` are regular, present exactly once, and
+  match the pre-backup paths, sizes, and SHA-256 values
 
 ## Separate restore drill only
 
@@ -122,4 +153,16 @@
   history and a new WAL segment are archived without a post-start archiver failure;
   the exact authenticated `VERIFIED` epoch receipt exists; one-time recovery settings
   and signals are absent; every canary, service health, archive verification, and
-  image identity check passed; the preserved backup/safety directory was recorded
+  image identity check passed; the root-owned mode-0700 safety copy exactly
+  preserves every mutated `.env`/secrets/TLS name, content, owner, group, and mode
+  without links; the preserved backup/safety directory was recorded
+
+## Strict 3.9.2 certification
+
+- the release run is unfiltered and all operational-view, UUID, Alarm Transfer
+  camera, storage, and backup workflows are `required`
+- `OSCAR_BUILD_LABEL` identifies the exact candidate and
+  `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` names the complete matching unfiltered
+  restore-drill PASS directory
+- restore evidence has zero incorrect/skipped checks, matching suite/build/URL/
+  release identity, and complete backup/canary/image/safety-copy attestation

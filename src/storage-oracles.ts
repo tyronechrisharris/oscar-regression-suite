@@ -1,5 +1,6 @@
 import {createHash} from "node:crypto";
 import type {StorageMetricSample} from "./types.js";
+import {canonicalProductUuid, isCanonicalProductUuid} from "./product-uuid.js";
 
 export const RETAINED_FRAME_POSITIONS = [
   "FIRST", "QUARTER", "MIDDLE", "THREE_QUARTERS", "LAST",
@@ -12,6 +13,10 @@ export const MAX_RETAINED_EVENT_BYTES = 64 * 1024 * 1024;
 export const MAX_RETAINED_EVENT_PIXELS = 120_000_000;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+
+export const OSCAR_STORAGE_SCHEMA_VERSION = 5;
+export const OSCAR_STORAGE_SCHEMA_CHECKSUM =
+  "sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5";
 
 function object(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -81,9 +86,12 @@ export function assessRetainedMediaResponse(
   value: unknown,
   expectedEventId: string,
 ): RetainedMediaAssessment {
+  const eventId = canonicalProductUuid(expectedEventId, "retained-media event UUID");
   const response = object(value, "retained-media response");
   if (response.schemaVersion !== 1) throw new Error("retained-media schemaVersion must be 1");
-  if (response.eventId !== expectedEventId) throw new Error("retained-media eventId does not match");
+  if (canonicalProductUuid(response.eventId, "retained-media response event UUID") !== eventId) {
+    throw new Error("retained-media eventId does not match");
+  }
   if (!Array.isArray(response.mediaSets) || response.mediaSets.length < 1 ||
       response.mediaSets.length > MAX_RETAINED_MEDIA_SETS) {
     throw new Error(`retained-media response must contain 1-${MAX_RETAINED_MEDIA_SETS} media sets`);
@@ -102,14 +110,15 @@ export function assessRetainedMediaResponse(
   response.mediaSets.forEach((rawSet, setIndex) => {
     const mediaSet = object(rawSet, `mediaSets[${setIndex}]`);
     const manifest = object(mediaSet.manifest, `mediaSets[${setIndex}].manifest`);
-    if (manifest.schemaVersion !== 1 || manifest.eventId !== expectedEventId) {
+    if (manifest.schemaVersion !== 1 ||
+        canonicalProductUuid(manifest.eventId, `mediaSets[${setIndex}] manifest event UUID`) !== eventId) {
       throw new Error(`mediaSets[${setIndex}] manifest identity is invalid`);
     }
     const laneUid = text(manifest.laneUid, `mediaSets[${setIndex}].manifest.laneUid`);
     const cameraUid = text(manifest.cameraUid, `mediaSets[${setIndex}].manifest.cameraUid`);
     const mediaSetId = sha256(manifest.mediaSetId, `mediaSets[${setIndex}].manifest.mediaSetId`);
     const expectedMediaSetId = createHash("sha256")
-      .update(`${expectedEventId}\0${laneUid}\0${cameraUid}`, "utf8")
+      .update(`${eventId}\0${laneUid}\0${cameraUid}`, "utf8")
       .digest("hex");
     if (mediaSetId !== expectedMediaSetId || setIds.has(mediaSetId)) {
       throw new Error(`mediaSets[${setIndex}] has an invalid or duplicate deterministic mediaSetId`);
@@ -122,7 +131,7 @@ export function assessRetainedMediaResponse(
     cameraUids.push(cameraUid);
     const cameraToken = Buffer.from(cameraUid, "utf8").toString("base64url");
     const manifestPath = text(mediaSet.manifestPath, `mediaSets[${setIndex}].manifestPath`);
-    if (manifestPath !== `media/${expectedEventId}/${cameraToken}/manifest.json`) {
+    if (manifestPath !== `media/${eventId}/${cameraToken}/manifest.json`) {
       throw new Error(`mediaSets[${setIndex}] manifest path does not match its cameraUid`);
     }
     jpegQualities.push(integer(
@@ -215,7 +224,7 @@ export function assessRetainedMediaResponse(
         position as typeof RETAINED_FRAME_POSITIONS[number],
       ) + 1}.jpg`;
       const segments = path.split("/");
-      if (segments.length !== 4 || segments[0] !== "media" || segments[1] !== expectedEventId ||
+      if (segments.length !== 4 || segments[0] !== "media" || segments[1] !== eventId ||
           segments[2] !== cameraToken || segments[3] !== expectedName) {
         throw new Error(`mediaSets[${setIndex}] response asset path escapes the event whitelist`);
       }
@@ -501,6 +510,7 @@ export interface StoragePlatformProbe {
   pgStatStatementsInstalled: boolean;
   pgStatStatementsPreloaded: boolean;
   schemaVersion: number;
+  schemaChecksum: string;
   archiveMarker: {
     present: boolean;
     exact: boolean;
@@ -510,10 +520,37 @@ export interface StoragePlatformProbe {
     initializedAt: string;
   };
   batchRewriteConfigured: boolean;
+  batchRewriteObservedCalls: number;
+  batchRewriteObservedRows: number;
   dailyJournalConfigured: boolean;
   archiveIntervalMinutes: number | null;
   deleteHotAfterArchive: boolean | null;
   rollbackGraceDays: number | null;
+  archiveResources: {
+    memoryLimitMegabytes: number | null;
+    threads: number | null;
+    maximumTemporaryMegabytes: number | null;
+    maximumConcurrentSessions: number | null;
+    sessionAcquireTimeoutSeconds: number | null;
+    temporaryDirectory: string;
+  };
+  archiveScratch: ArchiveScratchProbe;
+  dailyJournal: {
+    rootDirectory: string;
+    journalDirectory: string;
+    publicationDirectory: string;
+    zoneId: string;
+    observationMode: string;
+    fsyncIntervalMillis: number | null;
+    maxUnforcedRecords: number | null;
+    maxUnforcedBytes: number | null;
+    maxSegmentBytes: number | null;
+    maxSegmentAgeSeconds: number | null;
+    maxRecordBytes: number | null;
+    sealedJournalRetentionDays: number | null;
+    observationLifecycleDelegated: boolean | null;
+    purgeWorkLimit: number | null;
+  };
   videoRetention: {
     enabled: boolean | null;
     timeToRetentionDays: number | null;
@@ -521,7 +558,36 @@ export interface StoragePlatformProbe {
     frameCount: number | null;
     jpegQuality: number | null;
     sourceRollbackGraceHours: number | null;
+    metadataReclamationWorkLimit: number | null;
   };
+}
+
+export interface ArchiveScratchProbe {
+  present: boolean;
+  realDirectory: boolean;
+  ownerUid: number | null;
+  ownerGid: number | null;
+  mode: string;
+  archiveDisjoint: boolean;
+  entryCount: number;
+}
+
+export interface MediaMetadataHealthProbe {
+  rootPresent: boolean;
+  checkpointPresent: boolean;
+  checkpointValid: boolean;
+  checkpointSchemaVersion: number | null;
+  processedIndexFiles: number;
+  processedIndexBytes: number;
+  deletionIndexFiles: number;
+  deletionIndexBytes: number;
+  retainedManifestFiles: number;
+  retainedJpegFiles: number;
+  legacyProcessedMarkerFiles: number;
+  legacyDeletionTombstones: number;
+  partialArtifacts: number;
+  unsafeEntries: number;
+  indexFormatFailures: number;
 }
 
 export interface StorageRootIdentity {
@@ -758,6 +824,7 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
     pgStatStatementsInstalled: probe.pgStatStatementsInstalled === true,
     pgStatStatementsPreloaded: probe.pgStatStatementsPreloaded === true,
     schemaVersion: integer(probe.schemaVersion, "schemaVersion"),
+    schemaChecksum: text(probe.schemaChecksum, "schemaChecksum"),
     archiveMarker: (() => {
       const marker = object(probe.archiveMarker, "archiveMarker");
       return {
@@ -770,11 +837,51 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
       };
     })(),
     batchRewriteConfigured: probe.batchRewriteConfigured === true,
+    batchRewriteObservedCalls: integer(
+      probe.batchRewriteObservedCalls,
+      "batchRewriteObservedCalls",
+    ),
+    batchRewriteObservedRows: integer(
+      probe.batchRewriteObservedRows,
+      "batchRewriteObservedRows",
+    ),
     dailyJournalConfigured: probe.dailyJournalConfigured === true,
     archiveIntervalMinutes: nullableNumber(probe.archiveIntervalMinutes),
     deleteHotAfterArchive: typeof probe.deleteHotAfterArchive === "boolean"
       ? probe.deleteHotAfterArchive : null,
     rollbackGraceDays: nullableNumber(probe.rollbackGraceDays),
+    archiveResources: (() => {
+      const resources = object(probe.archiveResources, "archiveResources");
+      return {
+        memoryLimitMegabytes: nullableNumber(resources.memoryLimitMegabytes),
+        threads: nullableNumber(resources.threads),
+        maximumTemporaryMegabytes: nullableNumber(resources.maximumTemporaryMegabytes),
+        maximumConcurrentSessions: nullableNumber(resources.maximumConcurrentSessions),
+        sessionAcquireTimeoutSeconds: nullableNumber(resources.sessionAcquireTimeoutSeconds),
+        temporaryDirectory: text(resources.temporaryDirectory, "archiveResources.temporaryDirectory"),
+      };
+    })(),
+    archiveScratch: assessArchiveScratch(probe.archiveScratch),
+    dailyJournal: (() => {
+      const journal = object(probe.dailyJournal, "dailyJournal");
+      return {
+        rootDirectory: text(journal.rootDirectory, "dailyJournal.rootDirectory"),
+        journalDirectory: text(journal.journalDirectory, "dailyJournal.journalDirectory"),
+        publicationDirectory: text(journal.publicationDirectory, "dailyJournal.publicationDirectory"),
+        zoneId: text(journal.zoneId, "dailyJournal.zoneId"),
+        observationMode: text(journal.observationMode, "dailyJournal.observationMode"),
+        fsyncIntervalMillis: nullableNumber(journal.fsyncIntervalMillis),
+        maxUnforcedRecords: nullableNumber(journal.maxUnforcedRecords),
+        maxUnforcedBytes: nullableNumber(journal.maxUnforcedBytes),
+        maxSegmentBytes: nullableNumber(journal.maxSegmentBytes),
+        maxSegmentAgeSeconds: nullableNumber(journal.maxSegmentAgeSeconds),
+        maxRecordBytes: nullableNumber(journal.maxRecordBytes),
+        sealedJournalRetentionDays: nullableNumber(journal.sealedJournalRetentionDays),
+        observationLifecycleDelegated: typeof journal.observationLifecycleDelegated === "boolean"
+          ? journal.observationLifecycleDelegated : null,
+        purgeWorkLimit: nullableNumber(journal.purgeWorkLimit),
+      };
+    })(),
     videoRetention: (() => {
       const retention = object(probe.videoRetention, "videoRetention");
       return {
@@ -784,16 +891,83 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         frameCount: nullableNumber(retention.frameCount),
         jpegQuality: nullableNumber(retention.jpegQuality),
         sourceRollbackGraceHours: nullableNumber(retention.sourceRollbackGraceHours),
+        metadataReclamationWorkLimit: nullableNumber(retention.metadataReclamationWorkLimit),
       };
     })(),
   };
+}
+
+export function assessArchiveScratch(value: unknown): ArchiveScratchProbe {
+  const scratch = object(value, "archive scratch");
+  return {
+    present: scratch.present === true,
+    realDirectory: scratch.realDirectory === true,
+    ownerUid: nullableNumber(scratch.ownerUid),
+    ownerGid: nullableNumber(scratch.ownerGid),
+    mode: typeof scratch.mode === "string" ? scratch.mode : "",
+    archiveDisjoint: scratch.archiveDisjoint === true,
+    entryCount: integer(scratch.entryCount, "archiveScratch.entryCount"),
+  };
+}
+
+export function archiveScratchIsSafe(value: ArchiveScratchProbe, requirePresent: boolean): boolean {
+  if (!value.present) return !requirePresent && value.entryCount === 0;
+  return archiveScratchRootIsSafe(value) && value.entryCount === 0;
+}
+
+function archiveScratchRootIsSafe(value: ArchiveScratchProbe): boolean {
+  if (!value.present) return value.entryCount === 0;
+  return value.realDirectory && value.ownerUid === 10001 && value.ownerGid === 10001 &&
+    value.mode === "700" && value.archiveDisjoint;
+}
+
+export function assessMediaMetadataHealth(value: unknown): MediaMetadataHealthProbe {
+  const probe = object(value, "media metadata health probe");
+  return {
+    rootPresent: probe.rootPresent === true,
+    checkpointPresent: probe.checkpointPresent === true,
+    checkpointValid: probe.checkpointValid === true,
+    checkpointSchemaVersion: nullableNumber(probe.checkpointSchemaVersion),
+    processedIndexFiles: integer(probe.processedIndexFiles, "processedIndexFiles"),
+    processedIndexBytes: integer(probe.processedIndexBytes, "processedIndexBytes"),
+    deletionIndexFiles: integer(probe.deletionIndexFiles, "deletionIndexFiles"),
+    deletionIndexBytes: integer(probe.deletionIndexBytes, "deletionIndexBytes"),
+    retainedManifestFiles: integer(probe.retainedManifestFiles, "retainedManifestFiles"),
+    retainedJpegFiles: integer(probe.retainedJpegFiles, "retainedJpegFiles"),
+    legacyProcessedMarkerFiles: integer(
+      probe.legacyProcessedMarkerFiles,
+      "legacyProcessedMarkerFiles",
+    ),
+    legacyDeletionTombstones: integer(probe.legacyDeletionTombstones, "legacyDeletionTombstones"),
+    partialArtifacts: integer(probe.partialArtifacts, "partialArtifacts"),
+    unsafeEntries: integer(probe.unsafeEntries, "unsafeEntries"),
+    indexFormatFailures: integer(probe.indexFormatFailures, "indexFormatFailures"),
+  };
+}
+
+export function mediaMetadataHealthIsSafe(
+  value: MediaMetadataHealthProbe,
+  requirePopulated: boolean,
+): boolean {
+  const structurallySafe = value.partialArtifacts === 0 && value.unsafeEntries === 0 &&
+    value.indexFormatFailures === 0 && value.legacyProcessedMarkerFiles === 0 &&
+    value.legacyDeletionTombstones === 0 &&
+    (!value.checkpointPresent ||
+      (value.checkpointValid && value.checkpointSchemaVersion === 2)) &&
+    (value.processedIndexFiles === 0 ||
+      (value.checkpointPresent && value.checkpointValid && value.checkpointSchemaVersion === 2));
+  if (!structurallySafe) return false;
+  if (!requirePopulated) return true;
+  return value.rootPresent && value.checkpointPresent && value.checkpointValid &&
+    value.checkpointSchemaVersion === 2 && value.processedIndexFiles > 0 &&
+    value.processedIndexBytes >= 52 && value.retainedManifestFiles > 0 &&
+    value.retainedJpegFiles >= value.retainedManifestFiles * 5;
 }
 
 export function storagePlatformHasExactReleaseIdentity(
   value: StoragePlatformProbe,
   release: string,
 ): boolean {
-  const deploymentPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const roots: Array<[StorageRootIdentity, string, number, string]> = [
     [value.storageRoots.archive, "archive", 10001, "1770"],
     [value.storageRoots.backup, "backup", 0, "700"],
@@ -815,11 +989,16 @@ export function storagePlatformHasExactReleaseIdentity(
   return value.expectedRelease === release &&
     value.configuredRelease === release &&
     value.templateRelease === release &&
-    deploymentPattern.test(value.deploymentId) &&
+    isCanonicalProductUuid(value.deploymentId) &&
     rootsExact &&
     value.storageLock.file === `${value.storageLock.directory}/${value.deploymentId}.lock` &&
     value.storageLock.stablePath && value.storageLock.private &&
     value.storageLock.behaviorTested && value.storageLock.concurrentRejected &&
+    value.dataChecksums === "on" && value.pgStatStatementsInstalled &&
+    value.pgStatStatementsPreloaded && value.batchRewriteConfigured &&
+    value.batchRewriteObservedCalls > 0 &&
+    value.batchRewriteObservedRows > value.batchRewriteObservedCalls &&
+    value.dailyJournalConfigured &&
     value.walArchive.archiveMode === "on" && value.walArchive.archiveCommandExact &&
     value.walArchive.publicationContractExact &&
     helperExact(value.walArchive.helper, "/usr/local/bin/oscar-archive-wal") &&
@@ -879,7 +1058,31 @@ export function storagePlatformHasExactReleaseIdentity(
     value.archiveMarker.format === "oscar-storage-profile" &&
     value.archiveMarker.version === release &&
     value.archiveMarker.dataChecksums === "on" &&
-    Number.isFinite(Date.parse(value.archiveMarker.initializedAt));
+    Number.isFinite(Date.parse(value.archiveMarker.initializedAt)) &&
+    value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
+    value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
+    value.archiveResources.memoryLimitMegabytes === 256 &&
+    value.archiveResources.threads === 2 &&
+    value.archiveResources.maximumTemporaryMegabytes === 4096 &&
+    value.archiveResources.maximumConcurrentSessions === 2 &&
+    value.archiveResources.sessionAcquireTimeoutSeconds === 30 &&
+    value.archiveResources.temporaryDirectory === "/var/lib/oscar/duckdb-tmp" &&
+    archiveScratchRootIsSafe(value.archiveScratch) &&
+    value.videoRetention.metadataReclamationWorkLimit === 200 &&
+    value.dailyJournal.rootDirectory === "files" &&
+    value.dailyJournal.journalDirectory === ".dailyfile-journal" &&
+    value.dailyJournal.publicationDirectory === "dailyfiles" &&
+    value.dailyJournal.zoneId === "UTC" &&
+    value.dailyJournal.observationMode === "LATEST" &&
+    value.dailyJournal.fsyncIntervalMillis === 1000 &&
+    value.dailyJournal.maxUnforcedRecords === 128 &&
+    value.dailyJournal.maxUnforcedBytes === 1_048_576 &&
+    value.dailyJournal.maxSegmentBytes === 67_108_864 &&
+    value.dailyJournal.maxSegmentAgeSeconds === 900 &&
+    value.dailyJournal.maxRecordBytes === 4_194_304 &&
+    value.dailyJournal.sealedJournalRetentionDays === 30 &&
+    value.dailyJournal.observationLifecycleDelegated === true &&
+    value.dailyJournal.purgeWorkLimit === 50;
 }
 
 export interface ArchiveHealthProbe {
@@ -924,7 +1127,11 @@ export function storageMetricFromProbe(
     "transactionRollbacks", "observationInsertCalls", "observationInsertRows",
     "observationRowsPerCall", "activeArchiveGenerations", "sealedArchiveGenerations",
     "archiveRows", "archiveBytes", "failedArchiveJobs", "failedParityReceipts", "activeHolds",
-    "verifiedBackups", "journalBytes", "dailyFileBytes", "retainedMediaBytes", "backupBytes",
+    "verifiedBackups", "journalBytes", "dailyFileBytes", "retainedMediaBytes",
+    "retainedMediaManifestFiles", "retainedMediaJpegFiles", "processedObservationIndexFiles",
+    "processedObservationIndexBytes", "deletionIndexFiles", "deletionIndexBytes",
+    "legacyProcessedMarkerFiles", "legacyDeletionTombstones", "mediaMetadataCheckpointBytes",
+    "backupBytes",
   ] as const;
   const numbers = Object.fromEntries(fields.map(field => [field, nullableNumber(probe[field])])) as
     Record<typeof fields[number], number | null>;

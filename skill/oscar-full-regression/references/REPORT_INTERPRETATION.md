@@ -46,6 +46,15 @@ same allocation and use phase to associate spikes with workflows. CPU/memory
 peaks are observational until a project baseline/budget exists. Missing requested
 samples, OOMs, and restart increases are gating.
 
+For a 3.9.2 storage gate, inspect `storage-performance.csv` as well as functional
+rows. Compare processed/deletion index counts and bytes, manifest/JPEG counts,
+checkpoint bytes, and legacy processed-marker/tombstone counts between like-for-
+like runs. Any nonzero legacy count, malformed metadata-health result, nonempty
+DuckDB scratch, missing direct-journal durability proof, or missing retained-media
+backup member is a correctness failure, not merely a performance observation.
+Windows-native Docker/PowerShell acceptance remains deferred unless a separate
+Windows run transcript exists.
+
 ## Evidence standard
 
 A defect report includes the failing functional row, relevant errors, evidence

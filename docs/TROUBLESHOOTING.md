@@ -71,7 +71,7 @@ all-lane query.
 
 ## Retained fixture ID is missing
 
-`STORAGE_RETAINED_EVENT_ID` remains required for a required smoke/read-only
+`STORAGE_RETAINED_EVENT_ID` remains required for a required smoke/non-lifecycle
 retained-media proof. A normal unfiltered full run intentionally reports the
 early check as deferred, then uses an exact UUID produced by `rpm-alarms`,
 `event-uuid`, or `adjudication` and runs the API/decode and Viewer gallery proof
@@ -101,7 +101,7 @@ response and codec logs; file existence alone is not a valid substitute.
 The full target must be disposable and its persisted OSCAR service config must
 have `timeToRetention=0`, `videoQueryPeriod=1`,
 `enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
-`sourceRollbackGraceHours=24`.
+`sourceRollbackGraceHours=24`, with `metadataReclamationWorkLimit=200`.
 Lifecycle preflight reports the observed `videoRetention` object and refuses the
 test before polling if any value differs. Seven days is the correct production
 default, but cannot retain a freshly generated alarm during this run.

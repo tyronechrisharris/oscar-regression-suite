@@ -22,6 +22,7 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "test:smoke": "tsx src/cli.ts --profile smoke",
     "test:full": "tsx src/cli.ts --profile full",
+    "test:3.9.2-release": "tsx src/cli.ts --profile 3.9.2-release",
     "test:restore-drill": "tsx src/cli.ts --profile restore-drill",
     "install:browser": "playwright install chromium"
   },

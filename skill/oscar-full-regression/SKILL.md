@@ -17,15 +17,25 @@ checks. Preserve its evidence and restore the reserved RPM even when a test fail
   variable is an interlock, not authorization.
 - Require exact OSCAR_TEST_TARGET_ACK, RPM_EMULATOR_TARGET_ACK, and
   RPM_LANE_MAPPING_ACK values.
-- Ensure no other runner or operator is using the selected TEST_RPM_ID. The
-  harness lock is local to one runner and cannot coordinate other machines.
+- Ensure no other manual operator is using the selected TEST_RPM_ID. Every
+  mutating invocation must acquire and hold the host-wide remote suite lease
+  through `finally`; it coordinates runners, full/restore runs, and the
+  storage-health atomic-publisher probe. Local full/restore locks are additional
+  same-runner guards, not the cross-runner authority.
 - Never reveal passwords, secret-file contents, private keys, or .env.
 - Use strict SSH host-key verification. Verify fingerprints through an already
   trusted path before adding keys. Never bypass host-key checks.
 - Do not run destructive SensorHub Admin actions, broad bulk adjudication, or
   physical-device tests.
-- Treat `storage-lifecycle` as a second mutation boundary: require the exact
-  disposable-storage acknowledgement, a fresh 3.9.2 test database, and the
+- Treat every storage probe, including smoke/non-lifecycle `storage-health`, as a
+  separately bound remote target: require the exact
+  `<viewer-host>|<ssh-target>|<remotely-canonical-release>|DISPOSABLE-STORAGE`
+  acknowledgement. Before any remote write or probe action, require that exact
+  SSH target to resolve the configured release as an existing, non-root,
+  non-symlink directory containing a regular non-symlink `oscar.sh`; revalidate
+  that binding for every action.
+- Treat `storage-lifecycle` as a second mutation boundary: require a fresh 3.9.2
+  test database and the
   probe's one-generation purge guard. Never run it on production/physical lanes
   and never add a restore step to the ordinary regression run.
 - Treat `restore-drill` as a distinct destructive profile. It is never part of
@@ -73,7 +83,8 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    event-UUID, and alarm-transfer-camera workflow modes.
 2. Validate suite static checks, unit tests, dependency audit, and the selected
    lane fixture.
-3. Run ./scripts/run-regression.sh smoke. Require the `dashboard-health`
+3. Run ./scripts/run-regression.sh smoke. This is non-fault-injecting but still
+   mutates report/command state and holds the remote suite lease. Require the `dashboard-health`
    baseline: complete lane/RPM/per-camera inventory, every emulator RPM's
    explicit `tamper_fault=false` source state, no Dashboard Tamper Unknown,
    live Online resolution, accessible browser-fixture Offline/Unknown states,
@@ -94,31 +105,57 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
 
 For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
 `STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
-rotation and a configured retained-media fixture for smoke/read-only coverage,
+rotation and a configured retained-media fixture for smoke/non-lifecycle coverage,
 then run the full `storage-lifecycle` only on its separately acknowledged
 disposable database. A full run can self-seed its retained-media proof from the
 exact alarm UUIDs it generates; a legacy-media fixture is optional compatibility
 coverage, not a release prerequisite.
+Do not accept required lifecycle certification with zero proved retained media.
+An unfiltered full run must generate and validate at least one exact set; a
+lifecycle-only selection must configure `STORAGE_RETAINED_EVENT_ID` and pass
+the same API, five-JPEG identity/hash/type/structure, Chromium decode, and
+gallery proof before any lifecycle mutation.
 Before mutation, require the running OSCAR service's persisted
 `videoRetentionConfig` to contain exactly the regression-only acceleration
 values `timeToRetention=0`, `videoQueryPeriod=1`,
 `enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
-`sourceRollbackGraceHours=24` while preserving its other fields. Require the archive test profile documented by the
+`sourceRollbackGraceHours=24`, with `metadataReclamationWorkLimit=200`, while
+preserving its other fields. Require the archive test profile documented by the
 suite (`intervalMinutes=1`, `rollbackGraceDays=1`,
 `deleteHotAfterArchive=true`). Do not edit the packaged defaults to satisfy this
 gate: production media aging remains seven days and the production archive
 policy remains conservative.
+Require exact storage schema v5 checksum
+`sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`
+before lifecycle mutation and before/after restore. Require DuckDB's exact 256
+MiB memory, two-thread, 4,096 MiB spill, two-session process-wide admission,
+30-second admission-timeout policy and private archive-disjoint empty
+`/var/lib/oscar/duckdb-tmp`; prove the scratch is excluded from backup. Require
+the exact direct-daily-file config, a reserved-lane UID append caused by a real
+emulator transition, exact bounded 12-key publication manifests, and byte
+durability after restart.
+
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode
 and exact dimensions for every quality-85 frame, lazy gallery requests with bounded concurrency,
-fallback behavior, journal restart
+fallback behavior, schema-2 media metadata health, exact
+`retention-processed-index/%019d-%02d.idx` suffixes `00..11`, exact binary
+headers/36-byte records, no legacy marker/tombstone growth, journal restart
 recovery, archive parity/export and mixed-tier queries, generation- and
-archived-observation hold create/release plus dry-run/token
-safety, authenticated HMAC/epoch/regular backup markers, supported re-verification,
+archived-observation holds resolving exactly to `GENERATION_EXACT` and
+`COLD_RANGE_CONSERVATIVE` with dry-run exclusion, and a `HOT_EXACT` hold that
+rejects authenticated deletion until release, plus dry-run/token
+safety, independent backup-key HMAC/checksum/exact-inventory verification plus
+supported re-verification,
 an exact separately HMAC-authenticated `JOURNAL_CONFIRMED` v2 sidecar deliberately
 outside the immutable checksum inventory, a bounded canonical backup-time archive-generation
-UUID inventory with exact VERIFIED catalog-array equality, and atomic daily-journal
-confirmation-set membership for every receipt, exact tags/running image IDs/OCI labels and
+UUID inventory with exact VERIFIED catalog count/SHA-256/byte receipt, and atomic daily-journal
+confirmation-set membership for every receipt, exact receipt-to-authenticated-
+tar segment path/type/size/SHA-256 reconciliation, and exact once-only regular
+retained-media checkpoint, every processed/deletion index, and each proved
+event/lane/camera manifest plus `frame-01.jpg` through `frame-05.jpg` in the
+authenticated app-state backup with pre-backup path/type/size/SHA-256 identity,
+exact tags/running image IDs/OCI labels and
 checksum plus all three deployment-bound storage-root markers, stable private
 deployment lock rejection, exact WAL command and packaged/running helper hashes,
 compiled atomic-publisher source provenance and no-replace collision behavior,
@@ -127,6 +164,9 @@ base-backup wiring, atomic no-replace hard-link WAL publication, no archive/WAL 
 controlled stale-activation rollback with
 exact-row retry ownership, deployed archive/WAL helper behavior,
 checksums/pg_stat, and storage/resource metrics.
+
+`LEGACY_UNKNOWN` is migration-only for pre-v5 observation holds; never accept it
+as CLI output. Pre-v5 generation holds must migrate to `GENERATION_EXACT`.
 
 Only when the user has explicitly authorized a destructive isolated recovery
 test and all documented acknowledgements are present, run
@@ -139,7 +179,17 @@ file and new-timeline segment with no post-start archiver failure, exact reconst
 of the authenticated `VERIFIED` epoch receipt, removal of one-time recovery settings
 and signals, healthy services, archive verification, and unchanged immutable image
 IDs. The acknowledged storage planes must resolve exactly and remain distinct and
-non-overlapping. Never reinterpret a smoke/full request as restore authorization.
+non-overlapping. Require the private safety copy to preserve the exact mutated
+`.env`/secrets/TLS names, contents, owners, groups, and modes with no links.
+Never reinterpret a smoke/full request as restore authorization.
+
+For final 3.9.2 certification, first preserve a complete unfiltered
+`restore-drill` PASS. Set all five operational-view/UUID/camera/storage/backup
+workflows to `required`, set the exact `OSCAR_BUILD_LABEL`, point
+`OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching result directory, and run
+`npm run test:3.9.2-release` with no scenario filter. Do not accept a release run
+with mismatched identity, missing evidence, any skip/failure, or an incomplete
+restore attestation.
 
 The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
 they do not disconnect cameras or mutate SensorHub. The full profile separately
@@ -235,13 +285,15 @@ loss, or another runner can still strand emulator state.
 If cleanup is not proven correct:
 
 1. Stop further full runs.
-2. Keep the lock and result directory until the reserved RPM is inspected.
+2. Keep the local lock and result directory until the reserved RPM is inspected;
+   do not delete the remote lock file (the kernel lease releases with its SSH process).
 3. Read evidence/reserved-rpm-original-config.json and
    evidence/reserved-rpm-original-state.json.
 4. Clear injected faults, stop the RPM, PUT the exact saved configuration,
    restore original fault/running state, and verify the expected client count.
 5. Compare the restored configuration structurally and verify Status of Health.
-6. Remove a stale local lock only after recovery is verified.
+6. Remove a stale local lock only after recovery is verified. Never remove the
+   remote suite lock path to defeat live contention.
 
 ## Interpret and deliver results
 

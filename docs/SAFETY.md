@@ -22,12 +22,22 @@ OSCAR_LANE_CONFIG_PATH=fixtures/oscar-50-lane-config.csv
 Loopback targets are refused. This guard reduces accidental execution but is not
 a substitute for verifying the host yourself.
 
-The OSCAR 3.9.2 `storage-lifecycle` path has a separate interlock:
+Every OSCAR 3.9.2 storage probe, including smoke/non-lifecycle `storage-health`, has
+a separate target-bound interlock:
 
 ```text
+OSCAR_SSH_TARGET=tester@test-host
 OSCAR_RELEASE_DIR=/absolute/disposable/release
-OSCAR_STORAGE_TARGET_ACK=test-host:/absolute/disposable/release:DISPOSABLE-STORAGE
+OSCAR_STORAGE_TARGET_ACK=test-host|tester@test-host|/absolute/disposable/release|DISPOSABLE-STORAGE
 ```
+
+Before any remote write, upload, or probe action, the runner resolves the
+release directory on that exact SSH target. It must already exist, be a
+non-root directory, contain a regular non-symlink `oscar.sh`, contain no symlink
+component, and resolve byte-for-byte to the configured and acknowledged path.
+The binding is revalidated before every action. The probe itself runs from a
+fresh mode-0700 private workspace and removes it on completion. These checks are
+interlocks, not authorization.
 
 It copies two existing test observations into uniquely registered fixture rows.
 Cold deletion is refused unless the dry-run plan contains exactly the one
@@ -38,12 +48,19 @@ that must be preserved.
 
 The same disposable target must explicitly use `timeToRetention=0`,
 `videoQueryPeriod=1`, `enableFrameRetention=true`, `frameRetentionCount=5`, and
-`jpegQuality=85`, with `sourceRollbackGraceHours=24`, for the generated-alarm
+`jpegQuality=85`, `sourceRollbackGraceHours=24`, and
+`metadataReclamationWorkLimit=200` for the generated-alarm
 media check. The suite verifies those
 live values before it polls or creates the archive fixture; it never edits the
 configuration. The 24-hour source grace keeps the exact generated MP4s available
 for the final forensic comparison. OSCAR's packaged and production age default remains seven days.
 Never copy the zero-day test setting into production.
+
+A required lifecycle cannot certify a target without retained-media evidence.
+An unfiltered full run must generate and validate at least one exact retained
+set; a lifecycle-only run must configure `STORAGE_RETAINED_EVENT_ID` and pass
+the same API, five-JPEG hash/type/structure, Chromium decode, and gallery proof
+before lifecycle mutation begins.
 
 The only restore coverage is the separately selected `restore-drill` profile.
 It is rejected unless `STORAGE_WORKFLOW=required`, the ordinary target and
@@ -79,9 +96,15 @@ a global save, or explicitly reprovision a disposable site. Never delete volumes
 or reinitialize a site merely to force the fixture to apply. The browser workflow
 uses the file solely as its exact membership oracle.
 
-Only one full run may use a given `TEST_RPM_ID`. The runner uses a local lock,
-but that cannot detect a run launched from a different machine. Coordinate
-runner ownership externally and never overlap Mac/Linux/manual fault injection.
+Only one mutating suite run may use an OSCAR test host at a time. Before browser,
+emulator, storage, or restore mutation, the harness acquires the host-wide
+`/run/lock/oscar-regression-suite/suite.lock` over strict SSH and holds the live
+file descriptor until `finally` cleanup. The root-owned mode-0700 directory and
+mode-0600 regular lock file fail closed on links, wrong ownership/modes, or
+contention, and the lease is shared across runners, release directories, full
+runs, restore drills, and the storage-health atomic-publisher check. Full and
+restore local locks are defense in depth only. The lease does not coordinate a
+manual operator, so never overlap manual fault injection.
 
 ## What a full run changes
 

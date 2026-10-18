@@ -4,6 +4,7 @@ import {basename, join} from "node:path";
 import type {Locator, Page, Request} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
+import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
 import {
   alarmMediaForensicsPassed,
   assertAlarmVideoAssociationUnique,
@@ -35,15 +36,23 @@ import {navigateWithBoundedRetry} from "./navigation.js";
 import {RunReporter} from "./reporter.js";
 import {StorageProbeClient} from "./storage-probe.js";
 import {
+  archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratch,
   assessJpeg,
+  assessMediaMetadataHealth,
   assessRetainedMediaResponse,
   assessStoragePlatform,
   encodeOshBigId,
+  MAX_RETAINED_FRAME_BYTES,
+  mediaMetadataHealthIsSafe,
+  OSCAR_STORAGE_SCHEMA_CHECKSUM,
+  OSCAR_STORAGE_SCHEMA_VERSION,
   parseCollectionIds,
   storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
 } from "./storage-oracles.js";
+import {isCanonicalProductUuid} from "./product-uuid.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
 
@@ -78,6 +87,61 @@ interface GeneratedAlarmMedia {
   association: AlarmVideoAssociation;
 }
 
+const MAX_RETAINED_CATALOG_BYTES = 4 * 1024 * 1024;
+
+function parseBoundedJson(response: BoundedFetchResult, context: string): unknown {
+  if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
+  if (response.contentType !== "application/json") {
+    throw new Error(`${context} returned ${response.contentType || "no content type"}, not application/json`);
+  }
+  const bytes = Buffer.from(response.bodyBase64, "base64");
+  if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
+  try {
+    return JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(bytes));
+  } catch (error) {
+    throw new Error(`${context} returned invalid bounded JSON`, {cause: error});
+  }
+}
+
+interface DirectJournalLaneState {
+  directoryId: string;
+  present: boolean;
+  files: number;
+  bytes: number;
+  openSegments: number;
+  sealedSegments: number;
+  partialFiles: number;
+  unsafeEntries: number;
+  segments: Array<{
+    path: string;
+    kind: "open" | "seg";
+    bytes: number;
+    sha256: string;
+  }>;
+}
+
+function directJournalInventoryValid(state: DirectJournalLaneState): boolean {
+  if (!Array.isArray(state.segments) || state.segments.length !== state.files ||
+      state.segments.length > 512) return false;
+  const paths = new Set<string>();
+  let bytes = 0;
+  let open = 0;
+  let sealed = 0;
+  for (const segment of state.segments) {
+    if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}\/[0-9]{6}\.(?:open|seg)$/.test(segment.path) ||
+        !["open", "seg"].includes(segment.kind) ||
+        !Number.isSafeInteger(segment.bytes) || segment.bytes < 0 ||
+        !/^[0-9a-f]{64}$/.test(segment.sha256) || paths.has(segment.path) ||
+        !segment.path.endsWith(`.${segment.kind}`)) return false;
+    paths.add(segment.path);
+    bytes += segment.bytes;
+    if (!Number.isSafeInteger(bytes)) return false;
+    if (segment.kind === "open") open++;
+    else sealed++;
+  }
+  return bytes === state.bytes && open === state.openSegments && sealed === state.sealedSegments;
+}
+
 type DashboardConnectionKind = "rpm" | "camera";
 type DashboardConnectionState = "online" | "offline" | "unknown";
 type DashboardFaultKind = "gamma-high" | "gamma-low" | "neutron-high" | "tamper" | "extended-occupancy";
@@ -105,6 +169,16 @@ const REGRESSION_MEDIA_RETENTION = {
   frameCount: 5,
   jpegQuality: 85,
   sourceRollbackGraceHours: 24,
+  metadataReclamationWorkLimit: 200,
+} as const;
+
+const REGRESSION_ARCHIVE_RESOURCES = {
+  memoryLimitMegabytes: 256,
+  threads: 2,
+  maximumTemporaryMegabytes: 4096,
+  maximumConcurrentSessions: 2,
+  sessionAcquireTimeoutSeconds: 30,
+  temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
 } as const;
 
 function isVisible(locator: Locator): Promise<boolean> {
@@ -121,6 +195,7 @@ export class RegressionScenarios {
   private alarmCameraUids: string[] | undefined;
   private alarmLaneUid: string | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
+  private readonly retainedBackupExpectations = new Map<string, string>();
   private retainedMediaProofDeferred = false;
   private stopRequested: () => boolean = () => false;
   private activeScenario = "navigation";
@@ -142,7 +217,8 @@ export class RegressionScenarios {
   }
 
   private fullRunCanSelfSeedRetainedMedia(): boolean {
-    return this.config.profile === "full" && this.selected("storage-lifecycle") &&
+    return ["full", "3.9.2-release"].includes(this.config.profile) &&
+      this.selected("storage-lifecycle") &&
       ["rpm-alarms", "event-uuid", "adjudication"].some(scenario => this.selected(scenario));
   }
 
@@ -2236,7 +2312,7 @@ export class RegressionScenarios {
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
       const eventId = (await uuidValue.innerText()).trim();
       const url = new URL(page.url());
-      const passed = eventId.length > 0 && eventId.length <= 128 && url.searchParams.get("eventId") === eventId;
+      const passed = isCanonicalProductUuid(eventId) && url.searchParams.get("eventId") === eventId;
       return {
         passed,
         value: passed ? eventId : undefined,
@@ -2539,7 +2615,7 @@ export class RegressionScenarios {
         await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
         const uuid = (await uuidValue.innerText()).trim();
         const current = new URL(page.url());
-        const validIdentity = uuid.length > 0 && uuid.length <= 128;
+        const validIdentity = isCanonicalProductUuid(uuid);
         const canonical = current.searchParams.get("eventId") === uuid &&
           Boolean(current.searchParams.get("nodeId"));
         const passed = validIdentity && canonical;
@@ -2897,7 +2973,7 @@ export class RegressionScenarios {
           parsed.payload.version === 1 &&
           parsed.payload.source?.laneId === this.config.testLaneLabel &&
           exportedOccupancyId === String(occupancyCount) &&
-          observationId.length > 0 && observationId.length <= 128 &&
+          isCanonicalProductUuid(observationId) &&
           parsed.integrity?.algorithm === "SHA-256" &&
           /^[a-f0-9]{64}$/i.test(parsed.integrity.digest ?? "") &&
           parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
@@ -3155,13 +3231,17 @@ export class RegressionScenarios {
           const available = new Map<string, ReturnType<typeof assessRetainedMediaResponse>>();
           for (const item of generated) {
             const eventId = item.association.eventId;
-            const response = await page.context().request.get(this.viewerUrl(
-              `/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`,
-            ));
-            try {
-              if (response.status() === 404) continue;
-              if (!response.ok()) throw new Error(`retained-media API returned HTTP ${response.status()} for ${eventId}`);
-              const assessment = assessRetainedMediaResponse(await response.json(), eventId);
+            const response = await page.evaluate(boundedFetch, {
+              url: this.viewerUrl(`/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`),
+              maxBytes: MAX_RETAINED_CATALOG_BYTES,
+              decodeImage: false,
+            });
+            if (response.status === 404) continue;
+            {
+              const assessment = assessRetainedMediaResponse(
+                parseBoundedJson(response, `retained-media API for ${eventId}`),
+                eventId,
+              );
               const sourceByCamera = new Map(item.association.paths.map(path => [path.cameraUid, path.path]));
               if (assessment.mediaSetCount !== sourceByCamera.size || assessment.frameCount !== sourceByCamera.size * 5 ||
                   assessment.jpegQualities.some(quality => quality !== 85) ||
@@ -3171,8 +3251,6 @@ export class RegressionScenarios {
                 throw new Error(`retained manifests do not bind exactly to alarm ${eventId} videoPaths`);
               }
               available.set(eventId, assessment);
-            } finally {
-              await response.dispose();
             }
           }
           return available;
@@ -3188,30 +3266,17 @@ export class RegressionScenarios {
           expectedFrames += assessment.frameCount;
           for (const asset of assessment.assets) {
             const imageUrl = this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`);
-            const image = await page.context().request.get(imageUrl);
-            try {
-              const bytes = Buffer.from(await image.body());
-              const contentType = (image.headers()["content-type"] ?? "").split(";", 1)[0]?.trim();
-              const structureValid = image.ok() && contentType === asset.contentType &&
-                assessJpeg(bytes, asset.bytes, asset.sha256, asset.width, asset.height);
-              const decoded = structureValid ? await page.evaluate(async ({url, width, height}) => {
-                const response = await fetch(url, {credentials: "include", cache: "no-store"});
-                if (!response.ok) return false;
-                const blob = await response.blob();
-                if (blob.type !== "image/jpeg") return false;
-                try {
-                  const bitmap = await createImageBitmap(blob);
-                  const valid = bitmap.width === width && bitmap.height === height;
-                  bitmap.close();
-                  return valid;
-                } catch {
-                  return false;
-                }
-              }, {url: imageUrl, width: asset.width, height: asset.height}) : false;
-              if (structureValid && decoded) validFrames++;
-            } finally {
-              await image.dispose();
-            }
+            const image = await page.evaluate(boundedFetch, {
+              url: imageUrl,
+              maxBytes: Math.min(asset.bytes, MAX_RETAINED_FRAME_BYTES),
+              decodeImage: true,
+            });
+            const bytes = Buffer.from(image.bodyBase64, "base64");
+            const valid = image.ok && image.contentType === asset.contentType &&
+              image.byteCount === asset.bytes && bytes.length === image.byteCount &&
+              image.decodedWidth === asset.width && image.decodedHeight === asset.height &&
+              assessJpeg(bytes, asset.bytes, asset.sha256, asset.width, asset.height);
+            if (valid) validFrames++;
           }
         }
         const passed = validFrames === expectedFrames;
@@ -3225,6 +3290,9 @@ export class RegressionScenarios {
       });
 
       if (retained) {
+        for (const [eventId, assessment] of retained) {
+          this.recordRetainedBackupExpectations(eventId, assessment);
+        }
         await this.check({
           scenario: "storage-lifecycle",
           category: "retained-media",
@@ -3412,6 +3480,89 @@ export class RegressionScenarios {
     });
   }
 
+  private recordRetainedBackupExpectations(
+    eventId: string,
+    assessment: ReturnType<typeof assessRetainedMediaResponse>,
+  ): void {
+    const eventToken = Buffer.from(eventId, "utf8").toString("base64url");
+    for (const mediaSet of assessment.mediaSets) {
+      const laneToken = Buffer.from(mediaSet.laneUid, "utf8").toString("base64url");
+      const cameraToken = Buffer.from(mediaSet.cameraUid, "utf8").toString("base64url");
+      const assets = assessment.assets
+        .filter(asset => asset.path.startsWith(`media/${eventId}/${cameraToken}/`))
+        .sort((left, right) => left.path.localeCompare(right.path));
+      if (assets.length !== 5 || assets.some((asset, index) =>
+        basename(asset.path) !== `frame-0${index + 1}.jpg`)) {
+        throw new Error(`Cannot bind backup expectations to five exact frames for ${eventId}/${mediaSet.cameraUid}`);
+      }
+      const record = [eventToken, laneToken, cameraToken,
+        ...assets.flatMap(asset => [asset.sha256, String(asset.bytes)])].join(".");
+      if (record.length > 2048 || !/^[A-Za-z0-9_.-]+$/.test(record)) {
+        throw new Error("Retained-media backup expectation exceeds the guarded probe argument contract");
+      }
+      this.retainedBackupExpectations.set(`${eventToken}/${laneToken}/${cameraToken}`, record);
+    }
+  }
+
+  private async proveConfiguredRetainedMediaEvent(
+    eventId: string,
+    scenario: "storage-health" | "storage-lifecycle",
+  ): Promise<boolean> {
+    const page = await this.browser.oscarPage();
+    try {
+      // Establish a same-origin authenticated document before exercising
+      // browser-native fetch/createImageBitmap.
+      await this.goto(page, "/");
+      const assessment = await this.check({scenario, category: "retained-media",
+        action: "verify exact-five retained JPEG API", target: eventId,
+        expected: "each retained camera has five quality-85, bounded baseline JPEGs whose hashes, dimensions, content types, and Chromium decodes match"}, async () => {
+        const response = await page.evaluate(boundedFetch, {
+          url: this.viewerUrl(`/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`),
+          maxBytes: MAX_RETAINED_CATALOG_BYTES,
+          decodeImage: false,
+        });
+        const assessed = assessRetainedMediaResponse(
+          parseBoundedJson(response, `retained-media API for ${eventId}`),
+          eventId,
+        );
+        let valid = 0;
+        for (const asset of assessed.assets) {
+          const imageUrl = this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`);
+          const image = await page.evaluate(boundedFetch, {
+            url: imageUrl,
+            maxBytes: Math.min(asset.bytes, MAX_RETAINED_FRAME_BYTES),
+            decodeImage: true,
+          });
+          const bytes = Buffer.from(image.bodyBase64, "base64");
+          const verified = image.ok && image.contentType === asset.contentType &&
+            image.byteCount === asset.bytes && bytes.length === image.byteCount &&
+            image.decodedWidth === asset.width && image.decodedHeight === asset.height &&
+            assessJpeg(bytes, asset.bytes, asset.sha256, asset.width, asset.height);
+          if (verified) valid++;
+        }
+        const passed = assessed.jpegQualities.every(quality => quality === 85) &&
+          valid === assessed.frameCount;
+        return {passed, ...(passed ? {value: assessed} : {}),
+          observed: `${assessed.mediaSetCount} camera set(s), ${assessed.frameCount} frames, ` +
+            `${valid} statically and browser-decodable JPEGs; qualities=${assessed.jpegQualities.join(",")}`};
+      });
+      if (!assessment) return false;
+      this.recordRetainedBackupExpectations(eventId, assessment);
+      await this.verifyRetainedMediaGallery(
+        page,
+        eventId,
+        scenario,
+        "render retained-media gallery",
+        scenario === "storage-health"
+          ? "retained-media-five-frame-gallery"
+          : "lifecycle-configured-retained-media-five-frame-gallery",
+      );
+      return true;
+    } finally {
+      await page.close();
+    }
+  }
+
   private async storageHealth(): Promise<void> {
     if (this.storageUnavailable("storage-health")) return;
     const probe = new StorageProbeClient(this.config, this.reporter.runId);
@@ -3423,10 +3574,21 @@ export class RegressionScenarios {
       }, async () => {
         const value = assessStoragePlatform(await probe.runJson("platform"));
         const release = this.config.storageExpectedRelease;
+        const resources = value.archiveResources;
         const passed = storagePlatformHasExactReleaseIdentity(value, release) && value.dataChecksums === "on" &&
           value.pgStatStatementsInstalled && value.pgStatStatementsPreloaded &&
-          value.schemaVersion >= 4 && value.batchRewriteConfigured &&
-          value.dailyJournalConfigured;
+          value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
+          value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM && value.batchRewriteConfigured &&
+          value.dailyJournalConfigured &&
+          resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
+          resources.threads === REGRESSION_ARCHIVE_RESOURCES.threads &&
+          resources.maximumTemporaryMegabytes ===
+            REGRESSION_ARCHIVE_RESOURCES.maximumTemporaryMegabytes &&
+          resources.maximumConcurrentSessions ===
+            REGRESSION_ARCHIVE_RESOURCES.maximumConcurrentSessions &&
+          resources.sessionAcquireTimeoutSeconds ===
+            REGRESSION_ARCHIVE_RESOURCES.sessionAcquireTimeoutSeconds &&
+          resources.temporaryDirectory === REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory;
         return {passed, value, observed: JSON.stringify(value)};
       });
 
@@ -3443,14 +3605,42 @@ export class RegressionScenarios {
       });
 
       await this.check({
+        scenario: "storage-health", category: "cold-archive", action: "verify bounded DuckDB scratch hygiene",
+        target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
+        expected: "the configured scratch root is absent or a private archive-disjoint empty runtime directory",
+      }, async () => {
+        const value = await poll(
+          async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
+          scratch => archiveScratchIsSafe(scratch, false),
+          {timeoutMs: 60_000, intervalMs: 1_000,
+            description: "DuckDB scratch to become empty between bounded operations"},
+        );
+        return {passed: archiveScratchIsSafe(value, false), observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "retained-media", action: "verify bounded media metadata health",
+        target: "retained-media/v1",
+        expected: "checkpoint schema 2 and compact hourly/deletion indexes are structurally valid, with no legacy markers, tombstones, partials, or unsafe entries",
+      }, async () => {
+        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
+        return {
+          passed: mediaMetadataHealthIsSafe(value, Boolean(this.config.storageRetainedEventId)),
+          observed: JSON.stringify(value),
+        };
+      });
+
+      await this.check({
         scenario: "storage-health", category: "daily-file", action: "verify durable journal publications",
-        target: "dailyfiles", expected: "published CSV files have matching manifests and no partial artifacts",
+        target: "dailyfiles", expected: "bounded regular CSV files have exact 12-key v1 manifests, matching hashes/counts, and no links or partial artifacts",
       }, async () => {
         const value = await probe.runJson<{publications: number; manifests: number; validatedManifests: number;
-          partialFiles: number; manifestFailures: number}>("journal-status");
+          partialFiles: number; manifestFailures: number; unsafeLinks: number;
+          unsafeEntries: number; bounded: boolean}>("journal-status");
         const published = value.publications > 0 && value.publications === value.manifests;
         return {passed: published && value.validatedManifests === value.manifests &&
-          value.partialFiles === 0 && value.manifestFailures === 0,
+          value.partialFiles === 0 && value.manifestFailures === 0 && value.unsafeLinks === 0 &&
+          value.unsafeEntries === 0 && value.bounded,
           observed: JSON.stringify(value)};
       });
 
@@ -3472,67 +3662,7 @@ export class RegressionScenarios {
             "STORAGE_RETAINED_EVENT_ID is missing and this run cannot self-seed retained media",
             "incorrect", 0);
         } else this.skip(metadata, "no retained-media fixture event configured");
-      } else {
-        const page = await this.browser.oscarPage();
-        try {
-          // Establish a same-origin authenticated document before exercising
-          // browser-native fetch/createImageBitmap. A blank about:blank page
-          // would otherwise turn the decode into a cross-origin CORS probe.
-          await this.goto(page, "/");
-          await this.check({scenario: "storage-health", category: "retained-media",
-            action: "verify exact-five retained JPEG API", target: eventId,
-            expected: "each retained camera has five quality-85, bounded baseline JPEGs whose hashes, dimensions, content types, and Chromium decodes match"}, async () => {
-            const response = await page.context().request.get(this.viewerUrl(
-              `/sensorhub/buckets/videos/media/${encodeURIComponent(eventId)}`));
-            let assessment: ReturnType<typeof assessRetainedMediaResponse>;
-            try {
-              if (!response.ok()) throw new Error(`retained-media API returned HTTP ${response.status()}`);
-              assessment = assessRetainedMediaResponse(await response.json(), eventId);
-            } finally {
-              await response.dispose();
-            }
-            let valid = 0;
-            for (const asset of assessment.assets) {
-              const imageUrl = this.viewerUrl(`/sensorhub/buckets/videos/${asset.path}`);
-              const image = await page.context().request.get(imageUrl);
-              try {
-                const bytes = Buffer.from(await image.body());
-                const contentType = (image.headers()["content-type"] ?? "").split(";", 1)[0]?.trim();
-                const structureValid = image.ok() && contentType === asset.contentType &&
-                  assessJpeg(bytes, asset.bytes, asset.sha256, asset.width, asset.height);
-                const decoded = structureValid ? await page.evaluate(async ({url, width, height}) => {
-                  const decodedResponse = await fetch(url, {credentials: "include", cache: "no-store"});
-                  if (!decodedResponse.ok) return {valid: false, status: decodedResponse.status};
-                  const blob = await decodedResponse.blob();
-                  if (blob.type !== "image/jpeg") return {valid: false, status: decodedResponse.status};
-                  try {
-                    const bitmap = await createImageBitmap(blob);
-                    const dimensionsMatch = bitmap.width === width && bitmap.height === height;
-                    bitmap.close();
-                    return {valid: dimensionsMatch, status: decodedResponse.status};
-                  } catch {
-                    return {valid: false, status: decodedResponse.status};
-                  }
-                }, {url: imageUrl, width: asset.width, height: asset.height}) : {valid: false, status: image.status()};
-                if (structureValid && decoded.valid) valid++;
-              } finally {
-                await image.dispose();
-              }
-            }
-            const qualitiesValid = assessment.jpegQualities.every(quality => quality === 85);
-            return {passed: qualitiesValid && valid === assessment.frameCount,
-              observed: `${assessment.mediaSetCount} camera set(s), ${assessment.frameCount} frames, ` +
-                `${valid} statically and browser-decodable JPEGs; qualities=${assessment.jpegQualities.join(",")}`};
-          });
-          await this.verifyRetainedMediaGallery(
-            page,
-            eventId,
-            "storage-health",
-            "render retained-media gallery",
-            "retained-media-five-frame-gallery",
-          );
-        } finally { await page.close(); }
-      }
+      } else await this.proveConfiguredRetainedMediaEvent(eventId, "storage-health");
 
       const legacyId = this.config.storageLegacyEventId;
       if (legacyId) {
@@ -3568,21 +3698,37 @@ export class RegressionScenarios {
     const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
     let fixtureCreateAttempted = false;
     let apiPage: Page | undefined;
+    let directJournalLaneUid: string | undefined;
+    let directJournalAfterAppend: DirectJournalLaneState | undefined;
     try {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
         expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, one-day archive profile, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
         const media = platform.videoRetention;
+        const resources = platform.archiveResources;
         const passed = storagePlatformHasExactReleaseIdentity(platform, this.config.storageExpectedRelease) &&
             platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
             platform.archiveIntervalMinutes === 1 &&
+            platform.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
+            platform.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
+            resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
+            resources.threads === REGRESSION_ARCHIVE_RESOURCES.threads &&
+            resources.maximumTemporaryMegabytes ===
+              REGRESSION_ARCHIVE_RESOURCES.maximumTemporaryMegabytes &&
+            resources.maximumConcurrentSessions ===
+              REGRESSION_ARCHIVE_RESOURCES.maximumConcurrentSessions &&
+            resources.sessionAcquireTimeoutSeconds ===
+              REGRESSION_ARCHIVE_RESOURCES.sessionAcquireTimeoutSeconds &&
+            resources.temporaryDirectory === REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory &&
             media.enabled === REGRESSION_MEDIA_RETENTION.enabled &&
             media.timeToRetentionDays === REGRESSION_MEDIA_RETENTION.timeToRetentionDays &&
             media.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION.queryPeriodMinutes &&
             media.frameCount === REGRESSION_MEDIA_RETENTION.frameCount &&
             media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality &&
-            media.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION.sourceRollbackGraceHours;
+            media.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION.sourceRollbackGraceHours &&
+            media.metadataReclamationWorkLimit ===
+              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit;
         return {
           passed,
           value: passed,
@@ -3594,7 +3740,114 @@ export class RegressionScenarios {
           "Storage lifecycle mutation refused because the exact accelerated 3.9.2 archive/media test profile failed",
         );
       }
+
+      const scratchAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "verify clean DuckDB scratch before fixture mutation",
+        target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
+        expected: "the configured private archive-disjoint scratch root is empty between archive operations",
+      }, async () => {
+        const value = await poll(
+          async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
+          scratch => archiveScratchIsSafe(scratch, false),
+          {timeoutMs: 60_000, intervalMs: 1_000,
+            description: "pre-lifecycle DuckDB scratch to become empty"},
+        );
+        return {passed: archiveScratchIsSafe(value, false), observed: JSON.stringify(value)};
+      });
+      if (!scratchAccepted) {
+        throw new Error("Storage lifecycle mutation refused because DuckDB scratch did not become clean");
+      }
+
+      if (this.generatedAlarmMedia.size === 0 && this.retainedBackupExpectations.size === 0) {
+        const configuredEvent = this.config.storageRetainedEventId;
+        if (!configuredEvent) {
+          this.reporter.outcome(
+            "storage-lifecycle", "retained-media", "require retained-media proof before mutation",
+            this.config.testLaneLabel,
+            "at least one generated alarm or explicitly configured retained event proves exact five-frame retention",
+            "no generated alarm and STORAGE_RETAINED_EVENT_ID is unset",
+            "incorrect", 0,
+          );
+          throw new Error(
+            "Storage lifecycle mutation refused without generated or explicitly configured retained-media proof",
+          );
+        }
+        const configuredProof = await this.proveConfiguredRetainedMediaEvent(
+          configuredEvent,
+          "storage-lifecycle",
+        );
+        if (!configuredProof) {
+          throw new Error("Storage lifecycle mutation refused because configured retained-media proof failed");
+        }
+      }
+
+      const configuredLane = this.config.laneConfigOracle?.lanes.find(
+        lane => lane.name === this.config.testLaneLabel,
+      );
+      if (!configuredLane) {
+        throw new Error("Direct daily-file proof requires the reserved lane in OSCAR_LANE_CONFIG_PATH");
+      }
+      directJournalLaneUid = configuredLane.uniqueId.startsWith("urn:")
+        ? configuredLane.uniqueId
+        : `urn:osh:system:lane:${configuredLane.uniqueId}`;
+      directJournalAfterAppend = await this.check<DirectJournalLaneState>({
+        scenario: "storage-lifecycle", category: "daily-file", action: "prove direct journal append",
+        target: directJournalLaneUid,
+        expected: "an emulator fault transition appends durable bytes directly to the exact lane journal without unsafe or partial entries",
+      }, async () => {
+        const before = await probe.runJson<DirectJournalLaneState>(
+          "journal-lane-state",
+          [directJournalLaneUid!],
+        );
+        try {
+          await this.emulator.waitForIdle(this.config.testRpmId);
+          await this.emulator.fault(this.config.testRpmId, "tamper", true);
+          await this.emulator.waitForStatus(
+            this.config.testRpmId,
+            status => status.tamper_fault,
+            "direct-journal tamper transition to assert",
+          );
+          await sleep(1_000);
+        } finally {
+          await this.emulator.fault(this.config.testRpmId, "tamper", false).catch(() => undefined);
+          await this.emulator.waitForStatus(
+            this.config.testRpmId,
+            status => !status.tamper_fault,
+            "direct-journal tamper transition to clear",
+          ).catch(() => undefined);
+        }
+        const after = await poll(
+          () => probe.runJson<DirectJournalLaneState>("journal-lane-state", [directJournalLaneUid!]),
+          state => state.present && directJournalInventoryValid(state) &&
+            state.bytes > before.bytes && state.files > 0,
+          {timeoutMs: 30_000, intervalMs: 1_000, description: "reserved lane journal bytes to advance"},
+        );
+        const passed = after.present && directJournalInventoryValid(after) &&
+          after.bytes > before.bytes && after.files > 0 &&
+          after.openSegments + after.sealedSegments > 0 && after.partialFiles === 0 &&
+          after.unsafeEntries === 0;
+        return {passed, ...(passed ? {value: after} : {}), observed: JSON.stringify({before, after})};
+      });
+      if (!directJournalAfterAppend) {
+        throw new Error("Storage lifecycle refused to continue after the direct daily-file append proof failed");
+      }
       await this.verifyGeneratedAlarmRetention(probe);
+      if (this.retainedBackupExpectations.size === 0) {
+        throw new Error(
+          "Storage lifecycle mutation refused because no exact retained-media set completed certification",
+        );
+      }
+      await this.check({
+        scenario: "storage-lifecycle", category: "retained-media",
+        action: "verify compact media metadata after retention",
+        target: "retained-media/v1",
+        expected: "generated five-frame media has schema-2 checkpoint state and compact hourly processed indexes with no legacy or unsafe metadata",
+      }, async () => {
+        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
+        const requirePopulated = this.generatedAlarmMedia.size > 0;
+        return {passed: mediaMetadataHealthIsSafe(value, requirePopulated), observed: JSON.stringify(value)};
+      });
       this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
       fixtureCreateAttempted = true;
       const fixture = await probe.runJson<{coldId: string; hotId: string; datastreamId: number;
@@ -3680,14 +3933,79 @@ export class RegressionScenarios {
         return {passed: ids.includes(coldPublicId) && ids.includes(hotPublicId),
           observed: `${ids.length} IDs; cold=${ids.includes(coldPublicId)}; hot=${ids.includes(hotPublicId)}`};
       });
+      const hotHold = await probe.runJson<{
+        holdId: string;
+        hotId: string;
+        resolution: string;
+        listed: boolean;
+      }>("fixture-hot-hold-create", [fixtureRun]);
+      try {
+        await this.check({
+          scenario: "storage-lifecycle", category: "retention",
+          action: "enforce exact hot-observation legal hold",
+          target: hotPublicId,
+          expected: "a listed HOT_EXACT hold rejects authenticated observation deletion and leaves the hot row queryable",
+        }, async () => {
+          const deletion = await request.delete(
+            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
+          );
+          const deletionStatus = deletion.status();
+          const deletionRejected = !deletion.ok();
+          await deletion.dispose();
+          const stillPresent = await request.get(
+            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
+          );
+          const queryStatus = stillPresent.status();
+          const queryable = stillPresent.ok();
+          await stillPresent.dispose();
+          const passed = hotHold.resolution === "HOT_EXACT" && hotHold.listed &&
+            hotHold.hotId === fixture.hotId && deletionRejected && queryable;
+          return {
+            passed,
+            observed: `resolution=${hotHold.resolution}; listed=${hotHold.listed}; ` +
+              `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
+          };
+        });
+      } finally {
+        const release = await probe.runJson<{released: boolean}>(
+          "fixture-hot-hold-release",
+          [fixtureRun, hotHold.holdId],
+        );
+        if (!release.released) throw new Error("Disposable HOT_EXACT hold was not released");
+      }
+      await this.check({
+        scenario: "storage-lifecycle", category: "retention",
+        action: "delete hot observation after hold release",
+        target: hotPublicId,
+        expected: "the same authenticated delete succeeds only after release and the observation is no longer queryable",
+      }, async () => {
+        const deletion = await request.delete(
+          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
+        );
+        const deletionStatus = deletion.status();
+        const deleted = deletion.ok();
+        await deletion.dispose();
+        const missing = await request.get(
+          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
+        );
+        const queryStatus = missing.status();
+        await missing.dispose();
+        return {
+          passed: deleted && queryStatus === 404,
+          observed: `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
+        };
+      });
       await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
         target: archived.generationId ?? "fixture generation",
-        expected: "hold create/list/release works; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
+        expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
         const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
         const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
-          "observationHoldCreated", "wrongTokenRejected", "purged",
+          "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
+          "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
           "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
-          .every(key => value[key] === true);
+          .every(key => value[key] === true) &&
+          value.generationHoldResolution === "GENERATION_EXACT" &&
+          value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
         return {passed, observed: JSON.stringify(value)};
       });
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
@@ -3699,25 +4017,86 @@ export class RegressionScenarios {
           value.walPartialArtifacts === 0 && value.checksumVerificationPassed,
         observed: JSON.stringify(value)};
       });
+      await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "verify DuckDB operation scratch cleanup",
+        target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
+        expected: "archive/export/query/count/delete sessions leave the private archive-disjoint scratch root empty",
+      }, async () => {
+        const value = await poll(
+          async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
+          scratch => archiveScratchIsSafe(scratch, true),
+          {timeoutMs: 60_000, intervalMs: 1_000,
+            description: "post-lifecycle DuckDB scratch to become empty"},
+        );
+        return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
+      });
       await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
         target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
-        const value = await probe.runJson<{healthy: boolean; partialFiles: number; recoveryErrors: number}>("journal-restart");
-        return {passed: value.healthy && value.partialFiles === 0 && value.recoveryErrors === 0,
-          observed: JSON.stringify(value)};
+        const value = await probe.runJson<{
+          healthy: boolean;
+          segmentsChecked: number;
+          segmentsPreserved: number;
+          segmentFailures: number;
+          partialFiles: number;
+          recoveryErrors: number;
+        }>("journal-restart", [directJournalLaneUid!]);
+        const lane = await probe.runJson<DirectJournalLaneState>(
+          "journal-lane-state",
+          [directJournalLaneUid!],
+        );
+        const laneDurable = lane.present && directJournalInventoryValid(lane) &&
+          lane.bytes >= directJournalAfterAppend!.bytes &&
+          lane.files > 0 && lane.openSegments + lane.sealedSegments > 0 &&
+          lane.partialFiles === 0 && lane.unsafeEntries === 0;
+        const exactRestartPreservation = Number.isSafeInteger(value.segmentsChecked) &&
+          value.segmentsChecked > 0 && value.segmentsPreserved === value.segmentsChecked &&
+          value.segmentFailures === 0;
+        return {passed: value.healthy && exactRestartPreservation &&
+          value.partialFiles === 0 && value.recoveryErrors === 0 && laneDurable,
+          observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
       });
       if (this.config.storageBackupWorkflow !== "disabled") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
           expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
-          const value = await probe.runJson<Record<string, unknown>>("backup-check");
+          const mediaBeforeBackup = assessMediaMetadataHealth(
+            await probe.runJson("media-metadata-health"),
+          );
+          const retainedExpectations = [...this.retainedBackupExpectations.values()].sort();
+          if (retainedExpectations.length === 0) {
+            throw new Error("Backup certification requires at least one exact retained-media set");
+          }
+          const value = await probe.runJson<Record<string, unknown>>(
+            "backup-check",
+            retainedExpectations,
+          );
+          const exactMembers = Number(value.retainedMediaExactMembersVerified);
+          const expectedMembers = Number(value.retainedMediaExpectedMembers);
+          const expectedProcessed = Number(value.expectedProcessedIndexes);
+          const expectedDeletion = Number(value.expectedDeletionIndexes);
+          const metadataIncluded = value.retainedMediaPrefixPresent === true &&
+            value.mediaMetadataCheckpointIncluded === true &&
+            Number(value.retainedMediaExpectedSets) === retainedExpectations.length &&
+            Number.isSafeInteger(expectedMembers) && expectedMembers > retainedExpectations.length * 6 &&
+            exactMembers === expectedMembers && expectedProcessed > 0 &&
+            expectedProcessed === mediaBeforeBackup.processedIndexFiles &&
+            Number(value.processedObservationIndexesIncluded) === expectedProcessed &&
+            Number(value.deletionIndexesIncluded) === expectedDeletion;
+          const deletionMetadataIncluded = Number.isSafeInteger(Number(value.deletionIndexesIncluded)) &&
+            Number(value.deletionIndexesIncluded) === mediaBeforeBackup.deletionIndexFiles &&
+            expectedDeletion === mediaBeforeBackup.deletionIndexFiles;
           return {passed: value.automaticVerification === true && value.supportedVerification === true &&
+            value.independentCoreAuthentication === true &&
             value.authenticatedManifest === true && value.journalConfirmationAuthenticated === true &&
             value.regularMarkers === true && value.epochValid === true &&
             value.verifiedEpoch === true && value.archiveGenerationInventoryExact === true &&
             Number.isSafeInteger(Number(value.archiveGenerationCount)) && Number(value.archiveGenerationCount) >= 0 &&
-            Number(value.journalReceipts) > 0 &&
+            Number(value.journalReceipts) > 0 && Number(value.journalReceiptSegmentsVerified) > 0 &&
             value.journalReceiptReferencesValid === true &&
-            value.retentionRespected === true && value.restoreAttempted === false, observed: JSON.stringify(value)};
+            value.retentionRespected === true && value.duckDbScratchExcluded === true &&
+            metadataIncluded && deletionMetadataIncluded && value.restoreAttempted === false,
+          observed: JSON.stringify({backup: value, mediaBeforeBackup})};
         });
       }
       await apiPage.close();
@@ -3751,7 +4130,7 @@ export class RegressionScenarios {
       });
       if (!identityAccepted) throw new Error("Destructive restore refused because exact 3.9.2 identity failed");
 
-      await this.check({
+      const restoreResult = await this.check<Record<string, unknown>>({
         scenario: "storage-restore-drill",
         category: "restore",
         action: "restore authenticated backup over isolated deployment",
@@ -3774,27 +4153,29 @@ export class RegressionScenarios {
           "timelineHistoryArchived", "newTimelineWalArchived", "priorWalPreserved",
           "postBackupWalPreserved",
           "archiverFailureFree", "recoverySettingsCleared", "verifiedEpochRestored",
-          "allCanariesRestored",
+          "allCanariesRestored", "authenticatedBackupReverified", "preRestoreSafetyCopyVerified",
         ].every(field => value[field] === true) &&
-          typeof value.backupId === "string" && typeof value.preRestoreSafetyDirectory === "string";
-        return {passed, observed: JSON.stringify(value)};
+          typeof value.backupId === "string" &&
+          /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/.test(value.backupId) &&
+          typeof value.preRestoreSafetyDirectory === "string";
+        return {passed, ...(passed ? {value} : {}), observed: JSON.stringify(value)};
       });
 
       const after = assessStoragePlatform(await probe.runJson("platform"));
-      await this.check({
+      const immutableImageIdentityPreserved = await this.check<boolean>({
         scenario: "storage-restore-drill",
         category: "restore",
         action: "verify immutable image identity after restore",
         target: this.config.targetHost,
         expected: "restore restarts the exact same immutable application, PostGIS, and gateway image IDs",
-      }, async () => ({
-        passed: storagePlatformHasExactReleaseIdentity(
+      }, async () => {
+        const passed = storagePlatformHasExactReleaseIdentity(
           after,
           this.config.storageExpectedRelease,
         ) && after.appImage.containerImageId === before.appImage.containerImageId &&
           after.postgisImage.containerImageId === before.postgisImage.containerImageId &&
-          after.gatewayImage.containerImageId === before.gatewayImage.containerImageId,
-        observed: JSON.stringify({
+          after.gatewayImage.containerImageId === before.gatewayImage.containerImageId;
+        return {passed, ...(passed ? {value: true} : {}), observed: JSON.stringify({
           before: {
             app: before.appImage.containerImageId,
             postgis: before.postgisImage.containerImageId,
@@ -3805,8 +4186,20 @@ export class RegressionScenarios {
             postgis: after.postgisImage.containerImageId,
             gateway: after.gatewayImage.containerImageId,
           },
-        }),
-      }));
+        })};
+      });
+      if (restoreResult && immutableImageIdentityPreserved === true) {
+        this.reporter.addMetadata({
+          restoreDrillCertification: {
+            schemaVersion: 1,
+            backupId: String(restoreResult.backupId),
+            authenticatedBackupReverified: true,
+            allCanariesRestored: true,
+            immutableImageIdentityPreserved: true,
+            preRestoreSafetyCopyVerified: true,
+          },
+        });
+      }
       this.reporter.storageMetric(storageMetricFromProbe(
         "storage-restore-drill-after",
         await probe.runJson("snapshot"),

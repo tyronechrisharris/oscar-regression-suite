@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {readFileSync} from "node:fs";
+import {createHash} from "node:crypto";
+import {appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs";
+import {tmpdir} from "node:os";
 import {resolve} from "node:path";
 import test from "node:test";
 
@@ -43,16 +45,43 @@ json_value=$(json_query 'UPDATE fixture SET value=1 RETURNING json')
 printf '%s\\t%s' "$scalar_value" "$json_value"`], {encoding: "utf8"});
 }
 
-function runHoldOutputParser(output: string, storeKey = "obs", idScope = "4"): string {
+function runHoldOutputParser(
+  output: string,
+  storeKey = "obs",
+  idScope = "4",
+  resolution = "GENERATION_EXACT",
+): string {
   const validUuid = probe.match(/^valid_uuid\(\) \{[^\n]+\}$/mu)?.[0];
   const parser = probe.match(/^retention_hold_id_from_output\(\) \{\n[\s\S]*?^\}/mu)?.[0];
   assert.ok(validUuid && parser, "missing retention-hold output parser");
   return execFileSync("bash", ["-c", `set -Eeuo pipefail
 ${validUuid}
 ${parser}
-retention_hold_id_from_output "$1" "$2" "$3"`, "hold-parser", output, storeKey, idScope], {
+retention_hold_id_from_output "$1" "$2" "$3" "$4"`,
+  "hold-parser", output, storeKey, idScope, resolution], {
     encoding: "utf8",
   });
+}
+
+function structuralStorageFixtureAccepted(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  const object = (candidate: unknown): candidate is Record<string, unknown> =>
+    Boolean(candidate) && typeof candidate === "object" && !Array.isArray(candidate);
+  const exactly = (className: string) => value.filter(candidate =>
+    object(candidate) && candidate.objClass === className);
+  const daily = exactly("com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig");
+  const oscar = exactly("com.botts.impl.service.oscar.OSCARServiceConfig");
+  const databases = exactly("org.sensorhub.impl.database.system.SystemDriverDatabaseConfig");
+  if (daily.length !== 1 || oscar.length !== 1 || databases.length !== 1) return false;
+  const media = object(oscar[0]!.videoRetentionConfig) ? oscar[0]!.videoRetentionConfig : undefined;
+  const db = object(databases[0]!.dbConfig) ? databases[0]!.dbConfig : undefined;
+  const archive = object(db) && object(db.archive) ? db.archive : undefined;
+  return object(media) && object(db) && object(archive) &&
+    typeof media.enableFrameRetention === "boolean" &&
+    typeof media.frameRetentionCount === "number" &&
+    typeof db.useBatch === "boolean" && db.useBatch === true &&
+    typeof archive.deleteHotAfterArchive === "boolean" &&
+    typeof daily[0]!.maxSegmentBytes === "number";
 }
 
 test("query helpers suppress DML command tags before parsing scalar and JSON rows", () => {
@@ -70,12 +99,36 @@ test("query helpers suppress DML command tags before parsing scalar and JSON row
 
 test("retention-hold parser accepts the canonical scoped CLI line and rejects ambiguity", () => {
   const id = "ee6dda6f-af28-4f9c-951f-97b80c231cd5";
-  const canonical = `Retention hold created: ${id} (store=obs, id-scope=4)`;
+  const canonical = `Retention hold created: ${id} (store=obs, id-scope=4, resolution=GENERATION_EXACT)`;
   assert.equal(runHoldOutputParser(`administrative preface\n${canonical}\n`), id);
   assert.throws(() => runHoldOutputParser(canonical, "other_store", "4"));
   assert.throws(() => runHoldOutputParser(canonical, "obs", "5"));
+  assert.throws(() => runHoldOutputParser(canonical, "obs", "4", "HOT_EXACT"));
   assert.throws(() => runHoldOutputParser(`Retention hold created: ${id}`));
+  assert.throws(() => runHoldOutputParser(
+    `Retention hold created: ${id} (store=obs, id-scope=4, resolution=UNKNOWN)`,
+  ));
+  assert.throws(() => runHoldOutputParser(
+    `Retention hold created: ${id} (store=obs, id-scope=4, resolution=LEGACY_UNKNOWN)`,
+  ));
   assert.throws(() => runHoldOutputParser(`${canonical}\n${canonical}`));
+  assert.throws(() => runHoldOutputParser(canonical.toUpperCase()));
+});
+
+test("shell UUID validation enforces canonical version and variant bits", () => {
+  const helper = probe.match(/^valid_uuid\(\) \{[^\n]+\}$/mu)?.[0];
+  assert.ok(helper);
+  const accepted = execFileSync("bash", ["-c", `set -Eeuo pipefail
+${helper}
+valid_uuid "$1"
+printf accepted`, "uuid", "123e4567-e89b-42d3-a456-426614174000"], {encoding: "utf8"});
+  assert.equal(accepted, "accepted");
+  for (const value of [
+    "123E4567-E89B-42D3-A456-426614174000",
+    "123e4567-e89b-02d3-a456-426614174000",
+    "123e4567-e89b-42d3-7456-426614174000",
+    "00000000-0000-0000-0000-000000000000",
+  ]) assert.throws(() => execFileSync("bash", ["-c", `${helper}; valid_uuid "$1"`, "uuid", value]));
 });
 
 test("storage probe remains valid Bash and gates exact 3.9.2 image identity", () => {
@@ -166,7 +219,7 @@ test("storage probe client registers privileged alarm baseline cleanup before an
   const register = client.indexOf(
     'if (action === "alarm-media-baseline" && alarmRun) this.alarmBaselineRuns.add(alarmRun)',
   );
-  const remote = client.indexOf('const {stdout} = await execFileAsync("ssh"');
+  const remote = client.indexOf('const {stdout} = await execFileAsync("ssh"', register);
   assert.ok(register > 0 && remote > register);
   const cleanup = client.slice(client.indexOf("async cleanup(): Promise<void>"));
   assert.match(cleanup, /for \(const run of this\.alarmBaselineRuns\)/);
@@ -174,7 +227,7 @@ test("storage probe client registers privileged alarm baseline cleanup before an
   assert.match(cleanup, /"alarm-media-cleanup", run/);
   assert.match(cleanup, /baselineCleanupError \?\?= error/);
   assert.match(cleanup, /Unable to remove a privileged alarm-media baseline marker/);
-  assert.match(cleanup, /rm -f -- \$\{shellQuote\(this\.remoteScript\)\}/);
+  assert.match(cleanup, /removeRemoteWorkspace/);
   assert.doesNotMatch(cleanup, /rm -f -- \/tmp\/oscar-alarm-media/);
   assert.match(cleanup, /this\.alarmBaselineRuns\.clear\(\)/);
 });
@@ -296,45 +349,59 @@ exec java \${JAVA_OPTS:-} \\
   )), false);
 });
 
-test("platform config probes remain pipefail-safe for a large persisted configuration", () => {
+test("platform config uses structural JSON extraction and rejects decoys, duplicates, and type mismatch", () => {
   const block = probe.slice(probe.indexOf("  platform)"), probe.indexOf("  snapshot)"));
-  const helper = probe.match(/config_text_matches\(\) \{\n[\s\S]*?\n\}/)?.[0];
-  assert.ok(helper, "missing config_text_matches helper");
-  assert.match(helper, /grep -Eq -- "\$pattern" <<<"\$text"/);
-  assert.equal(block.match(/config_text_matches "\$config_text"/g)?.length, 6);
-  assert.doesNotMatch(block, /printf[^\n]*\$config_text[^\n]*\|[^\n]*grep/);
+  const helper = probe.match(/^platform_config_fields\(\) \{\n[\s\S]*?^\}/mu)?.[0];
+  assert.ok(helper, "missing structural config helper");
+  const configContract = `${helper}\n${block}`;
+  for (const required of [
+    "json_array_elements", "json_each", "json_typeof", "WITH ORDINALITY",
+    "count(*) FROM candidates WHERE kind = 'daily'", "count(*) FROM candidates WHERE kind = 'oscar'",
+    "count(*) FROM candidates WHERE kind = 'database'", "GROUP BY key HAVING count(*) <> 1",
+    "OscarTieredObsSystemDatabaseConfig", "useBatch", "videoRetentionConfig",
+  ]) assert.ok(helper.includes(required), `missing structural config contract: ${required}`);
+  assert.doesNotMatch(block, /config_text_matches|daily_config_text|oscar_config_text/);
+  assert.doesNotMatch(block, /sed -n 's\/\.\*"(?:intervalMinutes|frameRetentionCount|maxSegmentBytes)/);
   for (const field of [
     "timeToRetention", "videoQueryPeriod", "enableFrameRetention", "frameRetentionCount", "jpegQuality",
-    "sourceRollbackGraceHours",
-  ]) assert.ok(block.includes(field), `missing retained-media preflight field: ${field}`);
+    "sourceRollbackGraceHours", "metadataReclamationWorkLimit",
+    "duckDbMemoryLimitMegabytes", "duckDbThreads", "duckDbMaximumTemporaryMegabytes",
+    "duckDbMaximumConcurrentSessions", "duckDbSessionAcquireTimeoutSeconds",
+    "duckDbTemporaryDirectory", "archiveResources", "schemaChecksum", "archiveScratch",
+    "dailyJournal", "rootDirectory", "journalDirectory", "publicationDirectory",
+    "dailyFileObservationMode", "fsyncIntervalMillis", "maxUnforcedRecords", "maxUnforcedBytes",
+    "maxSegmentBytes", "maxSegmentAgeSeconds", "maxRecordBytes", "sealedJournalRetentionDays",
+    "delegateObservationLifecycleToDatabase", "dailyFilePurgeWorkLimit",
+  ]) assert.ok(configContract.includes(field), `missing bounded-storage preflight field: ${field}`);
+  assert.match(block, /config=\/var\/lib\/oscar\/config[.]json/);
+  assert.match(block, /test -f "\$path" && test ! -L "\$path"/);
+  assert.match(block, /size.*-le 16777216/);
+  assert.match(block, /WHERE version=5/);
+  assert.match(block, /archive_scratch_json "\$duck_temp_dir" \/var\/lib\/oscar\/archive/);
 
-  const largeConfig = [
-    '"OscarTieredObsSystemDatabase": {},',
-    '"DailyFileJournalService": {},',
-    '"deleteHotAfterArchive": true,',
-    '"reWriteBatchedInserts": true,',
-    `"padding":"${"x".repeat(1024 * 1024)}"`,
-  ].join("\n");
-  const legacyPipeline = `set -o pipefail
-config_text=$(cat)
-printf '%s' "$config_text" | grep -q DailyFileJournalService`;
-  assert.throws(
-    () => execFileSync("bash", ["-c", legacyPipeline], {input: largeConfig, stdio: ["pipe", "pipe", "pipe"]}),
-    "large-config fixture must reproduce the legacy SIGPIPE failure",
-  );
-
-  const safeProbe = `set -Eeuo pipefail
-${helper}
-config_text=$(cat)
-config_text_matches "$config_text" 'OscarTieredObsSystemDatabase'
-config_text_matches "$config_text" 'DailyFileJournalService'
-config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*true'
-config_text_matches "$config_text" 'reWriteBatchedInserts[^A-Za-z]*(true|"true")'
-! config_text_matches "$config_text" '"deleteHotAfterArchive"[[:space:]]*:[[:space:]]*false'`;
-  assert.doesNotThrow(() => execFileSync("bash", ["-c", safeProbe], {
-    input: largeConfig,
-    stdio: ["pipe", "pipe", "pipe"],
-  }));
+  const daily = {objClass: "com.botts.impl.service.dailyfile.DailyFileJournalServiceConfig",
+    moduleClass: "com.botts.impl.service.dailyfile.DailyFileJournalService", maxSegmentBytes: 67_108_864};
+  const oscar = {objClass: "com.botts.impl.service.oscar.OSCARServiceConfig",
+    moduleClass: "com.botts.impl.service.oscar.OSCARServiceModule",
+    videoRetentionConfig: {enableFrameRetention: true, frameRetentionCount: 5}};
+  const database = {objClass: "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
+    moduleClass: "org.sensorhub.impl.database.system.SystemDriverDatabase",
+    dbConfig: {objClass: "org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig",
+      useBatch: true, archive: {deleteHotAfterArchive: false}}};
+  const valid = [daily, oscar, database];
+  assert.equal(structuralStorageFixtureAccepted(valid), true);
+  assert.equal(structuralStorageFixtureAccepted([
+    {objClass: "decoy", frameRetentionCount: 999, deleteHotAfterArchive: true}, ...valid,
+  ]), true, "an unrelated decoy cannot supply scoped values");
+  assert.equal(structuralStorageFixtureAccepted([...valid, structuredClone(daily)]), false,
+    "a duplicate expected module must fail");
+  const wrongType = structuredClone(valid);
+  (wrongType[1] as typeof oscar).videoRetentionConfig.frameRetentionCount = "5" as unknown as number;
+  assert.equal(structuralStorageFixtureAccepted(wrongType), false,
+    "a shape-compatible string cannot satisfy a numeric storage field");
+  assert.ok(block.includes("AND query ~ '[)][[:space:]]*,[[:space:]]*[(]'"));
+  assert.match(block, /\$batch_rows -gt \$batch_calls/);
+  assert.doesNotMatch(block, /reWriteBatchedInserts|OscarTieredObsSystemDatabase\|/);
 });
 
 test("archive health aggregates generations independently from archive objects", () => {
@@ -348,16 +415,82 @@ test("archive health aggregates generations independently from archive objects",
   assert.equal(block.match(/'activeHolds'/g)?.length, 1, "archive-health JSON must contain activeHolds once");
 });
 
-test("journal status extracts SHA-256 without exposing nested positional parameters", () => {
+test("journal status validates exact bounded v1 manifests and direct lane state", () => {
   const block = probe.slice(probe.indexOf("  journal-status)"), probe.indexOf("  journal-restart)"));
-  const digestFragment = block.match(/digest_line=\$\(sha256sum "\$csv"\)\n\s*actual_sha=\$\{digest_line%% \*\}/)?.[0];
-  assert.ok(digestFragment, "missing nesting-safe journal digest extraction");
-  assert.doesNotMatch(block, /awk[^\n]*\\\\\$1/);
-  const actual = execFileSync("sh", ["-eu", "-c", `csv=$1
-${digestFragment}
-printf '%s' "$actual_sha"`, "journal-digest", resolve("package.json")], {encoding: "utf8"});
-  const expected = execFileSync("sha256sum", [resolve("package.json")], {encoding: "utf8"}).split(/\s+/u)[0];
-  assert.equal(actual, expected);
+  for (const required of [
+    "total", "100000", "manifest_size", "1048576", "manifest_encoded",
+    "json_object_keys(raw))=12", "OSCAR_LEGACY_DAILY_CSV", "checksumAlgorithm", "SHA-256",
+    "windowStartInclusive", "windowEndExclusive", "dataFile", "publishedAt", "unsafeLinks",
+    "unsafeEntries",
+    "bounded", "journal-lane-state)", "urn:osh:system:lane:", "directory_id",
+    "sha256sum | cut -c1-12", "lane.id", "-mindepth 2 -maxdepth 2",
+    "openSegments", "sealedSegments", "unsafeEntries",
+  ]) assert.ok(block.includes(required), `missing direct-journal validation contract: ${required}`);
+  assert.ok(block.includes(
+    "^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}",
+  ));
+  assert.ok(block.includes(
+    "value->>'dataFile' ~ '^[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}",
+  ));
+  const publicationPattern = block.match(/\[\[ ! \$manifest =~ (\^[^ ]+) \]\]/u)?.[1];
+  assert.ok(publicationPattern, "missing executable flat publication-path pattern");
+  const canonicalManifest =
+    "/var/lib/oscar/files/dailyfiles/Lane50-0123456789ab_2026-10-18.csv.manifest.v1.json";
+  execFileSync("bash", ["-c", `[[ $1 =~ ${publicationPattern} ]]`, "manifest-path", canonicalManifest]);
+  assert.throws(() => execFileSync("bash", ["-c", `[[ $1 =~ ${publicationPattern} ]]`,
+    "manifest-path", "/var/lib/oscar/files/dailyfiles/Lane50/2026-10-18.csv.manifest.v1.json"]));
+  assert.match(block, /-name "[*][.]partial[.]\*"/);
+  assert.match(block, /\(value->>'recordCount'\)::bigint=\$actual_records/);
+  assert.match(block, /\(value->>'byteCount'\)::bigint=\$actual_bytes/);
+  assert.match(block, /value->>'sha256'='\$actual_sha'/);
+  assert.match(block, /value->>'dataFile'='\$csv_name'/);
+  assert.match(block, /'\$csv_day'::date::timestamp AT TIME ZONE 'UTC'/);
+  assert.match(block, /publishedAt'\)::timestamptz >=/);
+  assert.doesNotMatch(block, /for manifest in \$\(find/);
+});
+
+test("journal restart prefix oracle rejects truncation masked by later growth", () => {
+  const helper = probe.match(/^journal_prefix_matches\(\) \{\n[\s\S]*?^\}/mu)?.[0];
+  assert.ok(helper, "missing journal prefix helper");
+  const root = mkdtempSync(resolve(tmpdir(), "oscar-journal-prefix-"));
+  const candidate = resolve(root, "000001.open");
+  const original = Buffer.from("durable-prefix-before-restart\n", "utf8");
+  const digest = createHash("sha256").update(original).digest("hex");
+  const run = () => execFileSync("bash", ["-c", `set -Eeuo pipefail
+${helper}
+journal_prefix_matches "$1" "$2" "$3"`, "prefix", digest, String(original.length), candidate]);
+  try {
+    writeFileSync(candidate, original);
+    appendFileSync(candidate, "legitimate-growth\n");
+    assert.doesNotThrow(run);
+    writeFileSync(candidate, Buffer.concat([
+      Buffer.from("TRUNCATED-AND-REPLACED!!!!!!!\n"),
+      Buffer.alloc(original.length + 32, 0x78),
+    ]));
+    assert.throws(run, "growth after truncation must not satisfy byte-count monotonicity");
+    writeFileSync(candidate, original.subarray(0, 5));
+    assert.throws(run, "a shorter successor must fail");
+  } finally {
+    rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test("media metadata probe validates compact checkpoint and exact binary indexes", () => {
+  const start = probe.indexOf("media_metadata_health_json()");
+  const end = probe.indexOf("\n}\n", start);
+  const helper = probe.slice(start, end + 2);
+  for (const required of [
+    ".metadata-reclamation-checkpoint.json", "checkpoint_schema",
+    "earliestProcessedObservationEpochHour", "retention-processed-index", "deletion-index",
+    "legacyProcessedMarkerFiles", "legacyDeletionTombstones", "indexFormatFailures", "100000",
+    "4f534341524d50490000000100000024", "4f534341524d44490000000100000024",
+  ]) assert.ok(helper.includes(required), `missing media metadata health contract: ${required}`);
+  assert.match(helper, /\^\[0-9\]\{19\}-\(0\[0-9\]\|1\[01\]\)\[.]idx\$/);
+  assert.match(helper, /\(\(\(size-16\)%36\)\)/);
+  assert.doesNotMatch(helper, /records[^\n]*-gt 100000/,
+    "valid high-rate five-minute index files must stream rather than fail format validation");
+  assert.match(probe, /  media-metadata-health\)/);
+  assert.match(probe, /  archive-scratch-health\)/);
 });
 
 test("storage snapshot emits activeHolds exactly once", () => {
@@ -372,6 +505,11 @@ test("storage snapshot emits activeHolds exactly once", () => {
     !block.includes("awk '{print \\\\$1+0}'"),
     "a doubled backslash leaves $1 exposed to the outer shell",
   );
+  for (const field of [
+    "retainedMediaManifestFiles", "retainedMediaJpegFiles", "processedObservationIndexFiles",
+    "processedObservationIndexBytes", "deletionIndexFiles", "deletionIndexBytes",
+    "legacyProcessedMarkerFiles", "legacyDeletionTombstones", "mediaMetadataCheckpointBytes",
+  ]) assert.ok(block.includes(field), `missing media storage metric: ${field}`);
 });
 
 test("backup check authenticates markers, epoch, supported verification, and journal receipts", () => {
@@ -391,8 +529,21 @@ test("backup check authenticates markers, epoch, supported verification, and jou
     "oscar-dailyfile-backup-confirmation-set",
     "confirmationSet",
     "oscar-backup:$backup/oscar-state.tar.gz#sha256=$oscar_state_sha",
+    "duckDbScratchExcluded",
+    "retainedMediaPrefixPresent",
+    "mediaMetadataCheckpointIncluded",
+    "processedObservationIndexesIncluded",
+    "deletionIndexesIncluded",
+    "retainedMediaManifestsIncluded",
+    "retainedMediaJpegsIncluded",
   ]) assert.ok(block.includes(required), `missing backup contract: ${required}`);
   assert.match(block, /-f \$root\/\$required && ! -L \$root\/\$required/);
+  assert.match(block, /-f \$root\/archive-generation-ids\.txt && ! -L \$root\/archive-generation-ids\.txt/);
+  assert.doesNotMatch(
+    block,
+    /-s \$root\/archive-generation-ids\.txt/,
+    "a zero-generation inventory is the canonical empty file and must remain valid",
+  );
   assert.match(block, /convert_from\(decode\('\$encoded','base64'\),'UTF8'\)::jsonb/);
   assert.match(block, /json_object_keys\(raw\)\)=10/);
   assert.match(block, /value->>'day'='\$receipt_day'/);
@@ -407,10 +558,39 @@ test("backup check authenticates markers, epoch, supported verification, and jou
   assert.match(block, /archive-generation-ids\.txt" \{count\+\+\} END \{print count\+0\}' "\$root\/SHA256SUMS"\) == 1/);
   assert.match(block, /generation_bytes -le 37000000/);
   assert.match(block, /generation_count -le 1000000/);
-  assert.match(block, /sort -c -u "\$root\/archive-generation-ids\.txt"/);
-  assert.match(block, /array_to_string\(archive_generation_ids,','\)/);
-  assert.match(block, /catalog_generation_ids == "\$inventory_generation_ids"/);
+  assert.match(block, /generation_bytes == \$\(\(generation_count \* 37\)\)/);
+  assert.match(block, /generation_sha=\$\(sha256_file "\$root\/archive-generation-ids\.txt"\)/);
+  assert.match(block, /archive_generation_count\|\|'\|'\|\|archive_generation_inventory_sha256\|\|'\|'\|\|archive_generation_inventory_bytes/);
+  assert.match(block, /catalog_generation_receipt == "\$generation_count\|\$generation_sha\|\$generation_bytes"/);
+  assert.doesNotMatch(block, /array_to_string\(archive_generation_ids/);
+  assert.doesNotMatch(block, /paste -sd,/);
+  assert.match(block, /tar -tzf "\$root\/oscar-state[.]tar[.]gz"/);
+  assert.match(block, /duckdb-tmp/);
+  assert.match(block, /retention-processed-index\/\[0-9\]\{19\}-\(0\[0-9\]\|1\[01\]\)/);
+  assert.match(block, /verify_retained_backup_members/);
+  assert.match(block, /expected-retained-members[.]txt/);
+  assert.match(block, /retainedMediaExactMembersVerified/);
+  assert.match(block, /expectedProcessedIndexes/);
+  assert.match(block, /expectedDeletionIndexes/);
+  assert.match(block, /frame-%02d[.]jpg/);
   assert.doesNotMatch(block, /grep -Fq "\\"backupReference/);
+});
+
+test("privileged command diagnostics use private workspaces, not fixed root logs", () => {
+  assert.match(probe, /^umask 077$/m);
+  for (const prefix of [
+    "oscar-regression-archive-verify", "oscar-regression-activation-",
+    "oscar-regression-backup-check", "oscar-regression-restore-",
+  ]) assert.ok(probe.includes(`mktemp -d \"/tmp/${prefix}`) || probe.includes(`mktemp -d /tmp/${prefix}`));
+  for (const fixed of [
+    "/tmp/oscar-regression-archive-verify.log",
+    "/tmp/oscar-regression-activation-holder-",
+    "/tmp/oscar-regression-backup-verify.log",
+    "/tmp/oscar-regression-restore-backup-verify.log",
+    "/tmp/oscar-regression-restore.log",
+    "/tmp/oscar-regression-restore-archive-verify.log",
+  ]) assert.ok(!probe.includes(fixed), `fixed privileged log remains: ${fixed}`);
+  assert.match(probe, /emit_command_diagnostics/);
 });
 
 test("restore drill is a separate exact-confirmation action with multi-plane canaries", () => {
@@ -421,6 +601,10 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
   assert.match(block, /expected_archive/);
   assert.match(block, /paths_overlap/);
   assert.match(block, /test ! -e "\/var\/lib\/oscar\/\$1" && test ! -L/);
+  assert.match(block, /restored_generation_bytes == \$\(\(restored_generation_count \* 37\)\)/);
+  assert.match(block, /archive_generation_count=\$restored_generation_count/);
+  assert.match(block, /archive_generation_inventory_sha256='\$restored_generation_sha'/);
+  assert.match(block, /archive_generation_inventory_bytes=\$restored_generation_bytes/);
   for (const field of [
     "databaseRestored",
     "applicationStateRestored",
@@ -448,6 +632,7 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
 
 test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
   const exportBlock = probe.slice(probe.indexOf("  export-check)"), probe.indexOf("  fixture-controls)"));
+  const hotBlock = probe.slice(probe.indexOf("  fixture-hot-hold-create)"), probe.indexOf("  fixture-controls)"));
   const controlBlock = probe.slice(probe.indexOf("  fixture-controls)"), probe.indexOf("  backup-check)"));
   assert.match(exportBlock, /archive export --store-key "\$store_key" --id-scope "\$id_scope"/);
   for (const operation of ["hold create", "dry-run", "purge"]) {
@@ -460,11 +645,22 @@ test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
   assert.match(controlBlock, /--observation "\$cold_id"/);
   assert.ok(controlBlock.includes("generationHoldCreated"));
   assert.ok(controlBlock.includes("observationHoldCreated"));
-  assert.match(controlBlock, /retention_hold_id_from_output "\$hold_output" "\$store_key" "\$id_scope"/);
-  assert.match(controlBlock, /retention_hold_id_from_output "\$observation_hold_output" "\$store_key" "\$id_scope"/);
+  assert.ok(controlBlock.includes("generationHoldEnforced"));
+  assert.ok(controlBlock.includes("coldObservationHoldEnforced"));
+  assert.match(controlBlock, /hold_count FROM oscar_deletion_plan/);
+  assert.match(controlBlock, /count\(\*\) FROM oscar_deletion_plan_item/);
+  assert.match(controlBlock, /retention_hold_id_from_output "\$hold_output" "\$store_key" "\$id_scope" GENERATION_EXACT/);
+  assert.match(controlBlock, /retention_hold_id_from_output "\$observation_hold_output" "\$store_key" "\$id_scope" COLD_RANGE_CONSERVATIVE/);
+  assert.match(controlBlock, /resolution_mode='GENERATION_EXACT'/);
+  assert.match(controlBlock, /resolution_mode='COLD_RANGE_CONSERVATIVE'/);
   assert.match(controlBlock, /created_by='oscar-regression'/);
   assert.match(controlBlock, /reason='regression-\$run'/);
   assert.match(controlBlock, /reason='regression-observation-\$run'/);
+  for (const required of [
+    "fixture-hot-hold-create)", "fixture-hot-hold-release)", "HOT_EXACT",
+    "regression-hot-$run", "hotId", "listed", "released",
+  ]) assert.ok(hotBlock.includes(required), `missing exact hot-hold contract: ${required}`);
+  assert.match(hotBlock, /retention_hold_id_from_output "\$hot_output" "\$store_key" "\$id_scope" HOT_EXACT/);
 });
 
 test("disposable lifecycle proves exact-row activation and deployed helper behavior", () => {
@@ -537,10 +733,12 @@ test("retained-media scenario browser-decodes every assessed frame", () => {
   assert.ok(originStart > 0 && start > originStart && end > start);
   assert.match(block, /await this\.goto\(page, "\/"\)/);
   assert.doesNotMatch(block, /await this\.goto\(page, "\/dashboard"\)/);
-  assert.match(block, /for \(const asset of assessment\.assets\)/);
-  assert.match(block, /createImageBitmap\(blob\)/);
-  assert.match(block, /bitmap\.width === width && bitmap\.height === height/);
-  assert.match(block, /assessment\.jpegQualities\.every\(quality => quality === 85\)/);
+  assert.match(block, /for \(const asset of assessed\.assets\)/);
+  assert.match(block, /page\.evaluate\(boundedFetch/);
+  assert.match(block, /maxBytes: Math\.min\(asset\.bytes, MAX_RETAINED_FRAME_BYTES\)/);
+  assert.match(block, /image\.decodedWidth === asset\.width && image\.decodedHeight === asset\.height/);
+  assert.doesNotMatch(block, /response\.body\(\)|response\.json\(\)|image\.body\(\)/);
+  assert.match(block, /assessed\.jpegQualities\.every\(quality => quality === 85\)/);
 });
 
 test("storage lifecycle refuses mutation when exact release/profile preflight fails", () => {
@@ -559,6 +757,20 @@ test("storage lifecycle refuses mutation when exact release/profile preflight fa
   assert.ok(block.indexOf("verifyGeneratedAlarmRetention") > block.indexOf("if (!profileAccepted)"));
 });
 
+test("lifecycle-only required storage refuses zero-media certification before lane mutation", () => {
+  const start = scenarios.indexOf("private async storageLifecycle");
+  const end = scenarios.indexOf("private async storageRestoreDrill", start);
+  const block = scenarios.slice(start, end);
+  const refusal = block.indexOf(
+    "Storage lifecycle mutation refused without generated or explicitly configured retained-media proof",
+  );
+  const journalMutation = block.indexOf("prove direct journal append");
+  assert.ok(refusal > 0 && journalMutation > refusal);
+  assert.match(block, /this\.generatedAlarmMedia\.size === 0 && this\.retainedBackupExpectations\.size === 0/);
+  assert.match(block, /proveConfiguredRetainedMediaEvent/);
+  assert.match(block, /no exact retained-media set completed certification/);
+});
+
 test("storage lifecycle cleans an attempted fixture even when create acknowledgement is lost", () => {
   const start = scenarios.indexOf("private async storageLifecycle");
   const end = scenarios.indexOf("private async storageRestoreDrill", start);
@@ -568,6 +780,40 @@ test("storage lifecycle cleans an attempted fixture even when create acknowledge
   const cleanup = block.indexOf('if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup"', create);
   assert.ok(attempted > 0 && create > attempted && cleanup > create);
   assert.doesNotMatch(block, /fixtureCreated/);
+});
+
+test("storage lifecycle proves direct journal durability, hold enforcement, scratch cleanup, and metadata backup", () => {
+  const start = scenarios.indexOf("private async storageLifecycle");
+  const end = scenarios.indexOf("private async storageRestoreDrill", start);
+  const block = scenarios.slice(start, end);
+  for (const required of [
+    "OSCAR_STORAGE_SCHEMA_CHECKSUM", "journal-lane-state", "prove direct journal append",
+    "status.tamper_fault", "reserved lane journal bytes to advance", "verify compact media metadata",
+    "mediaMetadataHealthIsSafe", "fixture-hot-hold-create", "HOT_EXACT",
+    ".delete(", "fixture-hot-hold-release", "GENERATION_EXACT", "COLD_RANGE_CONSERVATIVE",
+    "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
+    "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
+    "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
+    "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",
+    "deletionIndexesIncluded",
+    "retainedMediaExpectedSets", "retainedMediaExpectedMembers",
+    "retainedMediaExactMembersVerified", "expectedProcessedIndexes", "expectedDeletionIndexes",
+  ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
+  const holdCreate = block.indexOf('"fixture-hot-hold-create"');
+  const heldDelete = block.indexOf("request.delete(", holdCreate);
+  const holdRelease = block.indexOf('"fixture-hot-hold-release"', heldDelete);
+  const releasedDelete = block.indexOf("request.delete(", holdRelease);
+  assert.ok(holdCreate > 0 && heldDelete > holdCreate && holdRelease > heldDelete && releasedDelete > holdRelease);
+  assert.match(block, /lane\.bytes >= directJournalAfterAppend!\.bytes/);
+});
+
+test("restore drill re-runs the exact schema/checksum release identity gate", () => {
+  const start = scenarios.indexOf("private async storageRestoreDrill");
+  const end = scenarios.indexOf("private async extendedOccupancy", start);
+  const block = scenarios.slice(start, end);
+  assert.equal(block.match(/storagePlatformHasExactReleaseIdentity/g)?.length, 2);
+  assert.match(block, /const before = assessStoragePlatform/);
+  assert.match(block, /const after = assessStoragePlatform/);
 });
 
 test("retained-media gallery measures concurrency and proves selected content loaded", () => {
@@ -585,7 +831,7 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   const policyStart = scenarios.indexOf("private fullRunCanSelfSeedRetainedMedia");
   const policyEnd = scenarios.indexOf("private async check", policyStart);
   const policy = scenarios.slice(policyStart, policyEnd);
-  assert.match(policy, /this\.config\.profile === "full"/);
+  assert.match(policy, /\["full", "3\.9\.2-release"\]\.includes\(this\.config\.profile\)/);
   assert.match(policy, /this\.selected\("storage-lifecycle"\)/);
   for (const producer of ["rpm-alarms", "event-uuid", "adjudication"]) {
     assert.ok(policy.includes(`"${producer}"`), `missing retained-media producer ${producer}`);

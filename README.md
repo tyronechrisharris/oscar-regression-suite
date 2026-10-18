@@ -57,9 +57,13 @@ source review before the suite can certify that version.
   transfers and event resource budgets, baseline-JPEG structure plus Chromium
   decode/dimension checks for every frame, lazy selected-frame requests, and
   legacy-video fallback;
-  durable daily-file publications and restart recovery; archive catalog,
-  checksum, parity, portable export, hot/cold query, hold, tokenized purge, and
-  authenticated coordinated-backup controls and daily-journal receipts;
+  schema-2 metadata checkpoint and compact five-minute processed/deletion index
+  health; exact direct daily-file config, live lane-UID append, hardened
+  publication manifests, and restart durability; archive catalog, exact schema
+  v5 checksum, bounded DuckDB resources and scratch cleanup, parity, portable
+  export, hot/cold query, all three exact hold modes with deletion enforcement,
+  tokenized purge, and authenticated coordinated-backup controls, retained-media
+  inclusion, scratch exclusion, and daily-journal receipts;
   exact application/PostGIS/gateway tags, immutable running image IDs,
   available repository digests, OCI labels, checksum and all three deployment-bound
   storage-root markers, stable lock rejection, exact WAL command, atomic no-replace
@@ -81,12 +85,15 @@ the real reserved-RPM disconnect/reconnect and supported fault transitions.
 ## Safety model
 
 `smoke` is non-fault-injecting, but it authenticates, posts a national-statistics
-command, and creates report bucket files. `full` also changes emulator state and creates permanent,
+command, creates report bucket files, and behavior-tests the storage atomic publisher
+when `storage-health` is selected. `full` also changes emulator state and creates permanent,
 clearly marked adjudication audit records. Full runs are refused unless
 `OSCAR_TEST_TARGET_ACK` exactly matches the host in `OSCAR_BASE_URL`.
-It also requires exact emulator-host and RPM-to-lane acknowledgements. The local
-lock prevents overlapping full runs on one runner; operators must ensure another
-runner is not using the same RPM.
+It also requires exact emulator-host and RPM-to-lane acknowledgements. Every
+mutating invocation holds one host-wide, root-owned remote lease for its complete
+run, including cleanup; this coordinates different runners, full runs, restore
+drills, and storage-health publisher checks. Full/restore local locks remain an
+additional same-runner guard.
 
 The suite reserves one RPM (default `rpm-50` / `Lane50`), snapshots its complete
 configuration, disables random occupancies, runs deterministic tests, clears all
@@ -139,6 +146,19 @@ it only after reviewing
 npm run test:restore-drill
 ```
 
+For final 3.9.2 certification, first preserve the complete PASS directory from
+an unfiltered `restore-drill`. Then set every workflow to `required`, set an exact
+`OSCAR_BUILD_LABEL`, point `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching
+directory, and run the unfiltered release profile:
+
+```bash
+npm run test:3.9.2-release
+```
+
+This mode rejects scenario filters, missing/skipped gates, mismatched build or
+target identity, and restore evidence without the complete authenticated-backup,
+canary, immutable-image, and pre-restore-safety-copy attestation.
+
 Run one or more named scenarios with a comma-separated filter:
 
 ```bash
@@ -166,7 +186,16 @@ Start from [.env.example](.env.example). Required values are:
 | `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
 | `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.9.2 storage profile |
 | `OSCAR_RELEASE_DIR` | absolute release path on the disposable OSCAR SSH target |
-| `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>:<release-dir>:DISPOSABLE-STORAGE` lifecycle interlock |
+| `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>|<ssh-target>|<canonical-release-dir>|DISPOSABLE-STORAGE` interlock for every storage probe, including smoke |
+| `OSCAR_BUILD_LABEL` | exact artifact/component identity; mandatory for `3.9.2-release` |
+| `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` | complete PASS directory from the matching unfiltered restore drill; mandatory for `3.9.2-release` |
+
+Before any storage command or probe upload, the runner resolves
+`OSCAR_RELEASE_DIR` on the SSH target and requires it to be an existing,
+non-root directory whose remotely canonical path exactly matches both the
+configuration and acknowledgement. Symlinked/non-canonical release paths and a
+missing, linked, or non-regular `oscar.sh` are refused. The acknowledgement is
+rechecked before every subsequent probe action.
 
 Set `EVENT_UUID_WORKFLOW=required` when validating a Viewer build that claims
 the occupancy UUID workflow. The default `auto` mode records one skipped check
@@ -200,13 +229,15 @@ view query through the real Status of Health navigation link—as a release fail
 The explicit `auto` mode remains compatible with older Viewers by recording a
 skip only when the workflow itself is absent.
 
-`OSCAR_SSH_TARGET` enables Docker/host performance sampling and is required by
-the OSCAR 3.9.2 storage-health and storage-lifecycle gates.
+`OSCAR_SSH_TARGET` enables Docker/host performance sampling and the host-wide
+suite lease. It is required by every mutating invocation, including the default
+smoke run, reports/national-statistics filters, and both OSCAR 3.9.2 storage gates.
 `OSCAR_SSH_IDENTITY_FILE` may point to a dedicated least-privilege key.
 `BROWSER_EXECUTABLE_PATH` can select a preinstalled Chrome binary on a runner.
 
-Storage smoke checks are read-only except for normal Viewer authentication. The
-full `storage-lifecycle` scenario uses a separately acknowledged disposable
+Storage-health is non-destructive but not strictly read-only: its publisher
+contract creates and removes private temporary probe data, so the suite-wide
+remote lease is held. The full `storage-lifecycle` scenario uses a separately acknowledged disposable
 3.9.2 database, registers two synthetic copied observations, and refuses any
 cold purge whose plan includes data outside its unique fixture generation. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
@@ -215,6 +246,11 @@ seven days. It does not restore a backup. Daily-file publication verification re
 overnight/rotation-soak fixture; backup verification can be disabled separately
 with `STORAGE_BACKUP_WORKFLOW=disabled`. See
 [docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md).
+
+The automated storage probe is a Linux SSH/Docker gate. Native Windows Docker
+Desktop/PowerShell acceptance is currently deferred and must be recorded as a
+separate run; Linux execution and static PowerShell review do not constitute a
+Windows pass.
 
 `restore-drill` is a separate destructive profile and cannot be selected by a
 smoke/full scenario filter. In addition to the ordinary target and storage
@@ -238,8 +274,8 @@ Each run creates `results/<UTC timestamp>-<runner>/` containing:
 - `functional-results.csv` — one row per expected behavior, including correct,
   incorrect, and skipped counts
 - `performance.csv` — time-series resource samples by phase and target
-- `storage-performance.csv` — PostgreSQL/WAL/batch, archive, journal, media,
-  and backup point-in-time counters
+- `storage-performance.csv` — PostgreSQL/WAL/batch, archive, journal, retained
+  media and compact-metadata/index, and backup point-in-time counters
 - `summary.csv` — correctness and resource aggregates
 - `errors.csv` — browser, network, API, cleanup, and sampling errors
 - `summary.md` — concise narrative PASS/FAIL report

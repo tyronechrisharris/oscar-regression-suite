@@ -5,11 +5,13 @@ import {mkdirSync, rmSync, writeFileSync} from "node:fs";
 import {arch, hostname, platform, tmpdir} from "node:os";
 import {join} from "node:path";
 import {BrowserHarness} from "./browser.js";
-import {assertMutationAllowed, loadConfig} from "./config.js";
+import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "./config.js";
 import {RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {RunReporter} from "./reporter.js";
+import {validateRestoreEvidenceBundle} from "./release-certification.js";
+import {RemoteSuiteLease} from "./remote-suite-lease.js";
 import {RegressionScenarios} from "./scenarios.js";
 import {describeError} from "./util.js";
 
@@ -66,9 +68,18 @@ async function main(): Promise<number> {
   const startedAt = new Date();
   const config = loadConfig();
   assertMutationAllowed(config);
+  const suiteGitCommit = gitCommit();
+  const restoreEvidence = config.profile === "3.9.2-release"
+    ? validateRestoreEvidenceBundle(config.releaseRestoreEvidenceDirectory ?? "", {
+      suiteGitCommit,
+      oscarBuildLabel: config.oscarBuildLabel ?? "",
+      oscarBaseUrl: config.oscarBaseUrl,
+      oscarReleaseDirectory: config.oscarReleaseDirectory ?? "",
+    })
+    : undefined;
   const reporter = new RunReporter(runIdentifier(), config.resultsRoot, [config.oscarPassword], {
     suiteVersion: "1.1.0",
-    suiteGitCommit: gitCommit(),
+    suiteGitCommit,
     profile: config.profile,
     scenarioFilter: [...config.scenarioFilter].sort(),
     nodeVersion: process.version,
@@ -101,6 +112,12 @@ async function main(): Promise<number> {
     storageBackupWorkflow: config.storageBackupWorkflow,
     ...(config.oscarReleaseDirectory
       ? {oscarReleaseDirectory: config.oscarReleaseDirectory} : {}),
+    ...(config.releaseRestoreEvidenceDirectory
+      ? {releaseRestoreEvidenceDirectory: config.releaseRestoreEvidenceDirectory} : {}),
+    ...(restoreEvidence ? {
+      releaseRestoreEvidenceRunId: restoreEvidence.runId,
+      releaseRestoreEvidenceBackupId: restoreEvidence.backupId,
+    } : {}),
     ...(config.storageRetainedEventId
       ? {storageRetainedEventId: config.storageRetainedEventId} : {}),
     ...(config.storageLegacyEventId
@@ -114,11 +131,18 @@ async function main(): Promise<number> {
   const metrics = new MetricsSampler(config, reporter);
   const scenarios = new RegressionScenarios(config, reporter, browser, emulator, metrics);
   let interrupted = false;
-  const mutationRunLock = config.profile === "full"
+  const mutationRunLock = config.profile === "full" || config.profile === "3.9.2-release"
     ? acquireFullRunLock(config.rpmEmulatorUrl, config.testRpmId)
     : config.profile === "restore-drill"
       ? acquireRestoreRunLock(config.targetHost, config.oscarReleaseDirectory ?? "missing")
       : undefined;
+  const remoteLease = requiresRemoteSuiteLease(config)
+    ? new RemoteSuiteLease({
+      oscarSshTarget: config.oscarSshTarget ?? "",
+      oscarReleaseDirectory: config.oscarReleaseDirectory ?? "",
+      ...(config.sshIdentityFile ? {sshIdentityFile: config.sshIdentityFile} : {}),
+    })
+    : undefined;
 
   const handleSignal = (signal: NodeJS.Signals) => {
     interrupted = true;
@@ -130,13 +154,16 @@ async function main(): Promise<number> {
   scenarios.setStopRequested(() => interrupted);
 
   try {
+    await remoteLease?.acquire();
     await metrics.start();
     if (config.profile === "restore-drill") {
       await scenarios.runRestoreDrill();
     } else {
       await browser.start();
       await scenarios.runReadOnly();
-      if (config.profile === "full" && !interrupted) await scenarios.runFull();
+      if ((config.profile === "full" || config.profile === "3.9.2-release") && !interrupted) {
+        await scenarios.runFull();
+      }
     }
   } catch (error) {
     reporter.error("harness", "runner", error);
@@ -148,6 +175,14 @@ async function main(): Promise<number> {
     if (interrupted) await scenarios.emergencyCleanup().catch((error) => reporter.error("harness", "signal-cleanup", error));
     await metrics.stop().catch((error) => reporter.error("harness", "metrics-stop", error, "", "warning"));
     await browser.stop().catch((error) => reporter.error("harness", "browser-stop", error, "", "warning"));
+    await remoteLease?.release().catch(error => {
+      reporter.error("harness", "remote-suite-lease-release", error);
+      reporter.outcome(
+        "harness", "safety", "release remote suite lease", config.targetHost,
+        "the host-wide mutation lease is released cleanly", "lease release failed",
+        "incorrect", 0, "", describeError(error),
+      );
+    });
     mutationRunLock?.release();
     process.off("SIGINT", handleSignal);
     process.off("SIGTERM", handleSignal);

@@ -38,10 +38,18 @@ truth rather than duplicated expectations.
 
 ## Strict SSH for performance and storage validation
 
-SSH is optional only for an explicit non-storage/legacy run with
-`STORAGE_WORKFLOW=auto` or `disabled`. The default OSCAR 3.9.2
-`STORAGE_WORKFLOW=required` gate needs SSH both for performance evidence and for
-the target-side storage probe. Before setting `OSCAR_SSH_TARGET`:
+The 3.9.2 target-side storage helper is a Linux Bash/Docker probe. Native
+Windows Docker Desktop plus PowerShell/`oscar.bat` acceptance is not executed by
+this path and remains deferred. Do not translate a successful Linux run or
+static PowerShell contract test into a Windows deployment pass; capture a
+separate Windows-native transcript when that machine is available.
+
+SSH is optional only for an explicitly filtered, genuinely non-mutating run.
+The default smoke run posts commands/writes reports and the storage-health
+atomic-publisher proof uses private temporary data, so it requires SSH for the
+host-wide suite lease even when fault injection is absent. The OSCAR 3.9.2
+storage gate also uses SSH for metrics and its target probe. Before setting
+`OSCAR_SSH_TARGET`:
 
 1. obtain the OSCAR host's SSH fingerprint through a trusted channel
 2. scan the host key and compare the fingerprint exactly
@@ -89,6 +97,9 @@ STORAGE_WORKFLOW=required ./scripts/run-regression.sh full --scenario storage-li
 # Destructive isolated restore qualification. Set every documented storage and
 # restore path/acknowledgement first; never place these values on a normal runner.
 STORAGE_WORKFLOW=required ./scripts/run-regression.sh restore-drill
+# Final unfiltered candidate gate. Point OSCAR_3_9_2_RESTORE_EVIDENCE_DIR at
+# the complete matching restore-drill PASS and set all five workflows required.
+./scripts/run-regression.sh 3.9.2-release
 ```
 
 Review `summary.md`, `functional-results.csv`, `errors.csv`, and cleanup rows
@@ -104,8 +115,10 @@ npm run check
 npm test
 ```
 
-Do not place `.env`, SSH private keys, or generated `results/` in Git. Do not run
-`full` concurrently from two runners against the same reserved RPM.
+Do not place `.env`, SSH private keys, or generated `results/` in Git. Every
+mutating run holds the same host-wide remote lease; contention fails closed and
+the live lease is released in `finally` or when the runner SSH stream closes.
+This does not coordinate manual operators.
 
 ## Exit codes
 
