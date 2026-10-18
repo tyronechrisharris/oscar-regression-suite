@@ -27,6 +27,10 @@
   IDs; application/PostGIS OCI labels, checksum marker, and the archive,
   WAL-archive, and backup root v1 identities match the lowercase deployment ID
 - stable deployment lock and packaged/running WAL/archive helper checks pass;
+  the compiled atomic publisher matches its packaged-source provenance stamp
+  and preserves both source and destination when a publication collides;
+- neither long-running service mounts the full backup root; the packaged flow
+  wires a one-shot base-backup client to only fresh staging and exact credentials;
   PostgreSQL uses the exact helper-backed `archive_command` and the WAL helper's
   flushed-temp atomic no-replace hard-link contract; archive and WAL roots
   contain no partial artifacts
@@ -75,15 +79,26 @@
 - storage lifecycle uses one-minute archive cadence/one-day grace only on the
   disposable target; an overnight rotation produced daily CSV/manifest pairs;
   retained and legacy media event IDs were reviewed; backup capacity is adequate
+- the persisted live OSCAR service, not only a packaged template, uses the
+  regression-only media profile `timeToRetention=0`, `videoQueryPeriod=1`,
+  `enableFrameRetention=true`, `frameRetentionCount=5`, and `jpegQuality=85`;
+  other media settings are preserved and the packaged production default remains
+  seven days
 - the disposable lifecycle's controlled stale-activation race, exact-row retry,
   packaged CLI export/purge archive-helper wiring and invocation, and synthetic WAL helper
   idempotency/mismatch checks all completed and cleaned their temporary state
+- both generation and archived-observation retention holds were created, listed,
+  released, and left no active fixture hold before tokenized purge
 - retained fixtures expose five quality-85 baseline JPEGs per camera and every
   frame passes both the bounded parser and Chromium decode at declared dimensions
-- backup acceptance includes regular `VERIFIED`, `SHA256SUMS`,
-  `SHA256SUMS.hmac`, `epoch.json`, and `image-inventory.txt`; supported `backup-verify`; the VERIFIED
-  catalog epoch; and at least one receipt for the new backup's authenticated
-  daily-journal snapshot
+- backup acceptance includes regular `VERIFIED`, `JOURNAL_CONFIRMED`, `SHA256SUMS`,
+  `SHA256SUMS.hmac`, `epoch.json`, `image-inventory.txt`, and
+  `archive-generation-ids.txt`; the journal-confirmation v2 sidecar is deliberately
+  outside `SHA256SUMS`, verifies under its own HMAC, and binds the exact backup ID plus
+  OSCAR-state checksum; the canonical bounded generation inventory is covered exactly
+  once and exactly equals the VERIFIED catalog epoch's UUID array; supported
+  `backup-verify`; and at least one daily-journal receipt belongs by exact relative
+  path and SHA-256 to the atomically published confirmation-set marker for the new backup
 
 ## Separate restore drill only
 
@@ -98,5 +113,10 @@
 - capacity exists for a new backup and OSCAR's `pre-restore-ID` safety directory
 - operator accepts replacement of PostgreSQL, OSCAR state, archive, WAL,
   `.env`, secrets, and TLS and knows how to recover if services remain stopped
-- after the drill, every canary, service health, archive verification, and image
-  identity check passed; the preserved backup/safety directory was recorded
+- after the drill, PostgreSQL is out of recovery on a timeline newer than the base
+  backup; fingerprinted backup-era and divergent post-backup source-timeline WAL
+  are both byte-identical and were never deleted; the new timeline's
+  history and a new WAL segment are archived without a post-start archiver failure;
+  the exact authenticated `VERIFIED` epoch receipt exists; one-time recovery settings
+  and signals are absent; every canary, service health, archive verification, and
+  image identity check passed; the preserved backup/safety directory was recorded

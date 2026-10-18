@@ -96,16 +96,31 @@ For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
 `STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
 rotation and with retained/legacy media fixture IDs, then run the full
 `storage-lifecycle` only on its separately acknowledged disposable database.
+Before mutation, require the running OSCAR service's persisted
+`videoRetentionConfig` to contain exactly the regression-only acceleration
+values `timeToRetention=0`, `videoQueryPeriod=1`,
+`enableFrameRetention=true`, `frameRetentionCount=5`, and `jpegQuality=85` while
+preserving its other fields. Require the archive test profile documented by the
+suite (`intervalMinutes=1`, `rollbackGraceDays=1`,
+`deleteHotAfterArchive=true`). Do not edit the packaged defaults to satisfy this
+gate: production media aging remains seven days and the production archive
+policy remains conservative.
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode
 and exact dimensions for every quality-85 frame, lazy gallery requests with bounded concurrency,
 fallback behavior, journal restart
-recovery, archive parity/export and mixed-tier queries, hold/dry-run/token
+recovery, archive parity/export and mixed-tier queries, generation- and
+archived-observation hold create/release plus dry-run/token
 safety, authenticated HMAC/epoch/regular backup markers, supported re-verification,
-daily-journal confirmation receipts, exact tags/running image IDs/OCI labels and
+an exact separately HMAC-authenticated `JOURNAL_CONFIRMED` v2 sidecar deliberately
+outside the immutable checksum inventory, a bounded canonical backup-time archive-generation
+UUID inventory with exact VERIFIED catalog-array equality, and atomic daily-journal
+confirmation-set membership for every receipt, exact tags/running image IDs/OCI labels and
 checksum plus all three deployment-bound storage-root markers, stable private
 deployment lock rejection, exact WAL command and packaged/running helper hashes,
-atomic no-replace hard-link WAL publication, no archive/WAL partial artifacts,
+compiled atomic-publisher source provenance and no-replace collision behavior,
+no full backup-root mount in either long-running service and isolated one-shot
+base-backup wiring, atomic no-replace hard-link WAL publication, no archive/WAL partial artifacts,
 controlled stale-activation rollback with
 exact-row retry ownership, deployed archive/WAL helper behavior,
 checksums/pg_stat, and storage/resource metrics.
@@ -114,10 +129,14 @@ Only when the user has explicitly authorized a destructive isolated recovery
 test and all documented acknowledgements are present, run
 `npm run test:restore-drill` separately. Require pre-backup canaries to return
 across the database, application state, archive, WAL, `.env`, secrets, and TLS;
-require healthy services, archive verification, and unchanged immutable image
-IDs. The acknowledged storage planes must resolve exactly and remain distinct
-and non-overlapping. Never reinterpret a smoke/full request as restore
-authorization.
+require promotion onto a timeline newer than the base backup, byte-identical
+append-only preservation of fingerprinted backup-era and post-backup source-timeline
+WAL, an archived timeline-history
+file and new-timeline segment with no post-start archiver failure, exact reconstruction
+of the authenticated `VERIFIED` epoch receipt, removal of one-time recovery settings
+and signals, healthy services, archive verification, and unchanged immutable image
+IDs. The acknowledged storage planes must resolve exactly and remain distinct and
+non-overlapping. Never reinterpret a smoke/full request as restore authorization.
 
 The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
 they do not disconnect cameras or mutate SensorHub. The full profile separately
@@ -237,3 +256,8 @@ Native OS dialogs,
 destructive Admin changes, broad bulk adjudication, external WebID, physical QR
 hardware, HA/failover, soak/load, permissions matrices, and
 cross-browser/accessibility are explicit exclusions.
+
+When one supported target platform is unavailable, run every safe source-level
+and native-script check that remains available, but classify that platform's
+real Docker acceptance as deferred or waived. Never infer a Windows deployment
+pass from Linux execution or from parsing the PowerShell scripts.
