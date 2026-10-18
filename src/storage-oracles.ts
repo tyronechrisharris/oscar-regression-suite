@@ -406,6 +406,29 @@ export interface StoragePlatformProbe {
     cliExportIntegrated: boolean;
     cliPurgeIntegrated: boolean;
   };
+  restoreHelpers: {
+    prepare: StorageHelperIdentity;
+    mergeWal: StorageHelperIdentity;
+  };
+  atomicPublisher: {
+    helperPath: string;
+    sourceStampPath: string;
+    packagedSourceSha256: string;
+    deployedSourceSha256: string;
+    deployedBinarySha256: string;
+    regularExecutable: boolean;
+    sourceStampRegular: boolean;
+    behaviorTested: boolean;
+    firstPublishSucceeded: boolean;
+    collisionRejected: boolean;
+    sourcePreserved: boolean;
+    destinationPreserved: boolean;
+  };
+  backupIsolation: {
+    appBackupRootAbsent: boolean;
+    postgresBackupRootAbsent: boolean;
+    isolatedBasebackupWired: boolean;
+  };
   appImage: StorageImageIdentity;
   postgisImage: StorageImageIdentity;
   gatewayImage: StorageImageIdentity;
@@ -558,6 +581,47 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         cliPurgeIntegrated: helper.cliPurgeIntegrated === true,
       };
     })(),
+    restoreHelpers: (() => {
+      const helpers = object(probe.restoreHelpers, "restoreHelpers");
+      return {
+        prepare: helperIdentity(helpers.prepare, "restoreHelpers.prepare"),
+        mergeWal: helperIdentity(helpers.mergeWal, "restoreHelpers.mergeWal"),
+      };
+    })(),
+    atomicPublisher: (() => {
+      const publisher = object(probe.atomicPublisher, "atomicPublisher");
+      return {
+        helperPath: text(publisher.helperPath, "atomicPublisher.helperPath"),
+        sourceStampPath: text(publisher.sourceStampPath, "atomicPublisher.sourceStampPath"),
+        packagedSourceSha256: sha256(
+          publisher.packagedSourceSha256,
+          "atomicPublisher.packagedSourceSha256",
+        ),
+        deployedSourceSha256: sha256(
+          publisher.deployedSourceSha256,
+          "atomicPublisher.deployedSourceSha256",
+        ),
+        deployedBinarySha256: sha256(
+          publisher.deployedBinarySha256,
+          "atomicPublisher.deployedBinarySha256",
+        ),
+        regularExecutable: publisher.regularExecutable === true,
+        sourceStampRegular: publisher.sourceStampRegular === true,
+        behaviorTested: publisher.behaviorTested === true,
+        firstPublishSucceeded: publisher.firstPublishSucceeded === true,
+        collisionRejected: publisher.collisionRejected === true,
+        sourcePreserved: publisher.sourcePreserved === true,
+        destinationPreserved: publisher.destinationPreserved === true,
+      };
+    })(),
+    backupIsolation: (() => {
+      const isolation = object(probe.backupIsolation, "backupIsolation");
+      return {
+        appBackupRootAbsent: isolation.appBackupRootAbsent === true,
+        postgresBackupRootAbsent: isolation.postgresBackupRootAbsent === true,
+        isolatedBasebackupWired: isolation.isolatedBasebackupWired === true,
+      };
+    })(),
     appImage: imageIdentity(probe.appImage, "appImage"),
     postgisImage: imageIdentity(probe.postgisImage, "postgisImage"),
     gatewayImage: imageIdentity(probe.gatewayImage, "gatewayImage"),
@@ -621,6 +685,19 @@ export function storagePlatformHasExactReleaseIdentity(
     helperExact(value.walArchive.helper, "/usr/local/bin/oscar-archive-wal") &&
     helperExact(value.archiveObjectHelper, "/usr/local/bin/oscar-archive-object") &&
     value.archiveObjectHelper.cliExportIntegrated && value.archiveObjectHelper.cliPurgeIntegrated &&
+    helperExact(value.restoreHelpers.prepare, "/usr/local/bin/oscar-prepare-restore") &&
+    helperExact(value.restoreHelpers.mergeWal, "/usr/local/bin/oscar-merge-wal-restore") &&
+    value.atomicPublisher.helperPath === "/usr/local/bin/oscar-atomic-publish" &&
+    value.atomicPublisher.sourceStampPath ===
+      "/usr/local/share/oscar-atomic-publish.source.sha256" &&
+    value.atomicPublisher.packagedSourceSha256 === value.atomicPublisher.deployedSourceSha256 &&
+    value.atomicPublisher.regularExecutable && value.atomicPublisher.sourceStampRegular &&
+    value.atomicPublisher.behaviorTested && value.atomicPublisher.firstPublishSucceeded &&
+    value.atomicPublisher.collisionRejected && value.atomicPublisher.sourcePreserved &&
+    value.atomicPublisher.destinationPreserved &&
+    value.backupIsolation.appBackupRootAbsent &&
+    value.backupIsolation.postgresBackupRootAbsent &&
+    value.backupIsolation.isolatedBasebackupWired &&
     value.appImage.reference === `oscar:${release}` &&
     value.postgisImage.reference === `oscar-postgis:${release}` &&
     value.gatewayImage.reference === "nginxinc/nginx-unprivileged:1.28.1-alpine" &&

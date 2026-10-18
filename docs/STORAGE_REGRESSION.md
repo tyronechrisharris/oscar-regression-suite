@@ -33,10 +33,21 @@ the eight identity/adoption fields and the correct `archive`, `wal-archive`, or
 The same preflight requires the OS-default stable lock
 (`/run/lock/oscar-storage/<deployment-id>.lock` on Linux), private root ownership,
 and a nonblocking concurrency rejection while the probe holds that lock. It
-hash-compares the packaged and running `/usr/local/bin/oscar-archive-wal` and
-`/usr/local/bin/oscar-archive-object` regular executables, requires
+hash-compares the packaged and running `/usr/local/bin/oscar-archive-wal`,
+`/usr/local/bin/oscar-archive-object`, `/usr/local/bin/oscar-prepare-restore`,
+and `/usr/local/bin/oscar-merge-wal-restore` regular executables, requires
 `archive_mode=on`, and compares PostgreSQL's setting to the exact command
 `/usr/local/bin/oscar-archive-wal "%p" "%f" /var/lib/postgresql/wal-archive`.
+The compiled `/usr/local/bin/oscar-atomic-publish` has a different binary hash
+from its C source, so the image carries a root-owned regular source-provenance
+stamp instead. The gate compares that stamp with the packaged
+`docker/oscar/atomic-publish.c`, then behavior-tests a successful directory
+publication and a destination collision. The collision must preserve both the
+challenger source and the previously published destination byte-for-byte.
+The platform gate also inspects both running containers and refuses a full backup-root mount at
+either `/var/lib/oscar/backups` or `/var/lib/postgresql/backups`. It requires the packaged backup
+flow to use the running database's network namespace while mounting only the fresh `postgres/`
+staging directory and exact bootstrap-password file into the one-shot base-backup client.
 The packaged WAL helper must byte-compare an existing name and publish a
 flushed temporary inode through an atomic, no-replace hard link, followed by
 file and directory durability barriers.
@@ -123,13 +134,23 @@ video. `STORAGE_EVENT_NODE_ID` is included in Event Details links when needed.
 
 The backup check creates a coordinated backup and then invokes the supported
 `backup-verify` command again. It requires regular, non-symlink `VERIFIED`,
-`SHA256SUMS`, `SHA256SUMS.hmac`, `epoch.json`, and `image-inventory.txt` files; a well-formed HMAC;
+`JOURNAL_CONFIRMED`, `SHA256SUMS`, `SHA256SUMS.hmac`, `epoch.json`,
+`image-inventory.txt`, and `archive-generation-ids.txt` files. The immutable backup core is authenticated by
+`SHA256SUMS.hmac`; `JOURNAL_CONFIRMED` is deliberately excluded from that core
+inventory because it is published only after verification. Instead, its exact
+five-line v2 payload has a separate HMAC that binds the backup ID and exact
+authenticated OSCAR-state checksum. The check requires both HMACs to verify;
 an exact backup ID, UUID, `oscar-backup-epoch` v1/`CREATED` identity and 3.9.2
-release; the matching live VERIFIED catalog epoch; and count retention. It also
+release; a bounded, canonically sorted, duplicate-free backup-time archive-generation
+UUID inventory covered exactly once by the authenticated manifest; the matching
+live VERIFIED catalog epoch with exact array equality to that inventory; and count retention. It also
 requires at least one daily-journal confirmation receipt bound to the new backup
 ID and authenticated `oscar-state.tar.gz` SHA-256, with a non-empty sealed-segment
-inventory. This means an overnight publication/rotation fixture is a prerequisite
-for the complete gate. The lifecycle check explicitly does not restore. Set
+inventory. Receipts authorize deletion only when their relative path and SHA-256
+are members of the backup's atomically published confirmation-set marker; partial
+receipt writes without that marker fail closed. This means an overnight
+publication/rotation fixture is a prerequisite for the complete gate. The
+lifecycle check explicitly does not restore. Set
 `STORAGE_BACKUP_WORKFLOW=disabled` only when backup duration/capacity is outside
 the current run; do not call that a complete 3.9.2 storage release gate.
 
@@ -156,10 +177,16 @@ Then, and only then, run `npm run test:restore-drill`. The profile accepts no
 ordinary scenario and uses a separate local target/release lock. Before mutation
 it requires the exact 3.9.2 image/marker gate. The target-side helper creates
 unique pre-backup canaries in PostgreSQL, OSCAR application state, the external
-cold archive, WAL archive, `.env`, secrets, and TLS; creates and re-verifies a
+cold archive, `.env`, secrets, and TLS, plus real switched WAL fingerprints before
+and after the backup; creates and re-verifies a
 coordinated backup; mutates every canary; and calls only the supported
 `oscar.sh restore --backup ID --confirm ID` interface. Acceptance requires all
-pre-backup values, healthy app/PostGIS/gateway containers, archive verification,
+pre-backup values, promotion onto a timeline newer than the base backup, an archived
+timeline-history file and new-timeline WAL segment, byte-identical preservation of
+the fingerprinted backup-era and divergent post-backup source-timeline WAL, no
+post-start archiver failure, cleanup of the
+one-time recovery settings/signals, exact reconstruction of the authenticated
+`VERIFIED` epoch receipt, healthy app/PostGIS/gateway containers, archive verification,
 and unchanged immutable running image IDs after restore. Scoped canaries are
 removed after verification. The verified drill backup and OSCAR's mode-0700
 `pre-restore-ID` safety directory remain intentionally. The latter contains

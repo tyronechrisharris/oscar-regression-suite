@@ -57,8 +57,10 @@ source review before the suite can certify that version.
   exact application/PostGIS/gateway tags, immutable running image IDs,
   available repository digests, OCI labels, checksum and all three deployment-bound
   storage-root markers, stable lock rejection, exact WAL command, atomic no-replace
-  hard-link publication, and packaged helper hashes/behavior, no archive/WAL
-  partial artifacts, exact-row activation under a
+  hard-link publication, packaged helper hashes/behavior, and compiled archive/backup
+  publisher source provenance plus first-publish/collision-preservation behavior, no archive/WAL
+  partial artifacts, no full-backup-root mount in either long-running service,
+  isolated one-shot base-backup wiring, exact-row activation under a
   controlled source-change race, PostgreSQL checksums, `pg_stat_statements`, and
   observation batch/resource counters
 
@@ -213,9 +215,12 @@ acknowledgements, it requires exact `OSCAR_RESTORE_TARGET_ACK`,
 `OSCAR_RESTORE_PATHS_ACK` values. The last binds three supplied canonical,
 non-overlapping archive, WAL, and backup directories to the authorization. It
 creates an authenticated 3.9.2 backup, mutates isolated canaries across the
-database, application state, archive, WAL, `.env`, secrets, and TLS, invokes the
-supported restore command, and requires every canary plus all service health,
-archive verification, and immutable image identities to return. The test backup
+database, application state, archive, `.env`, secrets, and TLS, fingerprints real
+WAL segments before and after that backup, invokes the
+supported restore command, and requires every canary plus a fresh promoted PostgreSQL
+timeline, preserved backup-era and divergent post-backup WAL, archived timeline history/new WAL without an archiver
+failure, a reconstructed exact VERIFIED epoch receipt, cleared one-time recovery state,
+all service health, archive verification, and immutable image identities to return. The test backup
 and `pre-restore-<backup-id>` safety directory are preserved for operator review.
 
 ## Results

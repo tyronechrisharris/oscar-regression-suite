@@ -173,6 +173,18 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
       stablePath: true, private: true, behaviorTested: true, concurrentRejected: true},
     walArchive: {...helper, helperPath: "/usr/local/bin/oscar-archive-wal", archiveMode: "on",
       archiveCommandExact: true, publicationContractExact: true}, archiveObjectHelper: helper, appImage: image,
+    restoreHelpers: {
+      prepare: {...helper, helperPath: "/usr/local/bin/oscar-prepare-restore"},
+      mergeWal: {...helper, helperPath: "/usr/local/bin/oscar-merge-wal-restore"},
+    },
+    atomicPublisher: {helperPath: "/usr/local/bin/oscar-atomic-publish",
+      sourceStampPath: "/usr/local/share/oscar-atomic-publish.source.sha256",
+      packagedSourceSha256: "c".repeat(64), deployedSourceSha256: "c".repeat(64),
+      deployedBinarySha256: "d".repeat(64), regularExecutable: true, sourceStampRegular: true,
+      behaviorTested: true, firstPublishSucceeded: true, collisionRejected: true,
+      sourcePreserved: true, destinationPreserved: true},
+    backupIsolation: {appBackupRootAbsent: true, postgresBackupRootAbsent: true,
+      isolatedBasebackupWired: true},
     postgisImage: {...image, reference: "oscar-postgis:3.9.2", storageProfileLabel: "3.9.2"},
     gatewayImage: {...image, reference: "nginxinc/nginx-unprivileged:1.28.1-alpine", versionLabel: ""},
     dataChecksums: "on", pgStatStatementsInstalled: true,
@@ -213,6 +225,25 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, archiveObjectHelper: {...platform.archiveObjectHelper, cliPurgeIntegrated: false}},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, restoreHelpers: {...platform.restoreHelpers,
+      mergeWal: {...platform.restoreHelpers.mergeWal, deployedSha256: "f".repeat(64)}}},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, atomicPublisher: {...platform.atomicPublisher, collisionRejected: false}},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, atomicPublisher: {...platform.atomicPublisher,
+      deployedSourceSha256: "e".repeat(64)}},
+    "3.9.2",
+  ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, backupIsolation: {...platform.backupIsolation,
+      postgresBackupRootAbsent: false}},
     "3.9.2",
   ), false);
   const metric = storageMetricFromProbe("batch", {databaseSizeBytes: "100", observationInsertCalls: 2,

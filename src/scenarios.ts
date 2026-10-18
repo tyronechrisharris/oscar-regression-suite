@@ -2855,7 +2855,7 @@ export class RegressionScenarios {
       const platform = await this.check({
         scenario: "storage-health", category: "storage-platform", action: "verify PostgreSQL and storage controls",
         target: this.config.targetHost,
-        expected: "the running images, deployment/root identities, stable lock, exact WAL command, packaged helpers, and complete 3.9.2 storage profile match",
+        expected: "the running images, deployment/root identities, stable lock, exact WAL command, packaged helpers, backup-root isolation, and complete 3.9.2 storage profile match",
       }, async () => {
         const value = assessStoragePlatform(await probe.runJson("platform"));
         const release = this.config.storageExpectedRelease;
@@ -3164,7 +3164,8 @@ export class RegressionScenarios {
         target: archived.generationId ?? "fixture generation",
         expected: "hold create/list/release works; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
         const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
-        const passed = ["holdCreated", "holdListed", "holdReleased", "wrongTokenRejected", "purged",
+        const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
+          "observationHoldCreated", "wrongTokenRejected", "purged",
           "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
           .every(key => value[key] === true);
         return {passed, observed: JSON.stringify(value)};
@@ -3190,8 +3191,11 @@ export class RegressionScenarios {
           expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
           const value = await probe.runJson<Record<string, unknown>>("backup-check");
           return {passed: value.automaticVerification === true && value.supportedVerification === true &&
-            value.authenticatedManifest === true && value.regularMarkers === true && value.epochValid === true &&
-            value.verifiedEpoch === true && Number(value.journalReceipts) > 0 &&
+            value.authenticatedManifest === true && value.journalConfirmationAuthenticated === true &&
+            value.regularMarkers === true && value.epochValid === true &&
+            value.verifiedEpoch === true && value.archiveGenerationInventoryExact === true &&
+            Number.isSafeInteger(Number(value.archiveGenerationCount)) && Number(value.archiveGenerationCount) >= 0 &&
+            Number(value.journalReceipts) > 0 &&
             value.journalReceiptReferencesValid === true &&
             value.retentionRespected === true && value.restoreAttempted === false, observed: JSON.stringify(value)};
         });
@@ -3231,7 +3235,7 @@ export class RegressionScenarios {
         category: "restore",
         action: "restore authenticated backup over isolated deployment",
         target: this.config.targetHost,
-        expected: "database, OSCAR state, cold archive, WAL, credentials/TLS, service health, and archive verification all return to the pre-backup canaries",
+        expected: "all pre-backup canaries return, PostgreSQL promotes to a fresh failure-free archive timeline, the exact VERIFIED epoch is reconstructed, and one-time recovery state is cleared",
       }, async () => {
         const value = await probe.runJson<Record<string, unknown>>(
           "restore-drill",
@@ -3245,7 +3249,11 @@ export class RegressionScenarios {
         );
         const passed = [
           "databaseRestored", "applicationStateRestored", "archiveRestored", "walRestored",
-          "credentialsRestored", "servicesHealthy", "archiveVerified", "allCanariesRestored",
+          "credentialsRestored", "servicesHealthy", "archiveVerified", "freshTimeline",
+          "timelineHistoryArchived", "newTimelineWalArchived", "priorWalPreserved",
+          "postBackupWalPreserved",
+          "archiverFailureFree", "recoverySettingsCleared", "verifiedEpochRestored",
+          "allCanariesRestored",
         ].every(field => value[field] === true) &&
           typeof value.backupId === "string" && typeof value.preRestoreSafetyDirectory === "string";
         return {passed, observed: JSON.stringify(value)};

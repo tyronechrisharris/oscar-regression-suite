@@ -19,9 +19,12 @@ test("storage probe remains valid Bash and gates exact 3.9.2 image identity", ()
     "repoDigests",
     "oscar-storage-profile",
   ]) assert.ok(probe.includes(required), `missing probe identity contract: ${required}`);
+  assert.match(probe, /docker compose --project-name oscar --env-file \.env --file compose\.yaml/);
+  assert.match(probe, /env -u OSCAR_ARCHIVE_DIR/);
+  assert.doesNotMatch(probe, /lock_directory=\$\{OSCAR_STORAGE_LOCK_DIR/);
 });
 
-test("platform probe binds all root markers, the stable deployment lock, and exact packaged helpers", () => {
+test("platform probe binds roots, the stable lock, and exact helper provenance and behavior", () => {
   const block = probe.slice(probe.indexOf("  platform)"), probe.indexOf("  snapshot)"));
   for (const required of [
     "OSCAR_DEPLOYMENT_ID",
@@ -33,6 +36,10 @@ test("platform probe binds all root markers, the stable deployment lock, and exa
     "Another OSCAR storage administration command is already running.",
     "/usr/local/bin/oscar-archive-wal",
     "/usr/local/bin/oscar-archive-object",
+    "/usr/local/bin/oscar-prepare-restore",
+    "/usr/local/bin/oscar-merge-wal-restore",
+    "/usr/local/bin/oscar-atomic-publish",
+    "/usr/local/share/oscar-atomic-publish.source.sha256",
     "archive_command_exact",
     "wal_publication_contract",
     "publicationContractExact",
@@ -42,12 +49,28 @@ test("platform probe binds all root markers, the stable deployment lock, and exa
     "archive_purge_helper_wired",
     "cliExportIntegrated",
     "cliPurgeIntegrated",
+    "packagedSourceSha256",
+    "deployedSourceSha256",
+    "deployedBinarySha256",
+    "collisionRejected",
+    "sourcePreserved",
+    "destinationPreserved",
+    "appBackupRootAbsent",
+    "postgresBackupRootAbsent",
+    "isolatedBasebackupWired",
   ]) assert.ok(block.includes(required), `missing platform hardening contract: ${required}`);
   assert.match(block, /archive_object_helper copy "\\\$relative" "\\\$expected_sha" ro "\\\$partial"/);
   assert.match(block, /archive_object_helper delete "\\\$relative" "\\\$expected_sha" rw/);
   assert.match(block, /if ln -- "\$partial" "\$destination"/);
   assert.match(block, /sync -d "\$partial"/);
   assert.match(block, /sync -f "\$archive_root"/);
+  assert.match(block, /oscar-atomic-publish "\$root" source published/);
+  assert.match(block, /oscar-atomic-publish "\$root" challenger published/);
+  assert.match(block, /test "\$status" -ne 0/);
+  assert.match(block, /--network "container:\$postgres_container"/);
+  assert.match(block, /--volume "\$work\/postgres:\/backup"/);
+  assert.match(block, /grep -Fqx \/var\/lib\/oscar\/backups/);
+  assert.match(block, /grep -Fqx \/var\/lib\/postgresql\/backups/);
   for (const required of [".oscar-storage-root", "format=oscar-storage-root-identity", "version=1",
     "root_kind=$expected_kind"]) {
     assert.ok(probe.includes(required), `missing root-marker contract: ${required}`);
@@ -75,20 +98,38 @@ test("backup check authenticates markers, epoch, supported verification, and jou
   const block = probe.slice(probe.indexOf("  backup-check)"), probe.indexOf("  restore-drill)"));
   for (const required of [
     "SHA256SUMS.hmac",
+    "JOURNAL_CONFIRMED",
     "epoch.json",
     "image-inventory.txt",
+    "archive-generation-ids.txt",
     "backup-verify",
     "oscar-backup-epoch",
     "journalReceipts",
     "backup-confirmations",
+    "journalConfirmationAuthenticated",
+    "archiveGenerationInventoryExact",
+    "oscar-dailyfile-backup-confirmation-set",
+    "confirmationSet",
     "oscar-backup:$backup/oscar-state.tar.gz#sha256=$oscar_state_sha",
   ]) assert.ok(block.includes(required), `missing backup contract: ${required}`);
   assert.match(block, /-f \$root\/\$required && ! -L \$root\/\$required/);
   assert.match(block, /convert_from\(decode\('\$encoded','base64'\),'UTF8'\)::jsonb/);
-  assert.match(block, /json_object_keys\(raw\)\)\=9/);
+  assert.match(block, /json_object_keys\(raw\)\)=10/);
   assert.match(block, /value->>'day'='\$receipt_day'/);
   assert.match(block, /value \?& ARRAY\['schemaVersion','laneId','day','windowStartInclusive'/);
   assert.match(block, /json_array_elements/);
+  assert.match(block, /\$2=="\.\/JOURNAL_CONFIRMED" \{count\+\+\} END \{print count\+0\}' "\$root\/SHA256SUMS"\) == 0/);
+  assert.match(block, /grep -Fxc 'version=2'/);
+  assert.match(block, /hmac_sha256=/);
+  assert.match(block, /openssl dgst -sha256 -hmac/);
+  assert.match(block, /\.sets\/\$backup\.json/);
+  assert.match(block, /receipt->>'path'='\$relative' AND receipt->>'sha256'='\$receipt_sha'/);
+  assert.match(block, /archive-generation-ids\.txt" \{count\+\+\} END \{print count\+0\}' "\$root\/SHA256SUMS"\) == 1/);
+  assert.match(block, /generation_bytes -le 37000000/);
+  assert.match(block, /generation_count -le 1000000/);
+  assert.match(block, /sort -c -u "\$root\/archive-generation-ids\.txt"/);
+  assert.match(block, /array_to_string\(archive_generation_ids,','\)/);
+  assert.match(block, /catalog_generation_ids == "\$inventory_generation_ids"/);
   assert.doesNotMatch(block, /grep -Fq "\\"backupReference/);
 });
 
@@ -108,7 +149,21 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
     "credentialsRestored",
     "servicesHealthy",
     "archiveVerified",
+    "freshTimeline",
+    "timelineHistoryArchived",
+    "newTimelineWalArchived",
+    "priorWalPreserved",
+    "postBackupWalPreserved",
+    "archiverFailureFree",
+    "recoverySettingsCleared",
+    "verifiedEpochRestored",
   ]) assert.ok(block.includes(field), `missing restore canary: ${field}`);
+  assert.match(block, /SELECT pg_walfile_name\(pg_switch_wal\(\)\)/);
+  assert.match(block, /SELECT timeline_id FROM pg_control_checkpoint\(\)/);
+  assert.match(block, /restored_timeline -gt \$source_timeline/);
+  assert.match(block, /future_segment_sha/);
+  assert.doesNotMatch(block, /wal_canary/);
+  assert.match(block, /state='VERIFIED'/);
 });
 
 test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
@@ -121,6 +176,10 @@ test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
       `missing scoped archive operation: ${operation}`,
     );
   }
+  assert.match(controlBlock, /--generation "\$generation"/);
+  assert.match(controlBlock, /--observation "\$cold_id"/);
+  assert.ok(controlBlock.includes("generationHoldCreated"));
+  assert.ok(controlBlock.includes("observationHoldCreated"));
 });
 
 test("disposable lifecycle proves exact-row activation and deployed helper behavior", () => {
