@@ -1066,6 +1066,7 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
     "return {passed: clean, value: clean",
     "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
+    "await this.metrics.sample()", "retained-media indexes to repopulate and stabilize after restart",
     "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",

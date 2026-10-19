@@ -247,7 +247,11 @@ that lane's direct
 `{lane-directory}/{configured-zone-date}/{six-digit}.open|seg` bytes to
 advance. Those bytes and safe layout
 must survive the supported whole-deployment launcher restart. That restart also
-requires PostgreSQL to remain available through OSCAR's bounded shutdown: the
+closes the current metrics sample before entering the restart-exempt phase, so
+an in-flight pre-restart CPU interval cannot be mislabeled as steady-state
+load. It requires the retention worker to cancel and drain its scoped PostGIS
+query before OSCAR reports a successful bounded stop, and requires PostgreSQL
+to remain available through that shutdown: the
 post-start log window must contain no `BasicEventHandler`, transaction-handler,
 database-purger, module-timeout, PostgreSQL administrator-termination, camera
 command timeout/quarantine, recording-result timeout, queue rejection, or
@@ -320,7 +324,10 @@ duration and dimensions.
 After the accelerated cycle, each exact event UUID must return one retained
 manifest per source camera. Its `source.objectKey` must equal the already
 validated observation path, and its five quality-85 JPEGs must still pass size,
-hash, baseline-structure, dimension, and Chromium decode checks. The exact
+hash, baseline-structure, dimension, and Chromium decode checks. The manifest's
+`laneUid` must be the authoritative parent system UID in
+`urn:osh:system:lane:*` form; an RPM child UID or an unresolved placeholder is
+never accepted as a lane identity. The exact
 event/lane/camera `.job.json` ledger must be `PUBLISHED` or `SOURCE_DELETED`,
 have `attempts=1`, and have no failure. Finally, the probe derives only the
 authoritative camera tokens from this run's paths and compares those directories
@@ -348,7 +355,10 @@ and five-JPEG population mandatory. These counts and bytes are written to
 
 ## Backup and performance
 
-The backup check creates a coordinated backup and then invokes the supported
+After the supported deployment restart, the suite first waits for a nonempty
+processed-index inventory and three consecutive stable file-count snapshots.
+This prevents a backup from racing retention's durable-index reconstruction.
+The backup check then creates a coordinated backup and invokes the supported
 `backup-verify` command again. Independently, it recomputes `SHA256SUMS.hmac`
 with the configured backup key, verifies every listed checksum, and rejects
 unlisted, duplicate, linked, or special payloads. It requires regular, non-symlink `VERIFIED`,

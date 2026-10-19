@@ -9,8 +9,20 @@ import {
   expectedDashboardConnectionIds,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
+  healthRowHasRpmConnectionState,
   parseHealthObservationBatch,
 } from "../src/dashboard-health.js";
+
+test("Status-of-Health RPM oracle cannot be satisfied by a camera state", () => {
+  const reconnecting = "Lane50 Local Node RPM (Lane50 - RPM) · Offline " +
+    "Lane50 - Camera 0 · Online Gamma high: Clear";
+  assert.equal(healthRowHasRpmConnectionState(reconnecting, "online"), false);
+  assert.equal(healthRowHasRpmConnectionState(reconnecting, "offline"), true);
+  assert.equal(healthRowHasRpmConnectionState(
+    reconnecting.replace("RPM (Lane50 - RPM) · Offline", "RPM (Lane50 - RPM) · Online"),
+    "online",
+  ), true);
+});
 
 test("dashboard health batches enforce the ten-stream and two-request contract", () => {
   assert.equal(DASHBOARD_HEALTH_MAX_BATCH_STREAMS, 10);

@@ -21,6 +21,7 @@ import {
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
   DASHBOARD_HEALTH_MAX_IN_FLIGHT,
   expectedDashboardConnectionIds,
+  healthRowHasRpmConnectionState,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
   parseHealthObservationBatch,
@@ -2010,6 +2011,23 @@ export class RegressionScenarios {
     return row.innerText();
   }
 
+  private async waitHealthRpmConnection(
+    page: Page,
+    state: "online" | "offline",
+    timeoutMs = 45_000,
+  ): Promise<string> {
+    await this.goto(page, "/health");
+    const row = this.healthRow(page);
+    await row.waitFor({timeout: timeoutMs});
+    await poll(
+      () => row.innerText(),
+      (value) => healthRowHasRpmConnectionState(value, state),
+      {timeoutMs, intervalMs: 1_000,
+        description: `${this.config.testLaneLabel} RPM health to become ${state}`},
+    );
+    return row.innerText();
+  }
+
   private async connectionFault(): Promise<void> {
     const page = await this.browser.oscarPage();
     let stopped = false;
@@ -2021,8 +2039,8 @@ export class RegressionScenarios {
         scenario: "rpm-connection", category: "health", action: "detect RPM disconnection",
         target: this.config.testLaneLabel, expected: "Status of Health shows the reserved RPM Offline",
       }, async () => {
-        const text = await this.waitHealthText(page, "Offline", 60_000);
-        return {passed: /RPM.*Offline/i.test(text), observed: text};
+        const text = await this.waitHealthRpmConnection(page, "offline", 60_000);
+        return {passed: healthRowHasRpmConnectionState(text, "offline"), observed: text};
       });
       await this.check({
         scenario: "rpm-connection", category: "dashboard-health", action: "show disconnected RPM independently on dashboard",
@@ -2048,8 +2066,8 @@ export class RegressionScenarios {
       scenario: "rpm-connection", category: "health", action: "detect RPM reconnection",
       target: this.config.testLaneLabel, expected: "Status of Health returns the reserved RPM to Online",
     }, async () => {
-      const text = await this.waitHealthText(page, "Online", 60_000);
-      return {passed: /RPM.*Online/i.test(text), observed: text};
+      const text = await this.waitHealthRpmConnection(page, "online", 60_000);
+      return {passed: healthRowHasRpmConnectionState(text, "online"), observed: text};
     });
     await this.check({
       scenario: "rpm-connection", category: "dashboard-health", action: "show reconnected RPM on dashboard",
@@ -4131,6 +4149,10 @@ export class RegressionScenarios {
         return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
       });
       const lifecycleRestartPhase = "storage-lifecycle-restart-disruption";
+      // Finish any interval sample that captured the steady-state phase before allowing the
+      // supported restart. Otherwise that in-flight sample can observe the deliberate outage but
+      // be mislabeled as ordinary storage-lifecycle activity.
+      await this.metrics.sample();
       this.reporter.expectRemoteMetricDisruptionPhase(lifecycleRestartPhase);
       this.metrics.setPhase(lifecycleRestartPhase);
       try {
@@ -4169,8 +4191,22 @@ export class RegressionScenarios {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
           expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
-          const mediaBeforeBackup = assessMediaMetadataHealth(
-            await probe.runJson("media-metadata-health"),
+          let stableMetadataSignature = "";
+          let stableMetadataSamples = 0;
+          const mediaBeforeBackup = await poll(
+            async () => assessMediaMetadataHealth(
+              await probe.runJson("media-metadata-health"),
+            ),
+            (value) => {
+              const signature = [value.processedIndexFiles, value.deletionIndexFiles,
+                value.retainedManifestFiles, value.retainedJpegFiles].join(":");
+              stableMetadataSamples = signature === stableMetadataSignature
+                ? stableMetadataSamples + 1 : 1;
+              stableMetadataSignature = signature;
+              return value.processedIndexFiles > 0 && stableMetadataSamples >= 3;
+            },
+            {timeoutMs: 120_000, intervalMs: 2_000,
+              description: "retained-media indexes to repopulate and stabilize after restart"},
           );
           const retainedExpectations = [...this.retainedBackupExpectations.values()].sort();
           if (retainedExpectations.length === 0) {
