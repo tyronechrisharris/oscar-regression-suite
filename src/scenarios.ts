@@ -3739,7 +3739,12 @@ export class RegressionScenarios {
         scenario: "storage-health", category: "daily-file", action: "verify durable journal publications",
         target: "dailyfiles", expected: "each eligible completed day has an exact 12-key v1 CSV/manifest pair, or a not-yet-eligible current day has durable header-valid journal segments; neither state has links, partials, or unsafe entries",
       }, async () => {
-        const value = await probe.runJson<DailyJournalStatus>("journal-status");
+        const value = await poll(
+          () => probe.runJson<DailyJournalStatus>("journal-status"),
+          candidate => assessDailyJournalStatus(candidate).passed,
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "daily-journal inventory to reach an atomic clean boundary"},
+        );
         const assessment = assessDailyJournalStatus(value);
         return {
           passed: assessment.passed,
@@ -3984,13 +3989,22 @@ export class RegressionScenarios {
             archived.markedRows === 1 && archived.generationMinId === fixture.coldId &&
             archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
         }));
-      await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
-        target: archived.generationId ?? "fixture generation",
-        expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
-        return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
-          value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
-      });
+      const exportDisruptionPhase = "storage-lifecycle-export-disruption";
+      await this.metrics.sample();
+      this.reporter.expectRemoteMetricDisruptionPhase(exportDisruptionPhase);
+      this.metrics.setPhase(exportDisruptionPhase);
+      try {
+        await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
+          target: archived.generationId ?? "fixture generation",
+          expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
+          return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
+            value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
+        });
+      } finally {
+        this.metrics.setPhase("storage-lifecycle-post-export");
+        await this.metrics.sample();
+      }
       await this.check({scenario: "storage-lifecycle", category: "portability",
         action: "exercise deployed archive-object helper", target: archived.generationId ?? "fixture generation",
         expected: "the image helper verifies and copies a cataloged object by hash and rejects checksum mismatch and traversal"}, async () => {
@@ -4112,19 +4126,28 @@ export class RegressionScenarios {
           observed: `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
         };
       });
-      await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
-        target: archived.generationId ?? "fixture generation",
-        expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
-        const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
-          "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
-          "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
-          "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
-          .every(key => value[key] === true) &&
-          value.generationHoldResolution === "GENERATION_EXACT" &&
-          value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
-        return {passed, observed: JSON.stringify(value)};
-      });
+      const purgeDisruptionPhase = "storage-lifecycle-purge-disruption";
+      await this.metrics.sample();
+      this.reporter.expectRemoteMetricDisruptionPhase(purgeDisruptionPhase);
+      this.metrics.setPhase(purgeDisruptionPhase);
+      try {
+        await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
+          target: archived.generationId ?? "fixture generation",
+          expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
+          const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
+            "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
+            "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
+            "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
+            .every(key => value[key] === true) &&
+            value.generationHoldResolution === "GENERATION_EXACT" &&
+            value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
+          return {passed, observed: JSON.stringify(value)};
+        });
+      } finally {
+        this.metrics.setPhase("storage-lifecycle-post-purge");
+        await this.metrics.sample();
+      }
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
         expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
@@ -4190,7 +4213,11 @@ export class RegressionScenarios {
       if (this.config.storageBackupWorkflow !== "disabled") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
-          expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
+        expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
+          // Startup reclamation may briefly remove expired processed-index buckets before the
+          // first scheduled overlap scan republishes current observations. Cross one complete
+          // configured scan interval before freezing the exact backup inventory.
+          await sleep(REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000);
           let stableMetadataSignature = "";
           let stableMetadataSamples = 0;
           const mediaBeforeBackup = await poll(

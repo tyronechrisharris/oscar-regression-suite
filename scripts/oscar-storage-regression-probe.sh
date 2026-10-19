@@ -964,14 +964,18 @@ case $action in
     ledger_json=$(compose exec -T oscar sh -eu -c '
       ledger=/var/lib/oscar/files/videos/$1
       if test ! -f "$ledger" || test -L "$ledger"; then
-        printf "{\\"exists\\":false}\\n"
+        printf "MISSING\\n"
         exit 0
       fi
-      compact=$(tr -d "\\r\\n" <"$ledger")
-      case $compact in \{*\}) ;; *) exit 2 ;; esac
-      printf "{\\"exists\\":true,\\"ledger\\":%s}\\n" "$compact"
+      cat -- "$ledger"
     ' alarm-media-ledger "$ledger_key")
-    printf '%s\n' "$ledger_json"
+    if [[ $ledger_json == MISSING ]]; then
+      printf '{"exists":false}\n'
+    else
+      compact=$(printf '%s' "$ledger_json" | tr -d '\r\n')
+      case $compact in \{*\}) ;; *) fail 'Alarm-media ledger is not a JSON object.' ;; esac
+      printf '{"exists":true,"ledger":%s}\n' "$compact"
+    fi
     ;;
   alarm-media-forensics)
     run=${1:-}; shift || true
@@ -1868,11 +1872,14 @@ case $action in
       [[ $state == *healthy* ]] && { healthy=true; break; }
       sleep 2
     done
-    segments_preserved=0; segment_failures=0
-    while IFS='|' read -r relative before_bytes before_sha extra; do
+    segments_preserved=0; segment_failures=0; segments_verified=0
+    mapfile -t before_rows <"$before_inventory"
+    for before_row in "${before_rows[@]}"; do
+      IFS='|' read -r relative before_bytes before_sha extra <<<"$before_row"
       [[ -z ${extra:-} && $relative =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}\.(open|seg)$ &&
          $before_bytes =~ ^[1-9][0-9]*$ && $before_sha =~ ^[0-9a-f]{64}$ ]] ||
         fail 'Pre-restart segment inventory is malformed.'
+      segments_verified=$((segments_verified+1))
       lane_root="/var/lib/oscar/files/.dailyfile-journal/segments/$directory_id"
       preserved=false
       if [[ $relative == *.seg ]]; then
@@ -1905,7 +1912,9 @@ case $action in
       fi
       if $preserved; then segments_preserved=$((segments_preserved+1));
       else segment_failures=$((segment_failures+1)); fi
-    done <"$before_inventory"
+    done
+    [[ $segments_verified == "$segments_before" ]] ||
+      fail 'Restart verification did not inspect every captured journal segment.'
     # Hidden camera partials created after the restart are legitimate active recordings on a
     # live multi-lane site.  Count only pre-restart partials that survived the supported restart,
     # plus every temporary publication artifact (which is never a live camera output).

@@ -104,6 +104,21 @@ from steady-state service checks only for this profile. Host coverage, healthy
 pre/post samples, restart/OOM checks, and immutable image identity remain
 mandatory.
 
+The ordinary full storage lifecycle also invokes supported portable-export,
+confirmed-purge, and whole-deployment restart commands. Each may briefly stop
+OSCAR. Preserve every raw metric, and exempt service availability only inside
+the exact `storage-lifecycle-export-disruption`,
+`storage-lifecycle-purge-disruption`, and
+`storage-lifecycle-restart-disruption` phases. Require healthy samples around
+each boundary, unchanged image identity, and zero OOM kills. Do not treat
+Compose one-off command containers as long-running OSCAR services.
+
+Atomic journal rotation may expose a `.partial` only during publication. Poll a
+short bounded window for a clean boundary; a persistent partial remains a
+failure. After the supported restart, cross one complete configured media query
+interval before freezing backup inventory so startup reclamation cannot race
+the first repopulation scan.
+
 The lane CSV is read-only during a suite run. Apply it only while provisioning
 the authorized disposable regression system. OSCAR's spreadsheet import is
 additive: rows whose `UniqueID` already exists are skipped, not updated. On a

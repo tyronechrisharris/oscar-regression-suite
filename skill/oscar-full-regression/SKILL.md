@@ -128,6 +128,10 @@ An unfiltered full run must generate and validate at least one exact set; a
 lifecycle-only selection must configure `STORAGE_RETAINED_EVENT_ID` and pass
 the same API, five-JPEG identity/hash/type/structure, Chromium decode, and
 gallery proof before any lifecycle mutation.
+For a fresh unfiltered full run, clear stale `STORAGE_RETAINED_EVENT_ID` and
+`STORAGE_LEGACY_EVENT_ID` values so current alarms self-seed the proof. A
+configured retained ID must exist in the current deployment; a 404 is not a
+permitted compatibility fallback.
 Before mutation, require the running OSCAR service's persisted
 `videoRetentionConfig` to contain exactly the regression-only acceleration
 values `timeToRetention=0`, `videoQueryPeriod=1`,
@@ -151,6 +155,16 @@ also report zero database/module shutdown errors so a concurrent PostgreSQL stop
 cannot pass merely because services later become healthy, and zero camera
 recording timeout/quarantine/stale-generation errors so a healthy final container
 cannot hide a poisoned per-camera command queue.
+Allow the exact supported portable export, confirmed purge, and deployment
+restart to enter only their named `storage-lifecycle-*-disruption` metric
+phases. Retain all raw samples, exclude those exact windows only from
+steady-state service availability, and require healthy post-boundary samples,
+unchanged images, and zero OOM kills. Exclude Compose one-off command containers
+from the OSCAR service inventory. Poll briefly through an in-progress atomic
+journal rotation, but fail any persistent `.partial`; prove every captured
+journal segment survives restart. Before backup, cross one complete configured
+media-retention query interval plus 15 seconds and require a nonempty,
+three-snapshot-stable metadata inventory.
 
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode

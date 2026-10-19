@@ -86,6 +86,13 @@ encoded values such as `0i4d0ko` are valid. Do not translate one into a syntheti
 RFC 4122 UUID. The suite requires the configured string to match the observation,
 retained-media response, manifest, asset paths, and Viewer result exactly.
 
+For a fresh disposable full run, leave `STORAGE_RETAINED_EVENT_ID` and
+`STORAGE_LEGACY_EVENT_ID` empty so the suite self-seeds current evidence. An ID
+left over from a previous database is not reusable: if its observation API
+lookup returns 404, clear it or replace it with an event that exists in the
+current deployment. Never weaken the retained-media oracle to accept a stale
+identifier.
+
 ## Daily-file publication is empty on a fresh same-day install
 
 Read the `daily-file` result's `zoneId`, `currentDate`, and

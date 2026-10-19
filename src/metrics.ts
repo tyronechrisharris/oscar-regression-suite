@@ -143,7 +143,7 @@ export function buildOscarMetricsCommand(): string {
     "running_ids=''",
     [
       "for service in gateway oscar postgres; do",
-      "service_ids=$(docker ps --all --quiet --no-trunc --filter \"label=com.docker.compose.project=oscar\" --filter \"label=com.docker.compose.service=$service\")",
+      "service_ids=$(docker ps --all --quiet --no-trunc --filter \"label=com.docker.compose.project=oscar\" --filter \"label=com.docker.compose.service=$service\" --filter \"label=com.docker.compose.oneoff=False\")",
       "service_found=false",
       "for container_id in $service_ids; do",
       "if inspect_json=$(docker inspect --format '{{json .}}' \"$container_id\" 2>/dev/null); then",
@@ -189,6 +189,7 @@ export function parseOscarDockerSnapshot(text: string): OscarContainerSnapshot[]
       const value = JSON.parse(line) as DockerInspectDocument;
       const labels = value.Config?.Labels;
       if (labels?.["com.docker.compose.project"] === "oscar" &&
+          labels["com.docker.compose.oneoff"] !== "True" &&
           isOscarComposeService(labels["com.docker.compose.service"])) inspections.push(value);
     } catch {
       // A malformed inspection is omitted so required service coverage fails closed.

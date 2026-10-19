@@ -181,6 +181,9 @@ test("alarm-media probe scopes a no-replace baseline and removes every temporary
   assert.match(block, /rm -f -- "\$marker"/);
   assert.match(block, /trap cleanup_alarm_baseline EXIT/);
   assert.match(block, /trap cleanup_alarm_forensics EXIT/);
+  assert.match(block, /printf "MISSING\\\\n"/);
+  assert.match(block, /printf '\{"exists":true,"ledger":%s\}\\n'/);
+  assert.doesNotMatch(block, /printf "\{\\\\"exists/);
   assert.match(probe, /-g\[1-9\]\[0-9\]\*\\\.mp4/);
 });
 
@@ -565,6 +568,10 @@ test("journal restart exercises dependency-ordered launcher shutdown", () => {
   assert.match(block, /sudo bash oscar[.]sh restart/);
   assert.doesNotMatch(block, /compose restart oscar/);
   assert.match(block, /compose logs --since "\$restart_started" oscar postgres/);
+  assert.match(block, /mapfile -t before_rows <"\$before_inventory"/);
+  assert.match(block, /for before_row in "\$\{before_rows\[@\]\}"/);
+  assert.match(block, /segments_verified == "\$segments_before"/);
+  assert.doesNotMatch(block, /done <"\$before_inventory"/);
   for (const required of [
     "BasicEventHandler", "DataStreamTransactionHandler", "DatabasePurger",
     "ModuleRegistry", "journal-restart-partials", '! -newermt "$cutoff"',
@@ -1065,8 +1072,11 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     ".delete(", "fixture-hot-hold-release", "GENERATION_EXACT", "COLD_RANGE_CONSERVATIVE",
     "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
     "return {passed: clean, value: clean",
+    "storage-lifecycle-export-disruption", 'this.metrics.setPhase("storage-lifecycle-post-export")',
+    "storage-lifecycle-purge-disruption", 'this.metrics.setPhase("storage-lifecycle-post-purge")',
     "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
     "await this.metrics.sample()", "retained-media indexes to repopulate and stabilize after restart",
+    "REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000",
     "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
@@ -1125,6 +1135,8 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   assert.match(health, /this\.retainedMediaProofDeferred = true/);
   assert.match(health, /full profile will self-seed an exact alarm UUID/);
   assert.match(health, /STORAGE_RETAINED_EVENT_ID is missing and this run cannot self-seed/);
+  assert.match(health, /daily-journal inventory to reach an atomic clean boundary/);
+  assert.match(health, /candidate => assessDailyJournalStatus\(candidate\)\.passed/);
 
   const generatedStart = scenarios.indexOf("private async verifyGeneratedAlarmRetention");
   const generatedEnd = scenarios.indexOf("private storageUnavailable", generatedStart);

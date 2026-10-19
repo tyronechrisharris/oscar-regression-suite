@@ -195,6 +195,17 @@ never allowed to create `LEGACY_UNKNOWN`. Schema v5 retains that fourth value
 only for observation holds migrated from pre-v5 catalogs; migrated generation
 holds must be normalized to `GENERATION_EXACT`.
 
+Portable export uses the supported coordinated storage command and therefore
+briefly stops and restarts OSCAR to freeze a consistent copy. The confirmed
+tokenized purge follows the same consistency boundary. The suite records every
+raw resource sample but labels only these exact windows
+`storage-lifecycle-export-disruption` and
+`storage-lifecycle-purge-disruption`; they are excluded from steady-state
+service-availability assertions only in `full` and `3.9.2-release`. Healthy
+post-export/post-purge samples, immutable image identity, and zero OOM kills
+remain mandatory. Compose one-off command containers are not OSCAR services and
+are excluded from service inventory and resource aggregates.
+
 This live lifecycle runs the required accelerated archive-enabled profile. It
 does not rewrite/restart the target into an archive-disabled profile merely to
 repeat `HOT_EXACT` deletion enforcement; that separate configuration is covered
@@ -260,6 +271,13 @@ before its back-to-back one-second gamma/neutron occupancies and applies the
 same camera-recording gate after both generation-qualified MP4s have loaded.
 This is evidence of direct live journal capture,
 not a renamed or fabricated publication.
+
+A `.partial` journal path may exist momentarily while an atomic rotation is in
+progress. `storage-health` polls for a clean atomic boundary for up to 30
+seconds; a partial that persists beyond that window, or any unsafe entry, still
+fails the release gate. The restart proof inventories all captured segments
+before shutdown and requires every one—not merely the first stdin row—to retain
+its exact prefix afterward.
 
 The smoke check requires either eligible published CSV/manifest pairs or the
 strict durable-current-day state described above, and no partial artifacts;
@@ -355,9 +373,11 @@ and five-JPEG population mandatory. These counts and bytes are written to
 
 ## Backup and performance
 
-After the supported deployment restart, the suite first waits for a nonempty
-processed-index inventory and three consecutive stable file-count snapshots.
-This prevents a backup from racing retention's durable-index reconstruction.
+After the supported deployment restart, the suite first crosses one complete
+configured media-retention query interval plus 15 seconds, then waits for a
+nonempty processed-index inventory and three consecutive stable file-count
+snapshots. This prevents a backup from racing startup reclamation and the first
+durable-index reconstruction scan.
 The backup check then creates a coordinated backup and invokes the supported
 `backup-verify` command again. Independently, it recomputes `SHA256SUMS.hmac`
 with the configured backup key, verifies every listed checksum, and rejects

@@ -322,7 +322,7 @@ test("service disruption exemption rejects any profile or phase outside the exac
     const reporter = new RunReporter(`disruption-${profile}`, root, [], {...metadata, profile});
     assert.throws(
       () => reporter.expectRemoteMetricDisruptionPhase("storage-restore-drill-disruption"),
-      /restricted to exact supported restore\/restart phases/,
+      /restricted to exact supported disruption phases/,
     );
   }
   const root = mkdtempSync(join(tmpdir(), "oscar-regression-restore-disruption-misuse-"));
@@ -332,7 +332,24 @@ test("service disruption exemption rejects any profile or phase outside the exac
   });
   assert.throws(
     () => reporter.expectRemoteMetricDisruptionPhase("restore-disruption"),
-    /restricted to exact supported restore\/restart phases/,
+    /restricted to exact supported disruption phases/,
+  );
+});
+
+test("full lifecycle permits only its exact export, purge, and restart disruption phases", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-lifecycle-disruption-contract-"));
+  const reporter = new RunReporter("lifecycle-disruption-contract", root, [], {
+    ...metadata,
+    profile: "full",
+  });
+  for (const phase of [
+    "storage-lifecycle-export-disruption",
+    "storage-lifecycle-purge-disruption",
+    "storage-lifecycle-restart-disruption",
+  ]) assert.doesNotThrow(() => reporter.expectRemoteMetricDisruptionPhase(phase));
+  assert.throws(
+    () => reporter.expectRemoteMetricDisruptionPhase("storage-lifecycle-other-disruption"),
+    /restricted to exact supported disruption phases/,
   );
 });
 
