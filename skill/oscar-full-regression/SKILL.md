@@ -318,6 +318,12 @@ opening the confirmation dialog is not a save. Explicitly reprovision a
 disposable site when migration is needed. Do not delete volumes or reinitialize
 a target as a shortcut.
 
+For every 50-lane restart acceptance, inspect the new OSCAR container's startup
+log window. Require zero `ERNIE_lane` `ReaderException`/`ClassNotFoundException`
+entries and zero `Error processing RPM message: GX` entries. Counting Started
+RPM modules alone is insufficient because the legacy ERNIE constructor can
+otherwise fail internally while its enclosing RPM module still starts.
+
 ## Interruption and recovery
 
 Normal errors and handled signals enter cleanup. A hard kill, power loss, network

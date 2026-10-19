@@ -73,6 +73,9 @@
 - live memberships match the fixture: 10 lanes for each of `east-gate`,
   `west-gate`, `north-gate`, `south-gate`, and `pedestrian`; 25 each for
   `entrance` and `exit`; five in every primary/direction intersection
+- the latest 50-lane startup log has zero `ERNIE_lane`
+  `ReaderException`/`ClassNotFoundException` entries and zero
+  `Error processing RPM message: GX` entries
 - every one of the seven configured views is exercised with exact membership by
   following the real scoped Dashboard-to-Status-of-Health navigation link
 - the `view` query persists, and malformed, well-formed-but-unassigned, and
