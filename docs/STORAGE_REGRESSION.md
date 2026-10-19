@@ -158,6 +158,14 @@ other `videoRetentionConfig` fields. Full-profile preflight reads the persisted 
 config and requires all seven values before retained-media polling or cold-fixture
 creation, so a normal seven-day deployment fails early instead of timing out.
 Do not change the packaged default; use `timeToRetention=7` in production.
+Saving the form does not reconfigure an already running retained-media worker.
+Use the supported OSCAR restart, then require `retention-runtime-health` to
+observe a valid schema-1 durable scan checkpoint within 180 seconds of the
+zero-day eligible cutoff. If a disposable, newly initialized target was
+accidentally started under the seven-day default, stop OSCAR and reset only the
+fresh retention scan/reconciliation checkpoints before any recordings or
+retained-media jobs exist, then restart. Production checkpoints are durable
+history and must never be deleted or fast-forwarded.
 The platform preflight also requires the archive purge helper to read from
 `/dev/null`; this proves that a helper invoked inside the work-list loop cannot
 consume subsequent rows and leave a multi-object purge plan partially applied.

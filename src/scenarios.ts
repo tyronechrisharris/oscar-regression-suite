@@ -48,6 +48,7 @@ import {
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
+  assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
   MAX_RETAINED_FRAME_BYTES,
@@ -55,6 +56,7 @@ import {
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
   OSCAR_STORAGE_SCHEMA_VERSION,
   parseCollectionIds,
+  retentionRuntimeReady,
   storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
 } from "./storage-oracles.js";
@@ -181,6 +183,8 @@ const REGRESSION_MEDIA_RETENTION = {
   sourceRollbackGraceHours: 24,
   metadataReclamationWorkLimit: 200,
 } as const;
+
+const REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS = 180;
 
 const REGRESSION_ARCHIVE_RESOURCES = {
   memoryLimitMegabytes: 256,
@@ -3846,6 +3850,35 @@ export class RegressionScenarios {
       if (!profileAccepted) {
         throw new Error(
           "Storage lifecycle mutation refused because the exact accelerated 3.9.2 archive/media test profile failed",
+        );
+      }
+
+      const retentionRuntimeAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "configuration",
+        action: "verify accelerated retained-media worker is active",
+        target: this.config.targetHost,
+        expected: `the durable scan cursor is valid and no more than ${REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS} seconds behind the zero-day eligible cutoff`,
+      }, async () => {
+        const value = await poll(
+          async () => assessRetentionRuntimeHealth(
+            await probe.runJson("retention-runtime-health"),
+          ),
+          runtime => retentionRuntimeReady(
+            runtime,
+            REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS,
+          ),
+          {timeoutMs: 90_000, intervalMs: 5_000,
+            description: "accelerated retained-media scan cursor to become current"},
+        );
+        const passed = retentionRuntimeReady(
+          value,
+          REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS,
+        );
+        return {passed, value: passed, observed: JSON.stringify(value)};
+      });
+      if (!retentionRuntimeAccepted) {
+        throw new Error(
+          "Storage lifecycle mutation refused because the retained-media worker is still using or catching up from an older runtime profile",
         );
       }
 

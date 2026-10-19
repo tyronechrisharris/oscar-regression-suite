@@ -142,6 +142,15 @@ suite (`intervalMinutes=1`, `rollbackGraceDays=1`,
 `deleteHotAfterArchive=true`). Do not edit the packaged defaults to satisfy this
 gate: production media aging remains seven days and the production archive
 policy remains conservative.
+The retained-media worker reads this configuration at OSCAR startup. After
+saving the accelerated profile, use the supported OSCAR restart and require the
+`retention-runtime-health` preflight to report a valid schema-1 scan checkpoint
+no more than 180 seconds behind the zero-day eligible cutoff before triggering
+alarms. A much older cursor is bounded catch-up from a previous runtime profile,
+not proof that acceleration is active. Only on a completely fresh disposable
+site with no recordings or retained-media jobs may preparation stop OSCAR,
+remove the new retention scan/reconciliation checkpoints, and restart. Never
+reset or fast-forward these durable checkpoints on production.
 Require exact storage schema v5 checksum
 `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`
 before lifecycle mutation and before/after restore. Require DuckDB's exact 256

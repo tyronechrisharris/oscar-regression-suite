@@ -626,6 +626,7 @@ test("media metadata probe validates compact checkpoint and exact binary indexes
   assert.doesNotMatch(helper, /records[^\n]*-gt 100000/,
     "valid high-rate five-minute index files must stream rather than fail format validation");
   assert.match(probe, /  media-metadata-health\)/);
+  assert.match(probe, /  retention-runtime-health\)/);
   assert.match(probe, /  archive-scratch-health\)/);
 });
 
@@ -1077,6 +1078,8 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
     "await this.metrics.sample()", "retained-media indexes to repopulate and stabilize after restart",
     "REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000",
+    "verify accelerated retained-media worker is active", "retention-runtime-health",
+    "retentionRuntimeReady", "REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS",
     "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",

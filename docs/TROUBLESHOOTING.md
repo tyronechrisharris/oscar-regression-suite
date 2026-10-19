@@ -136,6 +136,14 @@ Lifecycle preflight reports the observed `videoRetention` object and refuses the
 test before polling if any value differs. Seven days is the correct production
 default, but cannot retain a freshly generated alarm during this run.
 
+Also inspect the `verify accelerated retained-media worker is active` row. A
+correct saved form with a stale scan cursor means OSCAR started before that form
+was applied: perform a supported restart. A cursor many hours or days behind is
+bounded catch-up from an earlier seven-day runtime profile. On an otherwise empty,
+fresh disposable target only, stop OSCAR, remove just the newly created retention
+scan/reconciliation checkpoints, and restart. Never apply that shortcut to
+production or a target that has recordings, jobs, or retained sets.
+
 For a manifest/ledger failure, use the exact event and camera UIDs in the result.
 Confirm `manifest.source.objectKey` equals the earlier observation path and
 inspect only that deterministic `.job.json`. `FAILED`, a nonblank failure, or

@@ -433,6 +433,56 @@ EOF
       "${legacy_deleted:-0}" "${partials:-0}" "${unsafe:-0}" "$format_failures"
   ' media-metadata-health "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema"
 }
+retention_runtime_health_json() {
+  local checkpoint=/var/lib/oscar/files/videos/retained-media/v1/.retention-scan-checkpoint.json
+  local encoded='' result='' schema=null valid=false processed=null updated=null lag=null
+  encoded=$(compose exec -T oscar sh -eu -c '
+    path=$1
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then exit 0; fi
+    [ -f "$path" ] && [ ! -L "$path" ] || exit 20
+    size=$(stat -c %s -- "$path")
+    [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || exit 21
+    openssl base64 -A -in "$path"
+  ' retention-scan-checkpoint "$checkpoint") ||
+    fail 'Retention scan checkpoint is linked, non-regular, empty, or over 1 MiB.'
+  if [[ -z $encoded ]]; then
+    printf '{"checkpointPresent":false,"checkpointValid":false,"checkpointSchemaVersion":null,"processedThrough":null,"updatedAt":null,"cursorLagSeconds":null}\n'
+    return
+  fi
+  [[ $encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#encoded} -le 1398104 ]] ||
+    fail 'Retention scan checkpoint is not bounded canonical base64.'
+  result=$(scalar "WITH source AS (
+      SELECT convert_from(decode('$encoded','base64'),'UTF8') AS text),
+    doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source),
+    checked AS (
+      SELECT raw,value,(
+        jsonb_typeof(value)='object'
+        AND (SELECT count(*) FROM json_object_keys(raw))=3
+        AND value ?& ARRAY['schemaVersion','processedThrough','updatedAt']
+        AND value->'schemaVersion'='1'::jsonb
+        AND jsonb_typeof(value->'processedThrough')='string'
+        AND value->>'processedThrough' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+        AND jsonb_typeof(value->'updatedAt')='string'
+        AND value->>'updatedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+      ) AS valid FROM doc)
+    SELECT coalesce(value->>'schemaVersion','')||'|'||valid::text||'|'||
+      CASE WHEN valid THEN value->>'processedThrough' ELSE '' END||'|'||
+      CASE WHEN valid THEN value->>'updatedAt' ELSE '' END||'|'||
+      CASE WHEN valid THEN greatest(0,floor(extract(epoch FROM
+        (clock_timestamp()-(value->>'processedThrough')::timestamptz))))::bigint::text ELSE '' END
+    FROM checked;")
+  IFS='|' read -r schema valid_text processed_text updated_text lag_text extra <<<"$result"
+  [[ -z ${extra:-} ]] || fail 'Retention scan checkpoint produced an ambiguous result.'
+  [[ $schema =~ ^[0-9]+$ ]] || schema=null
+  if [[ $valid_text == true ]]; then
+    valid=true
+    safe_json_text "$processed_text"; safe_json_text "$updated_text"
+    [[ $lag_text =~ ^[0-9]+$ ]] || fail 'Retention scan checkpoint lag is invalid.'
+    processed=\"$processed_text\"; updated=\"$updated_text\"; lag=$lag_text
+  fi
+  printf '{"checkpointPresent":true,"checkpointValid":%s,"checkpointSchemaVersion":%s,"processedThrough":%s,"updatedAt":%s,"cursorLagSeconds":%s}\n' \
+    "$valid" "$schema" "$processed" "$updated" "$lag"
+}
 safe_json_text() {
   [[ ${1:-} =~ ^[A-Za-z0-9._/:@+,-]*$ ]] || fail "Unsafe value in probe JSON: ${1:-}"
 }
@@ -1471,6 +1521,10 @@ case $action in
 
   media-metadata-health)
     media_metadata_health_json
+    ;;
+
+  retention-runtime-health)
+    retention_runtime_health_json
     ;;
 
   snapshot)
