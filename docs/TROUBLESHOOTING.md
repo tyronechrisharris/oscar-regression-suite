@@ -140,9 +140,11 @@ Also inspect the `verify accelerated retained-media worker is active` row. A
 correct saved form with a stale scan cursor means OSCAR started before that form
 was applied: perform a supported restart. A cursor many hours or days behind is
 bounded catch-up from an earlier seven-day runtime profile. On an otherwise empty,
-fresh disposable target only, stop OSCAR, remove just the newly created retention
-scan/reconciliation checkpoints, and restart. Never apply that shortcut to
-production or a target that has recordings, jobs, or retained sets.
+fresh disposable target, recreate the disposable database and application state,
+save the accelerated profile before provisioning lanes, restart, and verify the
+cursor before allowing emulator traffic. Do not delete or fast-forward retention
+scan/reconciliation checkpoints; doing so can force a safety-first scan from an
+old datastore range instead of proving that the intended runtime profile is active.
 
 For a manifest/ledger failure, use the exact event and camera UIDs in the result.
 Confirm `manifest.source.objectKey` equals the earlier observation path and
