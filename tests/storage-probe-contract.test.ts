@@ -208,6 +208,10 @@ test("generated alarm-media scenario binds public observations, MP4 metadata, ma
     "alarm-media-forensics",
     "alarmMediaForensicsPassed",
   ]) assert.ok(block.includes(required), `missing generated alarm-media assertion: ${required}`);
+  const metadataBlock = block.slice(block.indexOf("private async browserMp4Metadata"),
+    block.indexOf("private async captureAlarmMedia"));
+  assert.doesNotMatch(metadataBlock, /const finish\s*=/,
+    "browser-evaluated callbacks must not capture the tsx __name helper");
   assert.match(block, /Buffer\.from\(item\.association\.eventId, "utf8"\)\.toString\("base64url"\)/);
   assert.match(block, /generated\.flatMap\(item =>[\s\S]*item\.association\.paths/);
   assert.doesNotMatch(block, /new Set\(generated\.flatMap/);
@@ -1052,6 +1056,7 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "mediaMetadataHealthIsSafe", "fixture-hot-hold-create", "HOT_EXACT",
     ".delete(", "fixture-hot-hold-release", "GENERATION_EXACT", "COLD_RANGE_CONSERVATIVE",
     "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
+    "return {passed: clean, value: clean",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",

@@ -2367,21 +2367,39 @@ export class RegressionScenarios {
         document.body.append(video);
         const metadata = await new Promise<{loaded: boolean; duration: number; width: number; height: number}>(resolve => {
           let settled = false;
-          const finish = (loaded: boolean) => {
+          let timer = 0;
+          timer = window.setTimeout(() => {
             if (settled) return;
             settled = true;
-            window.clearTimeout(timer);
             resolve({
-              loaded,
+              loaded: false,
               duration: Number.isFinite(video.duration) ? video.duration : 0,
               width: video.videoWidth,
               height: video.videoHeight,
             });
-          };
-          const timer = window.setTimeout(() => finish(false), timeoutMs);
-          video.addEventListener("loadedmetadata", () => finish(video.readyState >= HTMLMediaElement.HAVE_METADATA),
-            {once: true});
-          video.addEventListener("error", () => finish(false), {once: true});
+          }, timeoutMs);
+          video.addEventListener("loadedmetadata", () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve({
+              loaded: video.readyState >= HTMLMediaElement.HAVE_METADATA,
+              duration: Number.isFinite(video.duration) ? video.duration : 0,
+              width: video.videoWidth,
+              height: video.videoHeight,
+            });
+          }, {once: true});
+          video.addEventListener("error", () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve({
+              loaded: false,
+              duration: Number.isFinite(video.duration) ? video.duration : 0,
+              width: video.videoWidth,
+              height: video.videoHeight,
+            });
+          }, {once: true});
           video.src = item.url;
           video.load();
         });
@@ -3683,7 +3701,8 @@ export class RegressionScenarios {
           {timeoutMs: 60_000, intervalMs: 1_000,
             description: "DuckDB scratch to become empty between bounded operations"},
         );
-        return {passed: archiveScratchIsSafe(value, false), observed: JSON.stringify(value)};
+        const clean = archiveScratchIsSafe(value, false);
+        return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
 
       await this.check({
@@ -3819,7 +3838,8 @@ export class RegressionScenarios {
           {timeoutMs: 60_000, intervalMs: 1_000,
             description: "pre-lifecycle DuckDB scratch to become empty"},
         );
-        return {passed: archiveScratchIsSafe(value, false), observed: JSON.stringify(value)};
+        const clean = archiveScratchIsSafe(value, false);
+        return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
       if (!scratchAccepted) {
         throw new Error("Storage lifecycle mutation refused because DuckDB scratch did not become clean");
