@@ -669,6 +669,40 @@ append_quiesced_backup_member() {
     fail "Quiesced retained frame size does not match its authenticated API manifest: $member"
   printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
 }
+copy_quiesced_confirmation_member() {
+  local member=$1 destination=$2 image=$3 byte_limit=$4 actual_bytes
+  [[ -n $image && $byte_limit =~ ^[1-9][0-9]*$ && $byte_limit -le 1048576 ]] ||
+    fail 'Quiesced daily-journal confirmation copy has invalid bounds.'
+  [[ $member =~ ^files/[.]dailyfile-journal/backup-confirmations/([.]sets/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}|[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2})[.]json$ ]] ||
+    fail 'Quiesced daily-journal confirmation member has an unsafe path.'
+  docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+    --volume oscar_oscar_state:/state:ro "$image" -eu -c '
+      member=$1
+      limit=$2
+      path=/state/$member
+      current=/state
+      old_ifs=$IFS
+      IFS=/
+      set -- $member
+      IFS=$old_ifs
+      for component do
+        [ -n "$component" ] && [ "$component" != . ] && [ "$component" != .. ]
+        current=$current/$component
+        [ ! -L "$current" ]
+      done
+      [ -f "$path" ]
+      size=$(stat -c %s -- "$path")
+      [ "$size" -gt 0 ] && [ "$size" -le "$limit" ]
+      cat -- "$path"
+    ' live-journal-confirmation "$member" "$byte_limit" >"$destination" ||
+    fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+  [[ -f $destination && ! -L $destination ]] ||
+    fail 'Quiesced daily-journal confirmation copy is not a regular file.'
+  actual_bytes=$(file_size "$destination")
+  [[ $actual_bytes =~ ^[1-9][0-9]*$ && $actual_bytes -le $byte_limit ]] ||
+    fail 'Quiesced daily-journal confirmation copy violated its byte bound.'
+}
 verify_retained_backup_members() {
   local archive=$1 inventory=$2 work=$3 listing member_file line kind member expected_sha expected_bytes
   local lookup matches raw verbose actual_sha actual_bytes header verified=0
@@ -2545,6 +2579,10 @@ case $action in
     output=$(sudo bash oscar.sh backup)
     backup=$(printf '%s' "$output" | sed -n 's#^Backup created: .*/##p' | tail -n1)
     [[ $backup =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]] || fail 'Backup command did not return a backup ID.'
+    journal_confirmed_count=$(printf '%s\n' "$output" | sed -n \
+      "s#^Confirmed \([0-9][0-9]*\) daily-file lane/day publication(s) from verified backup $backup\$#\1#p")
+    [[ $journal_confirmed_count =~ ^[0-9]+$ && $journal_confirmed_count -le 100000 ]] ||
+      fail 'Backup command did not report one bounded daily-journal confirmation outcome.'
     backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ./backups)")
     retention=$(env_value OSCAR_BACKUP_RETENTION_COUNT 14)
     verified=$(find "$backup_dir" -mindepth 2 -maxdepth 2 -type f -name VERIFIED | wc -l)
@@ -2656,20 +2694,10 @@ case $action in
     receipt_count=0; invalid_receipts=0; receipt_segments_verified=0
     receipt_root=files/.dailyfile-journal/backup-confirmations
     confirmation_set_member="$receipt_root/.sets/$backup.json"
-    confirmation_set_lookup=$(awk -v expected="$confirmation_set_member" '
-      { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
-        if (normalized==expected) { count++; raw=$0 } }
-      END { printf "%d|%s", count+0, raw }
-    ' "$state_listing")
-    IFS='|' read -r confirmation_set_matches confirmation_set_raw <<<"$confirmation_set_lookup"
-    [[ $confirmation_set_matches == 1 && -n $confirmation_set_raw ]] ||
-      fail 'Authenticated state tar must contain exactly one current daily-journal confirmation set.'
-    confirmation_set_verbose=$(tar -tvzf "$root/oscar-state.tar.gz" -- "$confirmation_set_raw")
-    [[ $(printf '%s\n' "$confirmation_set_verbose" | wc -l | tr -d '[:space:]') == 1 &&
-       ${confirmation_set_verbose:0:1} == - ]] ||
-      fail 'Daily-journal confirmation set in authenticated state tar is not a regular file.'
-    confirmation_set_file=$backup_work/confirmation-set.json
-    tar -xOf "$root/oscar-state.tar.gz" -- "$confirmation_set_raw" >"$confirmation_set_file"
+    if ((journal_confirmed_count > 0)); then
+      confirmation_set_file=$backup_work/confirmation-set.json
+      copy_quiesced_confirmation_member "$confirmation_set_member" "$confirmation_set_file" \
+        "$app_image" 786432
     set_bytes=$(file_size "$confirmation_set_file")
     [[ $set_bytes =~ ^[1-9][0-9]*$ && $set_bytes -le 786432 ]] ||
       fail 'Daily-journal confirmation-set marker exceeds its 768 KiB decoded safety bound.'
@@ -2714,20 +2742,8 @@ case $action in
         fail 'Authenticated daily-journal receipt identity is outside the exact receipt layout.'
       receipt_day=${receipt_relative##*/}; receipt_day=${receipt_day%.json}
       receipt_member="$receipt_root/$receipt_relative"
-      receipt_lookup=$(awk -v expected="$receipt_member" '
-        { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
-          if (normalized==expected) { count++; raw=$0 } }
-        END { printf "%d|%s", count+0, raw }
-      ' "$state_listing")
-      IFS='|' read -r receipt_matches receipt_raw <<<"$receipt_lookup"
-      [[ $receipt_matches == 1 && -n $receipt_raw ]] || {
-        invalid_receipts=$((invalid_receipts+1)); continue; }
-      receipt_verbose=$(tar -tvzf "$root/oscar-state.tar.gz" -- "$receipt_raw")
-      [[ $(printf '%s\n' "$receipt_verbose" | wc -l | tr -d '[:space:]') == 1 &&
-         ${receipt_verbose:0:1} == - ]] || {
-        invalid_receipts=$((invalid_receipts+1)); continue; }
       receipt_file=$backup_work/receipt-$receipt_count.json
-      tar -xOf "$root/oscar-state.tar.gz" -- "$receipt_raw" >"$receipt_file"
+      copy_quiesced_confirmation_member "$receipt_member" "$receipt_file" "$app_image" 786432
       receipt_bytes=$(file_size "$receipt_file")
       [[ $receipt_bytes =~ ^[1-9][0-9]*$ && $receipt_bytes -le 786432 &&
          $(sha256_file "$receipt_file") == "$receipt_expected_sha" ]] || {
@@ -2813,9 +2829,19 @@ case $action in
     set_count=$(scalar "WITH doc AS (
         SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
       SELECT (value->>'receiptCount')::bigint FROM doc;")
-    [[ $set_count == "$receipt_count" ]] || invalid_receipts=$((invalid_receipts+1))
-    [[ $receipt_count =~ ^[0-9]+$ && $receipt_count -gt 0 && $invalid_receipts == 0 ]] ||
-      fail 'New backup did not produce valid, authenticated daily-journal receipts.'
+      [[ $set_count == "$receipt_count" ]] || invalid_receipts=$((invalid_receipts+1))
+      [[ $receipt_count =~ ^[1-9][0-9]*$ && $receipt_count == "$journal_confirmed_count" &&
+         $invalid_receipts == 0 ]] ||
+        fail 'New backup did not produce its exact valid daily-journal confirmation set.'
+    else
+      docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+        --volume oscar_oscar_state:/state:ro "$app_image" -eu -c '
+          path=/state/$1
+          [ ! -e "$path" ] && [ ! -L "$path" ]
+        ' empty-journal-confirmation "$confirmation_set_member" ||
+        fail 'Zero-candidate daily-journal confirmation unexpectedly published a set marker.'
+    fi
     duck_scratch_excluded=true
     grep -Eq '^([.]/)?duckdb-tmp(/|$)' "$state_listing" && duck_scratch_excluded=false
     retained_prefix=false
@@ -2833,8 +2859,8 @@ case $action in
       fail 'Backup did not preserve the complete exact retained-media expectation inventory.'
     cleanup_backup_check
     trap - EXIT
-    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
-      "$backup" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)" \
+    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"journalConfirmedPublications":%s,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
+      "$backup" "$journal_confirmed_count" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)" \
       "$duck_scratch_excluded" "$retained_prefix" "$checkpoint_included" "$processed_indexes" \
       "$deletion_indexes" "$retained_manifests" "$retained_jpegs" "$expected_sets" \
       "$expected_member_count" "$exact_retained_members" "$processed_expected" "$deletion_expected" "$member_count"

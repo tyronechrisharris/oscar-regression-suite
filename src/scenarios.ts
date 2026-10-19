@@ -4246,7 +4246,7 @@ export class RegressionScenarios {
       if (this.config.storageBackupWorkflow !== "disabled") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
-        expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
+        expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, an exact daily-journal confirmation outcome, and bounded retention without restore"}, async () => {
           // Startup reclamation may briefly remove expired processed-index buckets before the
           // first scheduled overlap scan republishes current observations. Cross one complete
           // configured scan interval before freezing the exact backup inventory.
@@ -4306,7 +4306,11 @@ export class RegressionScenarios {
             value.regularMarkers === true && value.epochValid === true &&
             value.verifiedEpoch === true && value.archiveGenerationInventoryExact === true &&
             Number.isSafeInteger(Number(value.archiveGenerationCount)) && Number(value.archiveGenerationCount) >= 0 &&
-            Number(value.journalReceipts) > 0 && Number(value.journalReceiptSegmentsVerified) > 0 &&
+            Number.isSafeInteger(Number(value.journalConfirmedPublications)) &&
+            Number(value.journalConfirmedPublications) >= 0 &&
+            Number(value.journalReceipts) === Number(value.journalConfirmedPublications) &&
+            Number.isSafeInteger(Number(value.journalReceiptSegmentsVerified)) &&
+            Number(value.journalReceiptSegmentsVerified) >= Number(value.journalReceipts) &&
             value.journalReceiptReferencesValid === true &&
             value.retentionRespected === true && value.duckDbScratchExcluded === true &&
             metadataIncluded && deletionMetadataIncluded && value.restoreAttempted === false,

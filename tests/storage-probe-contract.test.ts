@@ -649,7 +649,7 @@ test("storage snapshot emits activeHolds exactly once", () => {
   ]) assert.ok(block.includes(field), `missing media storage metric: ${field}`);
 });
 
-test("backup check authenticates markers, epoch, supported verification, and journal receipts", () => {
+test("backup check authenticates markers, epoch, verification, and exact journal outcomes", () => {
   const block = probe.slice(probe.indexOf("  backup-check)"), probe.indexOf("  restore-drill)"));
   const liveMember = probe.slice(probe.indexOf("append_live_backup_member()"),
     probe.indexOf("verify_retained_backup_members()"));
@@ -666,6 +666,7 @@ test("backup check authenticates markers, epoch, supported verification, and jou
     "backup-verify",
     "oscar-backup-epoch",
     "journalReceipts",
+    "journalConfirmedPublications",
     "backup-confirmations",
     "journalConfirmationAuthenticated",
     "archiveGenerationInventoryExact",
@@ -712,6 +713,13 @@ test("backup check authenticates markers, epoch, supported verification, and jou
   assert.match(block, /retention-processed-index\/\[0-9\]\{19\}-\(0\[0-9\]\|1\[01\]\)/);
   assert.match(block, /verify_retained_backup_members/);
   assert.match(block, /append_quiesced_backup_member/);
+  assert.match(block, /copy_quiesced_confirmation_member "\$confirmation_set_member"/);
+  assert.match(block, /copy_quiesced_confirmation_member "\$receipt_member"/);
+  assert.match(block, /if \(\(journal_confirmed_count > 0\)\); then/);
+  assert.match(block, /Zero-candidate daily-journal confirmation unexpectedly published a set marker/);
+  assert.match(block, /receipt_count == "\$journal_confirmed_count"/);
+  assert.doesNotMatch(block, /tar -xOf "\$root\/oscar-state[.]tar[.]gz" -- "\$confirmation_set_raw"/,
+    "the post-verification confirmation set is live authorization, not a member of its prior snapshot");
   assert.match(block, /compose stop gateway/);
   assert.match(block, /compose stop oscar/);
   assert.match(block, /sudo bash oscar[.]sh start/);
