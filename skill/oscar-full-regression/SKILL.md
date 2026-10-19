@@ -310,9 +310,13 @@ and duplicate `view` parameters must each fail closed with zero health rows.
 
 CSV upload does not migrate matching `UniqueID` values. If a persistent target
 already has the 50 lanes, prove its live memberships match the fixture before
-testing. A successful upload alone is insufficient; use supported Admin edits
-and global save or explicitly reprovision a disposable site when migration is
-needed. Do not delete volumes or reinitialize a target as a shortcut.
+testing. A successful upload alone is insufficient; use supported Admin edits,
+select global Save, confirm **Yes** in its separate dialog, and require the
+**SensorHub Configuration Saved** notification. Then perform one supported
+restart and prove all expected Lane, RPM, and camera modules return. Merely
+opening the confirmation dialog is not a save. Explicitly reprovision a
+disposable site when migration is needed. Do not delete volumes or reinitialize
+a target as a shortcut.
 
 ## Interruption and recovery
 

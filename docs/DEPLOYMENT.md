@@ -36,6 +36,13 @@ Provision every canonical 50-lane regression build with
 same tracked file so the UI assertions are derived from the deployed source of
 truth rather than duplicated expectations.
 
+When provisioning through SensorHub Admin, a successful upload is only the
+in-memory step. Select **Apply Changes**, select the header's global **Save**,
+confirm **Yes** in the separate dialog, and require the **SensorHub Configuration
+Saved** notification. Perform one supported OSCAR restart and require all 50
+Lane, RPM, and camera modules to return before starting regression. Clicking
+Save without confirming Yes must fail provisioning.
+
 ## Strict SSH for performance and storage validation
 
 The 3.9.2 target-side storage helper is a Linux Bash/Docker probe. Native
