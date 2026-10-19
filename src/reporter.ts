@@ -122,10 +122,14 @@ export class RunReporter {
 
   expectRemoteMetricDisruptionPhase(phase: string): void {
     const normalized = oneLine(phase);
-    if (this.metadata.profile !== "restore-drill" ||
-        normalized !== "storage-restore-drill-disruption") {
+    const restore = this.metadata.profile === "restore-drill" &&
+      normalized === "storage-restore-drill-disruption";
+    const lifecycleRestart = (this.metadata.profile === "full" ||
+      this.metadata.profile === "3.9.2-release") &&
+      normalized === "storage-lifecycle-restart-disruption";
+    if (!restore && !lifecycleRestart) {
       throw new Error(
-        "Remote metric disruption exemptions are restricted to the exact restore-drill disruption phase",
+        "Remote metric disruption exemptions are restricted to exact supported restore/restart phases",
       );
     }
     this.expectedRemoteMetricDisruptionPhases.add(normalized);
@@ -297,8 +301,8 @@ export class RunReporter {
         OSCAR_COMPOSE_SERVICES.filter((service) => !disruptionSamples.some((item) =>
           item.phase === phase && item.composeService === service)).map((service) => `${phase}/${service}`));
       this.outcome(
-        "performance", "performance", "retain exact expected restore-disruption metrics", remoteTarget,
-        "only explicitly registered restore-disruption phases are exempted from steady-state checks while every raw sample remains reported",
+        "performance", "performance", "retain exact expected service-disruption metrics", remoteTarget,
+        "only explicitly registered supported restore/restart phases are exempted from steady-state checks while every raw sample remains reported",
         unregistered.length
           ? `unregistered disruption phases: ${unregistered.join(", ")}`
           : missingHostCoverage.length

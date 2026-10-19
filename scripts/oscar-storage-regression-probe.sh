@@ -579,7 +579,7 @@ append_live_backup_member() {
     [ -f "$path" ] && [ ! -L "$path" ]
     size=$(stat -c %s -- "$path")
     [ "$size" -gt 0 ]
-    sha=$(sha256sum -- "$path" | awk "{print \\$1}")
+    sha=$(sha256sum -- "$path" | awk "{print \$1}")
     printf "%s|%s\\n" "$sha" "$size"
   ' retained-backup-member "$member") || fail "Expected retained backup member is missing or unsafe: $member"
   IFS='|' read -r result_sha result_bytes extra <<<"$live"
@@ -1906,14 +1906,24 @@ case $action in
       if $preserved; then segments_preserved=$((segments_preserved+1));
       else segment_failures=$((segment_failures+1)); fi
     done <"$before_inventory"
-    partial=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) 2>/dev/null | wc -l')
+    # Hidden camera partials created after the restart are legitimate active recordings on a
+    # live multi-lane site.  Count only pre-restart partials that survived the supported restart,
+    # plus every temporary publication artifact (which is never a live camera output).
+    partial=$(compose exec -T oscar sh -eu -c '
+      root=/var/lib/oscar/files; cutoff=$1
+      {
+        find "$root" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" \) \
+          ! -newermt "$cutoff" -print
+        find "$root" -type f \( -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print
+      } 2>/dev/null | wc -l
+    ' journal-restart-partials "$restart_started")
     restart_service_log=$restart_work/restart-services.log
     if ! compose logs --since "$restart_started" oscar postgres >"$restart_service_log" 2>&1; then
       emit_command_diagnostics 'Supported restart service-log collection' "$restart_service_log"
       fail 'Could not collect the exact supported-restart service log window.'
     fi
     recovery_errors=$(grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' "$restart_service_log" || true)
-    shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)|FATAL:.*terminating connection due to administrator command' "$restart_service_log" || true)
+    shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)' "$restart_service_log" || true)
     camera_recording_errors=$(grep -Eic 'Timed out waiting for camera .* command; quarantining its queue|Camera .* command queue is quarantined|Timed out waiting for video files for occupancy generation|returned a stale or mismatched saved-video result for occupancy generation|Camera .* failed to close occupancy generation|Failed to finish matched camera recording generation' "$restart_service_log" || true)
     printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s}\n' \
       "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors"

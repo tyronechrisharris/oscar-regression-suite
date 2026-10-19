@@ -567,11 +567,13 @@ test("journal restart exercises dependency-ordered launcher shutdown", () => {
   assert.match(block, /compose logs --since "\$restart_started" oscar postgres/);
   for (const required of [
     "BasicEventHandler", "DataStreamTransactionHandler", "DatabasePurger",
-    "ModuleRegistry", "terminating connection due to administrator command",
+    "ModuleRegistry", "journal-restart-partials", '! -newermt "$cutoff"',
     "Timed out waiting for camera", "command queue is quarantined",
     "Timed out waiting for video files", "stale or mismatched saved-video result",
     '"shutdownErrors":%s', '"cameraRecordingErrors":%s',
   ]) assert.ok(block.includes(required), `missing ordered-restart oracle: ${required}`);
+  assert.doesNotMatch(block, /FATAL:[^'\n]*terminating connection due to administrator command/,
+    "normal PostgreSQL disconnects during the supported restart are not shutdown failures");
 });
 
 test("camera recording log probe uses one exact guarded window and count-only output", () => {
@@ -641,6 +643,12 @@ test("storage snapshot emits activeHolds exactly once", () => {
 
 test("backup check authenticates markers, epoch, supported verification, and journal receipts", () => {
   const block = probe.slice(probe.indexOf("  backup-check)"), probe.indexOf("  restore-drill)"));
+  const liveMember = probe.slice(probe.indexOf("append_live_backup_member()"),
+    probe.indexOf("verify_retained_backup_members()"));
+  assert.match(liveMember, /awk "\{print \\\$1\}"/,
+    "the inner container shell must receive one escaped awk field reference");
+  assert.doesNotMatch(liveMember, /awk "\{print \\\\\$1\}"/,
+    "a doubled backslash is passed through to awk as an invalid character");
   for (const required of [
     "SHA256SUMS.hmac",
     "JOURNAL_CONFIRMED",
@@ -1057,6 +1065,8 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     ".delete(", "fixture-hot-hold-release", "GENERATION_EXACT", "COLD_RANGE_CONSERVATIVE",
     "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
     "return {passed: clean, value: clean",
+    "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
+    "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",

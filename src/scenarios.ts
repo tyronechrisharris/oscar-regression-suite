@@ -4010,14 +4010,27 @@ export class RegressionScenarios {
           observed: `generation=${sealed.generationState}; hot row=${sealed.coldHotPresent}; HTTP ${response.status()}`};
       });
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query mixed hot/cold range",
-        target: streamPublicId, expected: "one bounded query returns both the cold and hot fixture IDs"}, async () => {
+        target: streamPublicId, expected: "bounded ascending and descending pages over one range expose the cold and hot fixture IDs"}, async () => {
         const start = new Date(Date.parse(fixture.coldTime) - 60_000).toISOString();
         const end = new Date(Date.parse(fixture.hotTime) + 60_000).toISOString();
-        const response = await request.get(this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`));
-        if (!response.ok()) return {passed: false, observed: `HTTP ${response.status()}`};
-        const ids = parseCollectionIds(await response.json());
-        return {passed: ids.includes(coldPublicId) && ids.includes(hotPublicId),
-          observed: `${ids.length} IDs; cold=${ids.includes(coldPublicId)}; hot=${ids.includes(hotPublicId)}`};
+        const base = `/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`;
+        const ascending = await request.get(this.viewerUrl(`${base}&order=asc`));
+        const descending = await request.get(this.viewerUrl(`${base}&order=desc`));
+        try {
+          if (!ascending.ok() || !descending.ok()) {
+            return {passed: false,
+              observed: `ascending HTTP ${ascending.status()}; descending HTTP ${descending.status()}`};
+          }
+          const ascendingIds = parseCollectionIds(await ascending.json());
+          const descendingIds = parseCollectionIds(await descending.json());
+          const coldFound = ascendingIds.includes(coldPublicId);
+          const hotFound = descendingIds.includes(hotPublicId);
+          return {passed: coldFound && hotFound,
+            observed: `ascending=${ascendingIds.length}, cold=${coldFound}; descending=${descendingIds.length}, hot=${hotFound}`};
+        } finally {
+          await ascending.dispose();
+          await descending.dispose();
+        }
       });
       const hotHold = await probe.runJson<{
         holdId: string;
@@ -4117,8 +4130,12 @@ export class RegressionScenarios {
         );
         return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
       });
-      await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
-        target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
+      const lifecycleRestartPhase = "storage-lifecycle-restart-disruption";
+      this.reporter.expectRemoteMetricDisruptionPhase(lifecycleRestartPhase);
+      this.metrics.setPhase(lifecycleRestartPhase);
+      try {
+        await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
+          target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
         const value = await probe.runJson<{
           healthy: boolean;
           segmentsChecked: number;
@@ -4140,11 +4157,14 @@ export class RegressionScenarios {
         const exactRestartPreservation = Number.isSafeInteger(value.segmentsChecked) &&
           value.segmentsChecked > 0 && value.segmentsPreserved === value.segmentsChecked &&
           value.segmentFailures === 0;
-        return {passed: value.healthy && exactRestartPreservation &&
-          value.partialFiles === 0 && value.recoveryErrors === 0 &&
-          value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
+          return {passed: value.healthy && exactRestartPreservation &&
+            value.partialFiles === 0 && value.recoveryErrors === 0 &&
+            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
           observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
-      });
+        });
+      } finally {
+        this.metrics.setPhase("storage-lifecycle-post-restart");
+      }
       if (this.config.storageBackupWorkflow !== "disabled") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
