@@ -336,7 +336,7 @@ test("service disruption exemption rejects any profile or phase outside the exac
   );
 });
 
-test("full lifecycle permits only its exact export, purge, and restart disruption phases", () => {
+test("full lifecycle permits only its exact export, purge, restart, and backup disruption phases", () => {
   const root = mkdtempSync(join(tmpdir(), "oscar-regression-lifecycle-disruption-contract-"));
   const reporter = new RunReporter("lifecycle-disruption-contract", root, [], {
     ...metadata,
@@ -346,6 +346,7 @@ test("full lifecycle permits only its exact export, purge, and restart disruptio
     "storage-lifecycle-export-disruption",
     "storage-lifecycle-purge-disruption",
     "storage-lifecycle-restart-disruption",
+    "storage-lifecycle-backup-disruption",
   ]) assert.doesNotThrow(() => reporter.expectRemoteMetricDisruptionPhase(phase));
   assert.throws(
     () => reporter.expectRemoteMetricDisruptionPhase("storage-lifecycle-other-disruption"),

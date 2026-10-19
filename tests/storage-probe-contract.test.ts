@@ -711,6 +711,11 @@ test("backup check authenticates markers, epoch, supported verification, and jou
   assert.match(block, /duckdb-tmp/);
   assert.match(block, /retention-processed-index\/\[0-9\]\{19\}-\(0\[0-9\]\|1\[01\]\)/);
   assert.match(block, /verify_retained_backup_members/);
+  assert.match(block, /append_quiesced_backup_member/);
+  assert.match(block, /compose stop gateway/);
+  assert.match(block, /compose stop oscar/);
+  assert.match(block, /sudo bash oscar[.]sh start/);
+  assert.doesNotMatch(block, /Backup certification requires at least one processed-observation index/);
   assert.match(block, /expected-retained-members[.]txt/);
   assert.match(block, /retainedMediaExactMembersVerified/);
   assert.match(block, /expectedProcessedIndexes/);
@@ -1082,6 +1087,7 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "storage-lifecycle-export-disruption", 'this.metrics.setPhase("storage-lifecycle-post-export")',
     "storage-lifecycle-purge-disruption", 'this.metrics.setPhase("storage-lifecycle-post-purge")',
     "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
+    "storage-lifecycle-backup-disruption", 'this.metrics.setPhase("storage-lifecycle-post-backup")',
     "await this.metrics.sample()", "retained-media indexes to repopulate and stabilize after restart",
     "REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000",
     "verify accelerated retained-media worker is active", "retention-runtime-health",

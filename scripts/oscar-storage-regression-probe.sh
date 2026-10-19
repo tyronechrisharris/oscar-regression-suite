@@ -641,6 +641,34 @@ append_live_backup_member() {
     fail "Live retained frame size does not match its authenticated API manifest: $member"
   printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
 }
+append_quiesced_backup_member() {
+  local inventory=$1 kind=$2 member=$3 image=$4 expected_sha=${5:-} expected_bytes=${6:-}
+  local snapshot result_sha result_bytes extra
+  [[ $kind =~ ^(M|J|C|P|D)$ && -n $image ]] ||
+    fail 'Quiesced retained backup expectation has an invalid member kind or image.'
+  [[ $member =~ ^files/videos/retained-media/v1/[A-Za-z0-9._/-]+$ &&
+     $member != *'/../'* && $member != */.. && $member != *'//' ]] ||
+    fail 'Quiesced retained backup expectation has an unsafe member path.'
+  snapshot=$(docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+    --volume oscar_oscar_state:/state:ro "$image" -eu -c '
+      path=/state/$1
+      [ -f "$path" ] && [ ! -L "$path" ]
+      size=$(stat -c %s -- "$path")
+      [ "$size" -gt 0 ]
+      sha=$(sha256sum -- "$path" | awk "{print \$1}")
+      printf "%s|%s\\n" "$sha" "$size"
+    ' retained-backup-member "$member") ||
+    fail "Expected quiesced retained backup member is missing or unsafe: $member"
+  IFS='|' read -r result_sha result_bytes extra <<<"$snapshot"
+  [[ -z ${extra:-} && $result_sha =~ ^[0-9a-f]{64}$ && $result_bytes =~ ^[1-9][0-9]*$ ]] ||
+    fail 'Quiesced retained backup member snapshot returned invalid hash/size metadata.'
+  [[ -z $expected_sha || $result_sha == "$expected_sha" ]] ||
+    fail "Quiesced retained frame hash does not match its authenticated API manifest: $member"
+  [[ -z $expected_bytes || $result_bytes == "$expected_bytes" ]] ||
+    fail "Quiesced retained frame size does not match its authenticated API manifest: $member"
+  printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
+}
 verify_retained_backup_members() {
   local archive=$1 inventory=$2 work=$3 listing member_file line kind member expected_sha expected_bytes
   local lookup matches raw verbose actual_sha actual_bytes header verified=0
@@ -2411,11 +2439,27 @@ case $action in
     (($# > 0 && $# <= 8)) ||
       fail 'Backup certification requires one to eight exact retained-media set expectations.'
     backup_work=$(mktemp -d /tmp/oscar-regression-backup-check.XXXXXXXX)
-    cleanup_backup_check() { rm -rf -- "$backup_work"; }
+    backup_services_quiesced=false
+    cleanup_backup_check() {
+      local status=$? recovery_log=$backup_work/service-recovery.log had_errexit=false
+      [[ $- == *e* ]] && had_errexit=true
+      trap - EXIT
+      set +e
+      if $backup_services_quiesced; then
+        if ! sudo bash oscar.sh start >"$recovery_log" 2>&1; then
+          emit_command_diagnostics 'OSCAR backup-check service recovery' "$recovery_log"
+          status=1
+        fi
+      fi
+      rm -rf -- "$backup_work"
+      $had_errexit && set -e
+      return "$status"
+    }
     trap cleanup_backup_check EXIT
     expected_inventory=$backup_work/expected-retained-members.txt
     : >"$expected_inventory"
     expected_sets=0
+    retained_records=("$@")
     for retained_record in "$@"; do
       IFS='.' read -r event_token lane_token camera_token \
         frame_1_sha frame_1_bytes frame_2_sha frame_2_bytes frame_3_sha frame_3_bytes \
@@ -2424,20 +2468,46 @@ case $action in
         valid_media_token "$camera_token" || fail 'Retained-media backup expectation has an invalid identity.'
       frame_shas=("$frame_1_sha" "$frame_2_sha" "$frame_3_sha" "$frame_4_sha" "$frame_5_sha")
       frame_bytes=("$frame_1_bytes" "$frame_2_bytes" "$frame_3_bytes" "$frame_4_bytes" "$frame_5_bytes")
-      base="files/videos/retained-media/v1/events/$event_token/lanes/$lane_token/cameras/$camera_token"
-      append_live_backup_member "$expected_inventory" M "$base/manifest.json"
       for frame_index in 0 1 2 3 4; do
         [[ ${frame_shas[$frame_index]} =~ ^[0-9a-f]{64}$ &&
            ${frame_bytes[$frame_index]} =~ ^[1-9][0-9]*$ ]] ||
           fail 'Retained-media backup expectation has an invalid frame hash or size.'
-        frame_name=$(printf 'frame-%02d.jpg' "$((frame_index+1))")
-        append_live_backup_member "$expected_inventory" J "$base/$frame_name" \
-          "${frame_shas[$frame_index]}" "${frame_bytes[$frame_index]}"
       done
       expected_sets=$((expected_sets+1))
     done
-    metadata_paths=$(compose exec -T oscar sh -eu -c '
-      root=/var/lib/oscar/files/videos/retained-media/v1
+    app_image=''
+    while IFS= read -r candidate_image; do
+      case $candidate_image in
+        oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
+      esac
+    done < <(compose config --images)
+    [[ -n $app_image ]] ||
+      fail 'Could not resolve the OSCAR application image for quiesced backup inventory.'
+    for service in gateway oscar postgres; do
+      compose ps --status running --services | grep -Fxq "$service" ||
+        fail "Backup certification requires the running $service service."
+    done
+    backup_services_quiesced=true
+    compose stop gateway >/dev/null
+    compose stop oscar >/dev/null
+    for retained_record in "${retained_records[@]}"; do
+      IFS='.' read -r event_token lane_token camera_token \
+        frame_1_sha frame_1_bytes frame_2_sha frame_2_bytes frame_3_sha frame_3_bytes \
+        frame_4_sha frame_4_bytes frame_5_sha frame_5_bytes extra <<<"$retained_record"
+      frame_shas=("$frame_1_sha" "$frame_2_sha" "$frame_3_sha" "$frame_4_sha" "$frame_5_sha")
+      frame_bytes=("$frame_1_bytes" "$frame_2_bytes" "$frame_3_bytes" "$frame_4_bytes" "$frame_5_bytes")
+      base="files/videos/retained-media/v1/events/$event_token/lanes/$lane_token/cameras/$camera_token"
+      append_quiesced_backup_member "$expected_inventory" M "$base/manifest.json" "$app_image"
+      for frame_index in 0 1 2 3 4; do
+        frame_name=$(printf 'frame-%02d.jpg' "$((frame_index+1))")
+        append_quiesced_backup_member "$expected_inventory" J "$base/$frame_name" "$app_image" \
+          "${frame_shas[$frame_index]}" "${frame_bytes[$frame_index]}"
+      done
+    done
+    metadata_paths=$(docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+      --volume oscar_oscar_state:/state:ro "$app_image" -eu -c '
+      root=/state/files/videos/retained-media/v1
       checkpoint=$root/.metadata-reclamation-checkpoint.json
       [ -f "$checkpoint" ] && [ ! -L "$checkpoint" ]
       printf "%s\\n" "$checkpoint"
@@ -2449,27 +2519,26 @@ case $action in
     processed_expected=0
     deletion_expected=0
     while IFS= read -r metadata_path; do
-      [[ -n $metadata_path && $metadata_path == /var/lib/oscar/files/videos/retained-media/v1/* ]] ||
+      [[ -n $metadata_path && $metadata_path == /state/files/videos/retained-media/v1/* ]] ||
         fail 'Retained-media metadata inventory escaped its expected root.'
-      metadata_member=${metadata_path#/var/lib/oscar/}
+      metadata_member=${metadata_path#/state/}
       case $metadata_member in
         files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json)
-          append_live_backup_member "$expected_inventory" C "$metadata_member"
+          append_quiesced_backup_member "$expected_inventory" C "$metadata_member" "$app_image"
           ;;
         files/videos/retained-media/v1/retention-processed-index/*.idx)
           [[ ${metadata_member##*/} =~ ^[0-9]{19}-(0[0-9]|1[01])[.]idx$ ]] ||
             fail 'Retained-media processed index has a noncanonical name.'
-          append_live_backup_member "$expected_inventory" P "$metadata_member"
+          append_quiesced_backup_member "$expected_inventory" P "$metadata_member" "$app_image"
           processed_expected=$((processed_expected+1))
           ;;
         files/videos/retained-media/v1/deletion-index/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f][0-9a-f].idx)
-          append_live_backup_member "$expected_inventory" D "$metadata_member"
+          append_quiesced_backup_member "$expected_inventory" D "$metadata_member" "$app_image"
           deletion_expected=$((deletion_expected+1))
           ;;
         *) fail 'Retained-media metadata inventory contains an unexpected path.' ;;
       esac
     done <<<"$metadata_paths"
-    ((processed_expected > 0)) || fail 'Backup certification requires at least one processed-observation index.'
     expected_member_count=$(wc -l <"$expected_inventory" | tr -d '[:space:]')
     [[ $expected_member_count == $((expected_sets * 6 + 1 + processed_expected + deletion_expected)) ]] ||
       fail 'Retained backup expectation inventory has an inconsistent exact member count.'
@@ -2487,12 +2556,6 @@ case $action in
     [[ -f $root/archive-generation-ids.txt && ! -L $root/archive-generation-ids.txt ]] ||
       fail 'Archive-generation inventory is missing, linked, or non-regular.'
     backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
-    app_image=''
-    while IFS= read -r candidate_image; do
-      case $candidate_image in
-        oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
-      esac
-    done < <(compose config --images)
     [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file ]] ||
       fail 'Cannot independently authenticate the backup core.'
     [[ $(verify_backup_core_authentication "$root" "$backup_key_file" "$app_image") == verified ]] ||

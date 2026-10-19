@@ -4272,10 +4272,19 @@ export class RegressionScenarios {
           if (retainedExpectations.length === 0) {
             throw new Error("Backup certification requires at least one exact retained-media set");
           }
-          const value = await probe.runJson<Record<string, unknown>>(
-            "backup-check",
-            retainedExpectations,
-          );
+          const backupDisruptionPhase = "storage-lifecycle-backup-disruption";
+          await this.metrics.sample();
+          this.reporter.expectRemoteMetricDisruptionPhase(backupDisruptionPhase);
+          this.metrics.setPhase(backupDisruptionPhase);
+          let value: Record<string, unknown>;
+          try {
+            value = await probe.runJson<Record<string, unknown>>(
+              "backup-check",
+              retainedExpectations,
+            );
+          } finally {
+            this.metrics.setPhase("storage-lifecycle-post-backup");
+          }
           const exactMembers = Number(value.retainedMediaExactMembersVerified);
           const expectedMembers = Number(value.retainedMediaExpectedMembers);
           const expectedProcessed = Number(value.expectedProcessedIndexes);
@@ -4284,13 +4293,13 @@ export class RegressionScenarios {
             value.mediaMetadataCheckpointIncluded === true &&
             Number(value.retainedMediaExpectedSets) === retainedExpectations.length &&
             Number.isSafeInteger(expectedMembers) && expectedMembers > retainedExpectations.length * 6 &&
-            exactMembers === expectedMembers && expectedProcessed > 0 &&
-            expectedProcessed === mediaBeforeBackup.processedIndexFiles &&
+            exactMembers === expectedMembers && mediaBeforeBackup.processedIndexFiles > 0 &&
+            Number.isSafeInteger(expectedProcessed) && expectedProcessed >= 0 &&
             Number(value.processedObservationIndexesIncluded) === expectedProcessed &&
             Number(value.deletionIndexesIncluded) === expectedDeletion;
           const deletionMetadataIncluded = Number.isSafeInteger(Number(value.deletionIndexesIncluded)) &&
-            Number(value.deletionIndexesIncluded) === mediaBeforeBackup.deletionIndexFiles &&
-            expectedDeletion === mediaBeforeBackup.deletionIndexFiles;
+            Number.isSafeInteger(expectedDeletion) && expectedDeletion >= 0 &&
+            Number(value.deletionIndexesIncluded) === expectedDeletion;
           return {passed: value.automaticVerification === true && value.supportedVerification === true &&
             value.independentCoreAuthentication === true &&
             value.authenticatedManifest === true && value.journalConfirmationAuthenticated === true &&

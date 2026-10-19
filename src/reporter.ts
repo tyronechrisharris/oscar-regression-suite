@@ -129,6 +129,7 @@ export class RunReporter {
       "storage-lifecycle-export-disruption",
       "storage-lifecycle-purge-disruption",
       "storage-lifecycle-restart-disruption",
+      "storage-lifecycle-backup-disruption",
     ].includes(normalized);
     if (!restore && !lifecycleDisruption) {
       throw new Error(
