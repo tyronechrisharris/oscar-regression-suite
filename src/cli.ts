@@ -1,25 +1,19 @@
 #!/usr/bin/env node
-import {execFileSync} from "node:child_process";
 import {createHash} from "node:crypto";
 import {mkdirSync, rmSync, writeFileSync} from "node:fs";
 import {arch, hostname, platform, tmpdir} from "node:os";
 import {join} from "node:path";
 import {BrowserHarness} from "./browser.js";
-import {assertMutationAllowed, loadConfig} from "./config.js";
+import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "./config.js";
 import {RpmEmulatorClient} from "./emulator.js";
+import {suiteGitCommit as resolveSuiteGitCommit} from "./git-state.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {RunReporter} from "./reporter.js";
+import {validateRestoreEvidenceBundle} from "./release-certification.js";
+import {RemoteSuiteLease} from "./remote-suite-lease.js";
 import {RegressionScenarios} from "./scenarios.js";
 import {describeError} from "./util.js";
-
-function gitCommit(): string {
-  try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {encoding: "utf8", stdio: ["ignore", "pipe", "ignore"]}).trim();
-  } catch {
-    return "uncommitted-or-unavailable";
-  }
-}
 
 function acquireFullRunLock(emulatorUrl: string, rpmId: string): {path: string; release: () => void} {
   const identity = createHash("sha256").update(`${emulatorUrl}\n${rpmId}`).digest("hex").slice(0, 16);
@@ -30,6 +24,26 @@ function acquireFullRunLock(emulatorUrl: string, rpmId: string): {path: string; 
   } catch {
     throw new Error(
       `Another full regression may own ${rpmId}; verify emulator state, then remove stale lock ${path}`,
+    );
+  }
+  return {path, release: () => rmSync(path, {recursive: true, force: true})};
+}
+
+function acquireRestoreRunLock(target: string, releaseDirectory: string): {path: string; release: () => void} {
+  const identity = createHash("sha256").update(`${target}\n${releaseDirectory}`).digest("hex").slice(0, 16);
+  const path = join(tmpdir(), `oscar-restore-drill-${identity}.lock`);
+  try {
+    mkdirSync(path);
+    writeFileSync(join(path, "owner.json"), `${JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      target,
+      releaseDirectory,
+    }, null, 2)}\n`);
+  } catch {
+    throw new Error(
+      `Another destructive restore drill may own ${target}:${releaseDirectory}; ` +
+      `verify target state, then remove stale lock ${path}`,
     );
   }
   return {path, release: () => rmSync(path, {recursive: true, force: true})};
@@ -46,9 +60,18 @@ async function main(): Promise<number> {
   const startedAt = new Date();
   const config = loadConfig();
   assertMutationAllowed(config);
+  const suiteGitCommit = resolveSuiteGitCommit(config.profile);
+  const restoreEvidence = config.profile === "3.9.2-release"
+    ? validateRestoreEvidenceBundle(config.releaseRestoreEvidenceDirectory ?? "", {
+      suiteGitCommit,
+      oscarBuildLabel: config.oscarBuildLabel ?? "",
+      oscarBaseUrl: config.oscarBaseUrl,
+      oscarReleaseDirectory: config.oscarReleaseDirectory ?? "",
+    })
+    : undefined;
   const reporter = new RunReporter(runIdentifier(), config.resultsRoot, [config.oscarPassword], {
-    suiteVersion: "1.0.0",
-    suiteGitCommit: gitCommit(),
+    suiteVersion: "1.1.0",
+    suiteGitCommit,
     profile: config.profile,
     scenarioFilter: [...config.scenarioFilter].sort(),
     nodeVersion: process.version,
@@ -75,6 +98,26 @@ async function main(): Promise<number> {
       ),
     } : {}),
     eventUuidWorkflow: config.eventUuidWorkflow,
+    alarmTransferCameraWorkflow: config.alarmTransferCameraWorkflow,
+    storageWorkflow: config.storageWorkflow,
+    storageExpectedRelease: config.storageExpectedRelease,
+    storageBackupWorkflow: config.storageBackupWorkflow,
+    storageProbeTimeoutMs: config.storageProbeTimeoutMs,
+    storageRestoreProbeTimeoutMs: config.storageRestoreProbeTimeoutMs,
+    ...(config.oscarReleaseDirectory
+      ? {oscarReleaseDirectory: config.oscarReleaseDirectory} : {}),
+    ...(config.releaseRestoreEvidenceDirectory
+      ? {releaseRestoreEvidenceDirectory: config.releaseRestoreEvidenceDirectory} : {}),
+    ...(restoreEvidence ? {
+      releaseRestoreEvidenceRunId: restoreEvidence.runId,
+      releaseRestoreEvidenceBackupId: restoreEvidence.backupId,
+    } : {}),
+    ...(config.storageRetainedEventId
+      ? {storageRetainedEventId: config.storageRetainedEventId} : {}),
+    ...(config.storageLegacyEventId
+      ? {storageLegacyEventId: config.storageLegacyEventId} : {}),
+    ...(config.storageEventNodeId
+      ? {storageEventNodeId: config.storageEventNodeId} : {}),
     remoteMetricsExpected: Boolean(config.oscarSshTarget),
   });
   const emulator = new RpmEmulatorClient(config.rpmEmulatorUrl);
@@ -82,8 +125,17 @@ async function main(): Promise<number> {
   const metrics = new MetricsSampler(config, reporter);
   const scenarios = new RegressionScenarios(config, reporter, browser, emulator, metrics);
   let interrupted = false;
-  const fullRunLock = config.profile === "full"
+  const mutationRunLock = config.profile === "full" || config.profile === "3.9.2-release"
     ? acquireFullRunLock(config.rpmEmulatorUrl, config.testRpmId)
+    : config.profile === "restore-drill"
+      ? acquireRestoreRunLock(config.targetHost, config.oscarReleaseDirectory ?? "missing")
+      : undefined;
+  const remoteLease = requiresRemoteSuiteLease(config)
+    ? new RemoteSuiteLease({
+      oscarSshTarget: config.oscarSshTarget ?? "",
+      oscarReleaseDirectory: config.oscarReleaseDirectory ?? "",
+      ...(config.sshIdentityFile ? {sshIdentityFile: config.sshIdentityFile} : {}),
+    })
     : undefined;
 
   const handleSignal = (signal: NodeJS.Signals) => {
@@ -96,10 +148,17 @@ async function main(): Promise<number> {
   scenarios.setStopRequested(() => interrupted);
 
   try {
-    await browser.start();
+    await remoteLease?.acquire();
     await metrics.start();
-    await scenarios.runReadOnly();
-    if (config.profile === "full" && !interrupted) await scenarios.runFull();
+    if (config.profile === "restore-drill") {
+      await scenarios.runRestoreDrill();
+    } else {
+      await browser.start();
+      await scenarios.runReadOnly();
+      if ((config.profile === "full" || config.profile === "3.9.2-release") && !interrupted) {
+        await scenarios.runFull();
+      }
+    }
   } catch (error) {
     reporter.error("harness", "runner", error);
     reporter.outcome(
@@ -110,7 +169,15 @@ async function main(): Promise<number> {
     if (interrupted) await scenarios.emergencyCleanup().catch((error) => reporter.error("harness", "signal-cleanup", error));
     await metrics.stop().catch((error) => reporter.error("harness", "metrics-stop", error, "", "warning"));
     await browser.stop().catch((error) => reporter.error("harness", "browser-stop", error, "", "warning"));
-    fullRunLock?.release();
+    await remoteLease?.release().catch(error => {
+      reporter.error("harness", "remote-suite-lease-release", error);
+      reporter.outcome(
+        "harness", "safety", "release remote suite lease", config.targetHost,
+        "the host-wide mutation lease is released cleanly", "lease release failed",
+        "incorrect", 0, "", describeError(error),
+      );
+    });
+    mutationRunLock?.release();
     process.off("SIGINT", handleSignal);
     process.off("SIGTERM", handleSignal);
   }

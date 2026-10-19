@@ -1,10 +1,14 @@
 import type {LaneConfigOracle} from "./lane-config.js";
 
-export type Profile = "smoke" | "full";
+export type Profile = "smoke" | "full" | "3.9.2-release" | "restore-drill";
 
 export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type ResultStatus = "correct" | "incorrect" | "skipped";
+
+export const OSCAR_COMPOSE_SERVICES = ["gateway", "oscar", "postgres"] as const;
+
+export type OscarComposeService = typeof OSCAR_COMPOSE_SERVICES[number];
 
 export interface SuiteConfig {
   profile: Profile;
@@ -35,6 +39,28 @@ export interface SuiteConfig {
   eventTimeoutMs: number;
   extendedOccupancySeconds: number;
   eventUuidWorkflow: CapabilityMode;
+  alarmTransferCameraWorkflow: CapabilityMode;
+  storageWorkflow: CapabilityMode;
+  storageExpectedRelease: "3.9.2";
+  storageBackupWorkflow: CapabilityMode;
+  storageTargetAcknowledgement: string;
+  restoreTargetAcknowledgement: string;
+  restoreDisposableAcknowledgement: string;
+  restoreDataLossAcknowledgement: string;
+  restorePathsAcknowledgement: string;
+  restoreArchiveDirectory?: string;
+  restoreWalArchiveDirectory?: string;
+  restoreBackupDirectory?: string;
+  oscarReleaseDirectory?: string;
+  releaseRestoreEvidenceDirectory?: string;
+  storageRetainedEventId?: string;
+  storageLegacyEventId?: string;
+  storageEventNodeId?: string;
+  storageDatabaseScope: number;
+  storageHotRetentionDays: number;
+  storageArchiveTimeoutMs: number;
+  storageProbeTimeoutMs: number;
+  storageRestoreProbeTimeoutMs: number;
   resultsRoot: string;
   scenarioFilter: Set<string>;
 }
@@ -70,6 +96,11 @@ export interface MetricSample {
   phase: string;
   source: "oscar-container" | "oscar-host" | "test-runner" | "test-runner-host";
   target: string;
+  composeService: OscarComposeService | null;
+  containerId: string | null;
+  containerState: string | null;
+  containerHealth: string | null;
+  containerStatsAvailable: boolean | null;
   cpuPercent: number | null;
   memoryUsedBytes: number | null;
   memoryLimitBytes: number | null;
@@ -79,6 +110,48 @@ export interface MetricSample {
   oomKilled: boolean | null;
   load1m: number | null;
   hostMemoryAvailableBytes: number | null;
+  note: string;
+}
+
+/** Point-in-time PostgreSQL and durable-storage counters captured by the 3.9.2 probe. */
+export interface StorageMetricSample {
+  runId: string;
+  timestamp: string;
+  phase: string;
+  databaseSizeBytes: number | null;
+  observationTableBytes: number | null;
+  observationIndexBytes: number | null;
+  walBytes: number | null;
+  tempBytes: number | null;
+  tuplesInserted: number | null;
+  tuplesUpdated: number | null;
+  tuplesDeleted: number | null;
+  transactionCommits: number | null;
+  transactionRollbacks: number | null;
+  observationInsertCalls: number | null;
+  observationInsertRows: number | null;
+  observationRowsPerCall: number | null;
+  activeArchiveGenerations: number | null;
+  sealedArchiveGenerations: number | null;
+  archiveRows: number | null;
+  archiveBytes: number | null;
+  failedArchiveJobs: number | null;
+  failedParityReceipts: number | null;
+  activeHolds: number | null;
+  verifiedBackups: number | null;
+  journalBytes: number | null;
+  dailyFileBytes: number | null;
+  retainedMediaBytes: number | null;
+  retainedMediaManifestFiles: number | null;
+  retainedMediaJpegFiles: number | null;
+  processedObservationIndexFiles: number | null;
+  processedObservationIndexBytes: number | null;
+  deletionIndexFiles: number | null;
+  deletionIndexBytes: number | null;
+  legacyProcessedMarkerFiles: number | null;
+  legacyDeletionTombstones: number | null;
+  mediaMetadataCheckpointBytes: number | null;
+  backupBytes: number | null;
   note: string;
 }
 
@@ -119,8 +192,31 @@ export interface RunMetadata {
   oscarLaneConfigSha256?: string;
   operationalViewLaneCounts?: Record<string, number>;
   eventUuidWorkflow: CapabilityMode;
+  alarmTransferCameraWorkflow: CapabilityMode;
+  storageWorkflow: CapabilityMode;
+  storageExpectedRelease: "3.9.2";
+  storageBackupWorkflow: CapabilityMode;
+  storageProbeTimeoutMs: number;
+  storageRestoreProbeTimeoutMs: number;
+  oscarReleaseDirectory?: string;
+  releaseRestoreEvidenceDirectory?: string;
+  releaseRestoreEvidenceRunId?: string;
+  releaseRestoreEvidenceBackupId?: string;
+  storageRetainedEventId?: string;
+  storageLegacyEventId?: string;
+  storageEventNodeId?: string;
   reservedRpmConfigSha256?: string;
   remoteMetricsExpected: boolean;
+  restoreDrillCertification?: RestoreDrillCertification;
+}
+
+export interface RestoreDrillCertification {
+  schemaVersion: 1;
+  backupId: string;
+  authenticatedBackupReverified: true;
+  allCanariesRestored: true;
+  immutableImageIdentityPreserved: true;
+  preRestoreSafetyCopyVerified: true;
 }
 
 export interface RpmConfig {

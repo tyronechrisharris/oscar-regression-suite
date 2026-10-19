@@ -3,7 +3,7 @@ import {mkdtempSync, readFileSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join, resolve} from "node:path";
 import test from "node:test";
-import {assertMutationAllowed, loadConfig} from "../src/config.js";
+import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "../src/config.js";
 
 const baseEnvironment = {
   OSCAR_BASE_URL: "https://192.0.2.10",
@@ -18,11 +18,20 @@ const baseEnvironment = {
   OPERATIONAL_VIEW_WORKFLOW: "auto",
   OSCAR_LANE_CONFIG_PATH: resolve("fixtures/oscar-50-lane-config.csv"),
   EVENT_UUID_WORKFLOW: "auto",
+  ALARM_TRANSFER_CAMERA_WORKFLOW: "auto",
 };
 
+const configurationEnvironmentNames = [...readFileSync(resolve(".env.example"), "utf8")
+  .matchAll(/^(?:#\s*)?([A-Z][A-Z0-9_]*)=/gm)]
+  .map((match) => match[1])
+  .filter((name): name is string => Boolean(name));
+
 function withEnvironment(values: Record<string, string>, operation: () => void): void {
-  const names = Object.keys(values);
+  const names = [...new Set([...configurationEnvironmentNames, ...Object.keys(values)])];
   const original = new Map(names.map((name) => [name, process.env[name]]));
+  // Keep every documented key defined-but-empty so loadConfig() cannot refill
+  // test state from a runner's private .env file.
+  for (const name of names) process.env[name] = "";
   Object.assign(process.env, values);
   try { operation(); } finally {
     for (const [name, value] of original) {
@@ -33,7 +42,9 @@ function withEnvironment(values: Record<string, string>, operation: () => void):
 }
 
 test("full profile requires exact OSCAR, emulator, and RPM/lane acknowledgements", () => {
-  withEnvironment(baseEnvironment, () => {
+  withEnvironment({...baseEnvironment,
+    OSCAR_SSH_TARGET: "tester@192.0.2.10",
+    OSCAR_RELEASE_DIR: "/opt/oscar-test"}, () => {
     const valid = loadConfig(["--profile", "full", "--scenario", "rpm-faults"]);
     assert.doesNotThrow(() => assertMutationAllowed(valid));
 
@@ -66,6 +77,255 @@ test("configuration accepts UUID workflow modes and the event-uuid scenario", ()
 
   withEnvironment({...baseEnvironment, EVENT_UUID_WORKFLOW: "sometimes"}, () => {
     assert.throws(() => loadConfig([]), /EVENT_UUID_WORKFLOW must be auto, required, or disabled/);
+  });
+});
+
+test("configuration accepts camera workflow modes and the alarm-transfer-camera scenario", () => {
+  for (const mode of ["auto", "required", "disabled"] as const) {
+    withEnvironment({...baseEnvironment, ALARM_TRANSFER_CAMERA_WORKFLOW: mode}, () => {
+      const config = loadConfig(["--scenario", "alarm-transfer-camera"]);
+      assert.equal(config.alarmTransferCameraWorkflow, mode);
+      assert.deepEqual([...config.scenarioFilter], ["alarm-transfer-camera"]);
+    });
+  }
+
+  withEnvironment({...baseEnvironment, ALARM_TRANSFER_CAMERA_WORKFLOW: "sometimes"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /ALARM_TRANSFER_CAMERA_WORKFLOW must be auto, required, or disabled/,
+    );
+  });
+});
+
+test("configuration accepts the dashboard-health scenario", () => {
+  withEnvironment(baseEnvironment, () => {
+    const config = loadConfig(["--scenario", "dashboard-health"]);
+    assert.deepEqual([...config.scenarioFilter], ["dashboard-health"]);
+  });
+});
+
+test("full storage lifecycle requires an exact disposable-storage acknowledgement", () => {
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "required", OSCAR_SSH_TARGET: "tester@192.0.2.10",
+    OSCAR_RELEASE_DIR: "/opt/oscar-test",
+    OSCAR_STORAGE_TARGET_ACK: "192.0.2.10|tester@192.0.2.10|/opt/oscar-test|DISPOSABLE-STORAGE"}, () => {
+    const config = loadConfig(["--profile", "full", "--scenario", "storage-lifecycle"]);
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+    assert.throws(() => assertMutationAllowed({...config, storageTargetAcknowledgement: "wrong"}),
+      /OSCAR_STORAGE_TARGET_ACK/);
+  });
+});
+
+test("smoke storage probes require the exact Viewer, SSH, and canonical release acknowledgement", () => {
+  const environment = {...baseEnvironment, STORAGE_WORKFLOW: "required",
+    OSCAR_SSH_TARGET: "tester@192.0.2.10", OSCAR_RELEASE_DIR: "/opt/oscar-test",
+    OSCAR_STORAGE_TARGET_ACK: "192.0.2.10|tester@192.0.2.10|/opt/oscar-test|DISPOSABLE-STORAGE"};
+  withEnvironment(environment, () => {
+    const config = loadConfig(["--profile", "smoke", "--scenario", "storage-health"]);
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+    assert.throws(
+      () => assertMutationAllowed({...config, storageTargetAcknowledgement:
+        "192.0.2.10|wrong@192.0.2.10|/opt/oscar-test|DISPOSABLE-STORAGE"}),
+      /OSCAR_STORAGE_TARGET_ACK/,
+    );
+    assert.throws(
+      () => assertMutationAllowed({...config, storageTargetAcknowledgement: ""}),
+      /OSCAR_STORAGE_TARGET_ACK/,
+    );
+  });
+});
+
+test("3.9.2 storage defaults to required while full runs always require the remote lease target", () => {
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: " "}, () => {
+    const config = loadConfig(["--profile", "full"]);
+    assert.equal(config.storageWorkflow, "required");
+    assert.throws(() => assertMutationAllowed(config), /OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "auto"}, () => {
+    const config = loadConfig(["--profile", "full"]);
+    assert.throws(() => assertMutationAllowed(config), /remote suite lease/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "auto",
+    OSCAR_SSH_TARGET: "tester@192.0.2.10", OSCAR_RELEASE_DIR: "/opt/oscar-test",
+    OSCAR_STORAGE_TARGET_ACK:
+      "192.0.2.10|tester@192.0.2.10|/opt/oscar-test|DISPOSABLE-STORAGE"}, () => {
+    assert.doesNotThrow(() => assertMutationAllowed(
+      loadConfig(["--profile", "full", "--scenario", "rpm-faults"]),
+    ));
+  });
+});
+
+test("3.9.2 release certification is unfiltered and requires every release gate", () => {
+  const releaseEnvironment = {
+    ...baseEnvironment,
+    OPERATIONAL_VIEW_WORKFLOW: "required",
+    EVENT_UUID_WORKFLOW: "required",
+    ALARM_TRANSFER_CAMERA_WORKFLOW: "required",
+    STORAGE_WORKFLOW: "required",
+    STORAGE_BACKUP_WORKFLOW: "required",
+    OSCAR_SSH_TARGET: "tester@192.0.2.10",
+    OSCAR_RELEASE_DIR: "/opt/oscar-test",
+    OSCAR_STORAGE_TARGET_ACK:
+      "192.0.2.10|tester@192.0.2.10|/opt/oscar-test|DISPOSABLE-STORAGE",
+    OSCAR_BUILD_LABEL: "oscar-3.9.2-candidate-abc123",
+    OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: "/tmp/oscar-restore-evidence",
+  };
+  withEnvironment(releaseEnvironment, () => {
+    const config = loadConfig(["--profile", "3.9.2-release"]);
+    assert.equal(config.profile, "3.9.2-release");
+    assert.equal(config.releaseRestoreEvidenceDirectory, "/tmp/oscar-restore-evidence");
+    assert.equal(requiresRemoteSuiteLease(config), true);
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+    assert.throws(
+      () => loadConfig(["--profile", "3.9.2-release", "--scenario", "event-uuid"]),
+      /unfiltered full certification/,
+    );
+  });
+  for (const [name, value] of [
+    ["OPERATIONAL_VIEW_WORKFLOW", "auto"],
+    ["EVENT_UUID_WORKFLOW", "auto"],
+    ["ALARM_TRANSFER_CAMERA_WORKFLOW", "disabled"],
+    ["STORAGE_WORKFLOW", "auto"],
+    ["STORAGE_BACKUP_WORKFLOW", "auto"],
+  ] as const) {
+    withEnvironment({...releaseEnvironment, [name]: value}, () => {
+      assert.throws(() => loadConfig(["--profile", "3.9.2-release"]), /requires .* workflows/);
+    });
+  }
+  withEnvironment({...releaseEnvironment, OSCAR_BUILD_LABEL: ""}, () => {
+    assert.throws(() => loadConfig(["--profile", "3.9.2-release"]), /OSCAR_BUILD_LABEL/);
+  });
+  withEnvironment({...releaseEnvironment, OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: ""}, () => {
+    assert.throws(() => loadConfig(["--profile", "3.9.2-release"]), /RESTORE_EVIDENCE_DIR/);
+  });
+});
+
+test("retained-media configuration accepts bounded OSCAR public observation identities", () => {
+  withEnvironment({...baseEnvironment,
+    STORAGE_RETAINED_EVENT_ID: "0i4d0ko",
+    STORAGE_LEGACY_EVENT_ID: "obs/legacy"}, () => {
+    assert.equal(loadConfig([]).storageRetainedEventId, "0i4d0ko");
+    assert.equal(loadConfig([]).storageLegacyEventId, "obs/legacy");
+  });
+  withEnvironment({...baseEnvironment, STORAGE_RETAINED_EVENT_ID: "x".repeat(129)}, () => {
+    assert.throws(() => loadConfig([]), /public observation ID/);
+  });
+});
+
+test("remote suite lease covers full, restore, and every configured storage mutator", () => {
+  withEnvironment(baseEnvironment, () => {
+    assert.equal(requiresRemoteSuiteLease(loadConfig(["--profile", "smoke", "--scenario", "event-uuid"])), false);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "required",
+    OSCAR_SSH_TARGET: "tester@192.0.2.10", OSCAR_RELEASE_DIR: "/opt/oscar-test"}, () => {
+    assert.equal(requiresRemoteSuiteLease(
+      loadConfig(["--profile", "smoke", "--scenario", "storage-health"]),
+    ), true);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "disabled"}, () => {
+    assert.equal(requiresRemoteSuiteLease(
+      loadConfig(["--profile", "smoke", "--scenario", "map-national-servers"]),
+    ), true);
+    assert.equal(requiresRemoteSuiteLease(
+      loadConfig(["--profile", "smoke", "--scenario", "lane-video"]),
+    ), true);
+    assert.throws(
+      () => assertMutationAllowed(loadConfig([
+        "--profile", "smoke", "--scenario", "map-national-servers",
+      ])),
+      /every mutating run requires OSCAR_SSH_TARGET/,
+    );
+  });
+});
+
+test("restore drill is isolated from ordinary profiles and requires exact target, data-loss, and path acknowledgements", () => {
+  const restoreEnvironment = {
+    ...baseEnvironment,
+    STORAGE_WORKFLOW: "required",
+    STORAGE_BACKUP_WORKFLOW: "required",
+    OSCAR_SSH_TARGET: "tester@192.0.2.10",
+    OSCAR_RELEASE_DIR: "/opt/oscar-restore-test",
+    OSCAR_STORAGE_TARGET_ACK:
+      "192.0.2.10|tester@192.0.2.10|/opt/oscar-restore-test|DISPOSABLE-STORAGE",
+    OSCAR_RESTORE_TARGET_ACK: "192.0.2.10|tester@192.0.2.10|/opt/oscar-restore-test|ISOLATED-RESTORE",
+    OSCAR_RESTORE_DISPOSABLE_ACK: "192.0.2.10:DISPOSABLE-NO-PRODUCTION-DATA",
+    OSCAR_RESTORE_DATA_LOSS_ACK: "I-ACCEPT-DESTRUCTIVE-RESTORE",
+    OSCAR_RESTORE_ARCHIVE_DIR: "/srv/oscar-restore/archive",
+    OSCAR_RESTORE_WAL_ARCHIVE_DIR: "/srv/oscar-restore/wal-archive",
+    OSCAR_RESTORE_BACKUP_DIR: "/srv/oscar-restore/backups",
+    OSCAR_RESTORE_PATHS_ACK: "/srv/oscar-restore/archive|/srv/oscar-restore/wal-archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS",
+  };
+  withEnvironment(restoreEnvironment, () => {
+    const config = loadConfig(["--profile", "restore-drill"]);
+    assert.equal(config.profile, "restore-drill");
+    assert.doesNotThrow(() => assertMutationAllowed(config));
+    for (const [field, expected] of [
+      ["restoreTargetAcknowledgement", /OSCAR_RESTORE_TARGET_ACK/],
+      ["restoreDisposableAcknowledgement", /OSCAR_RESTORE_DISPOSABLE_ACK/],
+      ["restoreDataLossAcknowledgement", /OSCAR_RESTORE_DATA_LOSS_ACK/],
+      ["restorePathsAcknowledgement", /OSCAR_RESTORE_PATHS_ACK/],
+    ] as const) {
+      assert.throws(() => assertMutationAllowed({...config, [field]: "wrong"}), expected);
+    }
+    assert.throws(
+      () => loadConfig(["--profile", "restore-drill", "--scenario", "storage-health"]),
+      /may run only storage-restore-drill/,
+    );
+    assert.throws(
+      () => loadConfig(["--profile", "full", "--scenario", "storage-restore-drill"]),
+      /requires --profile restore-drill/,
+    );
+    assert.throws(
+      () => assertMutationAllowed({...config, restoreWalArchiveDirectory: config.restoreArchiveDirectory!}),
+      /distinct, non-overlapping planes/,
+    );
+    assert.throws(
+      () => assertMutationAllowed({...config, storageBackupWorkflow: "auto"}),
+      /STORAGE_BACKUP_WORKFLOW must be required/,
+    );
+  });
+});
+
+test("restore drill rejects noncanonical or root storage planes", () => {
+  withEnvironment({...baseEnvironment, OSCAR_RESTORE_ARCHIVE_DIR: "/srv/oscar/../archive"}, () => {
+    assert.throws(() => loadConfig(["--profile", "restore-drill"]), /parent-directory|canonical, non-root/);
+  });
+  withEnvironment({...baseEnvironment, OSCAR_RESTORE_BACKUP_DIR: "/"}, () => {
+    assert.throws(() => loadConfig(["--profile", "restore-drill"]), /canonical, non-root/);
+  });
+});
+
+test("storage paths, modes, and numeric bounds fail closed", () => {
+  withEnvironment({...baseEnvironment, OSCAR_RELEASE_DIR: "relative/release"}, () => {
+    assert.throws(() => loadConfig(["--scenario", "storage-health"]), /absolute remote POSIX path/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "maybe"}, () => {
+    assert.throws(() => loadConfig([]), /STORAGE_WORKFLOW must be auto, required, or disabled/);
+  });
+  withEnvironment({...baseEnvironment, OSCAR_RELEASE_DIR: "/opt/oscar/./release"}, () => {
+    assert.throws(() => loadConfig(["--scenario", "storage-health"]), /canonical, non-root/);
+  });
+  withEnvironment({...baseEnvironment, OSCAR_RELEASE_DIR: "/"}, () => {
+    assert.throws(() => loadConfig(["--scenario", "storage-health"]), /canonical, non-root/);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_HOT_RETENTION_DAYS: "0"}, () => {
+    assert.throws(() => loadConfig([]), /STORAGE_HOT_RETENTION_DAYS must be an integer >= 1/);
+  });
+  withEnvironment(baseEnvironment, () => {
+    const config = loadConfig([]);
+    assert.equal(config.storageProbeTimeoutMs, 1_800_000);
+    assert.equal(config.storageRestoreProbeTimeoutMs, 7_200_000);
+  });
+  withEnvironment({...baseEnvironment, STORAGE_RESTORE_PROBE_TIMEOUT_MS: "599999"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /STORAGE_RESTORE_PROBE_TIMEOUT_MS must be an integer >= 600000/,
+    );
+  });
+  withEnvironment({...baseEnvironment, STORAGE_RESTORE_PROBE_TIMEOUT_MS: "28800001"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /STORAGE_RESTORE_PROBE_TIMEOUT_MS must be an integer between 600000 and 28800000/,
+    );
   });
 });
 

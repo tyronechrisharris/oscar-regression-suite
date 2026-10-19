@@ -1,6 +1,7 @@
 import {mkdirSync, writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {toCsv} from "./csv.js";
+import {OSCAR_COMPOSE_SERVICES} from "./types.js";
 import type {
   AggregateRow,
   ErrorRecord,
@@ -8,6 +9,7 @@ import type {
   MetricSample,
   RunMetadata,
   ResultStatus,
+  StorageMetricSample,
 } from "./types.js";
 
 const FUNCTIONAL_COLUMNS: readonly (keyof FunctionalResult)[] = [
@@ -18,7 +20,8 @@ const ERROR_COLUMNS: readonly (keyof ErrorRecord)[] = [
   "runId", "timestamp", "scenario", "source", "severity", "message", "evidence",
 ];
 const METRIC_COLUMNS: readonly (keyof MetricSample)[] = [
-  "runId", "timestamp", "phase", "source", "target", "cpuPercent", "memoryUsedBytes",
+  "runId", "timestamp", "phase", "source", "target", "composeService", "containerId",
+  "containerState", "containerHealth", "containerStatsAvailable", "cpuPercent", "memoryUsedBytes",
   "memoryLimitBytes", "memoryPercent", "pids", "restartCount", "oomKilled", "load1m",
   "hostMemoryAvailableBytes", "note",
 ];
@@ -27,10 +30,43 @@ const AGGREGATE_COLUMNS: readonly (keyof AggregateRow)[] = [
   "accuracyPercent", "peakCpuPercent", "peakMemoryBytes", "averageCpuPercent",
   "averageMemoryBytes",
 ];
+const STORAGE_METRIC_COLUMNS: readonly (keyof StorageMetricSample)[] = [
+  "runId", "timestamp", "phase", "databaseSizeBytes", "observationTableBytes",
+  "observationIndexBytes", "walBytes", "tempBytes", "tuplesInserted", "tuplesUpdated",
+  "tuplesDeleted", "transactionCommits", "transactionRollbacks", "observationInsertCalls",
+  "observationInsertRows", "observationRowsPerCall", "activeArchiveGenerations",
+  "sealedArchiveGenerations", "archiveRows", "archiveBytes", "failedArchiveJobs",
+  "failedParityReceipts", "activeHolds", "verifiedBackups", "journalBytes",
+  "dailyFileBytes", "retainedMediaBytes", "retainedMediaManifestFiles",
+  "retainedMediaJpegFiles", "processedObservationIndexFiles",
+  "processedObservationIndexBytes", "deletionIndexFiles", "deletionIndexBytes",
+  "legacyProcessedMarkerFiles", "legacyDeletionTombstones",
+  "mediaMetadataCheckpointBytes", "backupBytes", "note",
+];
 
-function mean(values: number[]): number | null {
+/** Unweighted arithmetic mean of the available point-in-time samples. */
+function arithmeticSampleMean(values: number[]): number | null {
   if (!values.length) return null;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function performanceGroup(sample: MetricSample): string {
+  if (sample.source !== "oscar-container") return `${sample.source}:${sample.target}`;
+  return [
+    sample.source,
+    sample.composeService ?? "unresolved-service",
+    sample.containerId ?? "missing-container",
+    sample.target,
+  ].join(":");
+}
+
+function containerSampleLabel(sample: MetricSample): string {
+  const identity = sample.containerId ? sample.containerId.slice(0, 12) : "missing";
+  return `${sample.phase}/${sample.composeService ?? "unresolved"}/${identity}`;
+}
+
+function unavailableNumber(value: number | null): boolean {
+  return value === null || !Number.isFinite(value);
 }
 
 function maximum(values: number[]): number | null {
@@ -50,11 +86,15 @@ export class RunReporter {
   readonly functional: FunctionalResult[] = [];
   readonly errors: ErrorRecord[] = [];
   readonly metrics: MetricSample[] = [];
+  readonly storageMetrics: StorageMetricSample[] = [];
   readonly outputDir: string;
   readonly evidenceDir: string;
   readonly downloadDir: string;
   private readonly secrets: string[];
   private readonly metadata: RunMetadata;
+  private readonly requiredRemoteMetricPhases = new Set<string>();
+  private readonly expectedRemoteMetricDisruptionPhases = new Set<string>();
+  private remoteMetricTarget: string | undefined;
 
   constructor(
     readonly runId: string,
@@ -73,6 +113,27 @@ export class RunReporter {
 
   addMetadata(values: Partial<RunMetadata>): void {
     Object.assign(this.metadata, values);
+  }
+
+  requireRemoteMetricPhase(phase: string): void {
+    const normalized = oneLine(phase);
+    if (normalized) this.requiredRemoteMetricPhases.add(normalized);
+  }
+
+  expectRemoteMetricDisruptionPhase(phase: string): void {
+    const normalized = oneLine(phase);
+    if (this.metadata.profile !== "restore-drill" ||
+        normalized !== "storage-restore-drill-disruption") {
+      throw new Error(
+        "Remote metric disruption exemptions are restricted to the exact restore-drill disruption phase",
+      );
+    }
+    this.expectedRemoteMetricDisruptionPhases.add(normalized);
+  }
+
+  setRemoteMetricTarget(target: string): void {
+    const normalized = oneLine(target);
+    if (normalized) this.remoteMetricTarget = normalized;
   }
 
   redact(value: unknown): string {
@@ -128,6 +189,10 @@ export class RunReporter {
     this.metrics.push({runId: this.runId, timestamp: new Date().toISOString(), ...sample});
   }
 
+  storageMetric(sample: Omit<StorageMetricSample, "runId" | "timestamp">): void {
+    this.storageMetrics.push({runId: this.runId, timestamp: new Date().toISOString(), ...sample});
+  }
+
   aggregate(): AggregateRow[] {
     const rows: AggregateRow[] = [];
     const groups = new Map<string, FunctionalResult[]>();
@@ -160,11 +225,13 @@ export class RunReporter {
       });
     }
 
-    const targets = new Set(this.metrics.map((item) => `${item.source}:${item.target}`));
+    const targets = new Set(this.metrics.map((item) => performanceGroup(item)));
     for (const target of targets) {
-      const subset = this.metrics.filter((item) => `${item.source}:${item.target}` === target);
-      const cpu = subset.flatMap((item) => item.cpuPercent === null ? [] : [item.cpuPercent]);
-      const memory = subset.flatMap((item) => item.memoryUsedBytes === null ? [] : [item.memoryUsedBytes]);
+      const subset = this.metrics.filter((item) => performanceGroup(item) === target);
+      const cpu = subset.flatMap((item) =>
+        item.cpuPercent !== null && Number.isFinite(item.cpuPercent) ? [item.cpuPercent] : []);
+      const memory = subset.flatMap((item) =>
+        item.memoryUsedBytes !== null && Number.isFinite(item.memoryUsedBytes) ? [item.memoryUsedBytes] : []);
       rows.push({
         runId: this.runId,
         section: "performance",
@@ -176,8 +243,8 @@ export class RunReporter {
         accuracyPercent: null,
         peakCpuPercent: rounded(maximum(cpu)),
         peakMemoryBytes: rounded(maximum(memory), 0),
-        averageCpuPercent: rounded(mean(cpu)),
-        averageMemoryBytes: rounded(mean(memory), 0),
+        averageCpuPercent: rounded(arithmeticSampleMean(cpu)),
+        averageMemoryBytes: rounded(arithmeticSampleMean(memory), 0),
       });
     }
     return rows;
@@ -185,40 +252,194 @@ export class RunReporter {
 
   private addPerformanceHealthChecks(): void {
     if (!this.metadata.remoteMetricsExpected) return;
-    const containers = this.metrics.filter((item) => item.source === "oscar-container");
-    this.outcome(
-      "performance", "performance", "capture OSCAR container metrics", this.metadata.oscarBaseUrl,
-      "at least one OSCAR container sample is captured", `${containers.length} container samples`,
-      containers.length ? "correct" : "incorrect", 0,
-    );
-    if (!containers.length) return;
-    const oomTargets = [...new Set(containers.filter((item) => item.oomKilled).map((item) => item.target))];
-    this.outcome(
-      "performance", "performance", "detect container OOM kills", this.metadata.oscarBaseUrl,
-      "no sampled container is OOM-killed", oomTargets.length ? `OOM-killed: ${oomTargets.join(", ")}` : "none",
-      oomTargets.length ? "incorrect" : "correct", 0,
-    );
-    const increased: string[] = [];
-    for (const target of new Set(containers.map((item) => item.target))) {
-      const counts = containers
-        .filter((item) => item.target === target && item.restartCount !== null)
-        .map((item) => item.restartCount as number);
-      if (counts.length > 1 && (counts.at(-1) ?? 0) > (counts[0] ?? 0)) increased.push(target);
+    const containers = this.metrics.filter((item) =>
+      item.source === "oscar-container" && item.composeService !== null &&
+      OSCAR_COMPOSE_SERVICES.includes(item.composeService));
+    const requiredPhases = [...this.requiredRemoteMetricPhases];
+    const disruptionPhases = this.expectedRemoteMetricDisruptionPhases;
+    const steadyRequiredPhases = requiredPhases.filter((phase) => !disruptionPhases.has(phase));
+    const steadyContainers = containers.filter((item) => !disruptionPhases.has(item.phase));
+    const remoteTarget = this.remoteMetricTarget
+      ?? this.metrics.find((item) => item.source === "oscar-host")?.target
+      ?? "configured OSCAR_SSH_TARGET";
+    const missingCoverage: string[] = [];
+    if (!steadyRequiredPhases.length) missingCoverage.push("no steady-state required phases were registered");
+    if (disruptionPhases.size && steadyRequiredPhases.length < 2) {
+      missingCoverage.push("expected disruption lacks distinct pre/post steady-state phases");
+    }
+    for (const phase of steadyRequiredPhases) {
+      for (const service of OSCAR_COMPOSE_SERVICES) {
+        const serviceSamples = steadyContainers.filter((item) =>
+          item.phase === phase && item.composeService === service);
+        if (!serviceSamples.some((item) => item.containerId !== null) ||
+            serviceSamples.some((item) => item.containerId === null)) {
+          missingCoverage.push(`${phase}/${service}`);
+        }
+      }
     }
     this.outcome(
-      "performance", "performance", "detect container restarts", this.metadata.oscarBaseUrl,
-      "no sampled container restart count increases during the run",
-      increased.length ? `restart count increased: ${increased.join(", ")}` : "no restart count increased",
-      increased.length ? "incorrect" : "correct", 0,
+      "performance", "performance", "capture exact OSCAR Compose service metrics", remoteTarget,
+      "gateway, oscar, and postgres identities are sampled in every steady-state required phase",
+      missingCoverage.length
+        ? `missing phase/service coverage: ${missingCoverage.join(", ")}`
+        : `${steadyRequiredPhases.length * OSCAR_COMPOSE_SERVICES.length} steady-state phase/service pairs covered`,
+      missingCoverage.length ? "incorrect" : "correct", 0,
+    );
+
+    if (disruptionPhases.size) {
+      const unregistered = [...disruptionPhases].filter((phase) => !this.requiredRemoteMetricPhases.has(phase));
+      const disruptionSamples = containers.filter((item) => disruptionPhases.has(item.phase));
+      const missingHostCoverage = [...disruptionPhases].filter((phase) =>
+        !this.metrics.some((item) => item.source === "oscar-host" && item.phase === phase &&
+          item.load1m !== null && item.hostMemoryAvailableBytes !== null &&
+          item.memoryLimitBytes !== null));
+      const missingDisruptionCoverage = [...disruptionPhases].flatMap((phase) =>
+        OSCAR_COMPOSE_SERVICES.filter((service) => !disruptionSamples.some((item) =>
+          item.phase === phase && item.composeService === service)).map((service) => `${phase}/${service}`));
+      this.outcome(
+        "performance", "performance", "retain exact expected restore-disruption metrics", remoteTarget,
+        "only explicitly registered restore-disruption phases are exempted from steady-state checks while every raw sample remains reported",
+        unregistered.length
+          ? `unregistered disruption phases: ${unregistered.join(", ")}`
+          : missingHostCoverage.length
+            ? `missing successful OSCAR host samples: ${missingHostCoverage.join(", ")}`
+          : missingDisruptionCoverage.length
+            ? `missing raw disruption samples: ${missingDisruptionCoverage.join(", ")}`
+          : disruptionSamples.length
+            ? `${disruptionSamples.length} raw samples retained for ${[...disruptionPhases].join(", ")}`
+            : "no raw samples were captured for the expected disruption phase",
+        unregistered.length || missingHostCoverage.length || missingDisruptionCoverage.length ||
+          !disruptionSamples.length
+          ? "incorrect" : "correct", 0,
+      );
+    }
+
+    const incomplete = steadyContainers.filter((item) => {
+      const identityMissing = item.containerId === null || item.containerState === null ||
+        item.containerHealth === null || item.restartCount === null || item.oomKilled === null;
+      const runningStatsMissing = item.containerState === "running" && (
+        item.containerStatsAvailable !== true || unavailableNumber(item.cpuPercent) ||
+        unavailableNumber(item.memoryUsedBytes) || unavailableNumber(item.memoryLimitBytes) ||
+        unavailableNumber(item.memoryPercent) || unavailableNumber(item.pids)
+      );
+      return identityMissing || runningStatsMissing;
+    });
+    this.outcome(
+      "performance", "performance", "validate OSCAR container metric samples", remoteTarget,
+      disruptionPhases.size
+        ? "every steady-state service sample has complete identity, state, health, restart, OOM, and running resource data"
+        : "every observed service has complete identity, state, health, restart, OOM, and running resource data",
+      incomplete.length
+        ? `incomplete samples: ${[...new Set(incomplete.map(containerSampleLabel))].join(", ")}`
+        : "all required container samples are complete",
+      incomplete.length ? "incorrect" : "correct", 0,
+    );
+
+    const stopped = steadyContainers.filter((item) =>
+      item.containerId !== null && item.containerState !== null && item.containerState !== "running");
+    this.outcome(
+      "performance", "performance", "detect stopped OSCAR containers", remoteTarget,
+      disruptionPhases.size
+        ? "gateway, oscar, and postgres remain running in every steady-state sample"
+        : "gateway, oscar, and postgres remain running in every sample",
+      stopped.length
+        ? `non-running: ${[...new Set(stopped.map((item) =>
+          `${containerSampleLabel(item)}=${item.containerState}`))].join(", ")}`
+        : "all observed service containers remained running",
+      stopped.length ? "incorrect" : "correct", 0,
+    );
+
+    const unhealthy = steadyContainers.filter((item) =>
+      item.containerId !== null && item.containerHealth !== null && item.containerHealth !== "healthy");
+    this.outcome(
+      "performance", "performance", "detect unhealthy OSCAR containers", remoteTarget,
+      disruptionPhases.size
+        ? "gateway, oscar, and postgres remain healthy in every steady-state sample"
+        : "gateway, oscar, and postgres remain healthy in every sample",
+      unhealthy.length
+        ? `not healthy: ${[...new Set(unhealthy.map((item) =>
+          `${containerSampleLabel(item)}=${item.containerHealth}`))].join(", ")}`
+        : "all observed service containers remained healthy",
+      unhealthy.length ? "incorrect" : "correct", 0,
+    );
+
+    const oomTargets = [...new Set(containers
+      .filter((item) => item.oomKilled)
+      .map((item) => containerSampleLabel(item)))];
+    this.outcome(
+      "performance", "performance", "detect container OOM kills", remoteTarget,
+      "no sampled OSCAR service container is OOM-killed",
+      oomTargets.length ? `OOM-killed: ${oomTargets.join(", ")}` : "none",
+      oomTargets.length ? "incorrect" : "correct", 0,
+    );
+
+    const changedRestarts: string[] = [];
+    const restartIdentities = new Set(containers.flatMap((item) =>
+      item.containerId && item.composeService ? [`${item.composeService}/${item.containerId}`] : []));
+    for (const identity of restartIdentities) {
+      const counts = new Set(containers
+        .filter((item) => `${item.composeService}/${item.containerId}` === identity && item.restartCount !== null)
+        .map((item) => item.restartCount as number));
+      if (counts.size > 1) changedRestarts.push(`${identity.split("/")[0]}/${identity.split("/")[1]?.slice(0, 12)}`);
+    }
+    this.outcome(
+      "performance", "performance", "detect container restarts", remoteTarget,
+      "each OSCAR container identity keeps a constant restart count during the run",
+      changedRestarts.length
+        ? `restart count changed: ${changedRestarts.join(", ")}`
+        : "no restart count changed",
+      changedRestarts.length ? "incorrect" : "correct", 0,
+    );
+
+    const identityIssues: string[] = [];
+    for (const service of OSCAR_COMPOSE_SERVICES) {
+      const serviceSamples = steadyContainers.filter((item) => item.composeService === service);
+      if (disruptionPhases.size) {
+        for (const phase of steadyRequiredPhases) {
+          const identities = [...new Set(serviceSamples
+            .filter((item) => item.phase === phase)
+            .flatMap((item) => item.containerId ? [item.containerId] : []))];
+          if (identities.length > 1) {
+            identityIssues.push(
+              `${service} used multiple container IDs in ${phase} (${identities.map((id) => id.slice(0, 12)).join(", ")})`,
+            );
+          }
+        }
+      } else {
+        const identities = [...new Set(serviceSamples.flatMap((item) =>
+          item.containerId ? [item.containerId] : []))];
+        if (identities.length > 1) {
+          identityIssues.push(`${service} used multiple container IDs (${identities.map((id) => id.slice(0, 12)).join(", ")})`);
+        }
+      }
+      const absentPhases = steadyRequiredPhases.filter((phase) => {
+        const phaseSamples = serviceSamples.filter((item) => item.phase === phase);
+        return !phaseSamples.some((item) => item.containerId !== null) ||
+          phaseSamples.some((item) => item.containerId === null);
+      });
+      if (absentPhases.length) identityIssues.push(`${service} absent in ${absentPhases.join(",")}`);
+    }
+    this.outcome(
+      "performance", "performance", "detect service disappearance or recreation", remoteTarget,
+      disruptionPhases.size
+        ? "each OSCAR Compose service keeps one identity within every pre/post steady-state phase and is present in each"
+        : "each OSCAR Compose service keeps one container identity and is present in every required phase",
+      identityIssues.length ? identityIssues.join("; ") : "service identities remained present and stable",
+      identityIssues.length ? "incorrect" : "correct", 0,
     );
   }
 
   finalize(startedAt: Date, finishedAt = new Date()): {exitCode: number; outputDir: string} {
+    const nonPerformanceCheckCount = this.functional.filter((item) => item.scenario !== "performance").length;
     this.addPerformanceHealthChecks();
     const aggregate = this.aggregate();
     writeFileSync(join(this.outputDir, "functional-results.csv"), toCsv(this.functional, FUNCTIONAL_COLUMNS));
     writeFileSync(join(this.outputDir, "errors.csv"), toCsv(this.errors, ERROR_COLUMNS));
     writeFileSync(join(this.outputDir, "performance.csv"), toCsv(this.metrics, METRIC_COLUMNS));
+    writeFileSync(
+      join(this.outputDir, "storage-performance.csv"),
+      toCsv(this.storageMetrics, STORAGE_METRIC_COLUMNS),
+    );
     writeFileSync(join(this.outputDir, "summary.csv"), toCsv(aggregate, AGGREGATE_COLUMNS));
 
     const overall = aggregate.find((row) => row.section === "correctness" && row.group === "all");
@@ -232,7 +453,7 @@ export class RunReporter {
     const topMemory = [...performance]
       .filter((row) => row.peakMemoryBytes !== null)
       .sort((a, b) => (b.peakMemoryBytes ?? 0) - (a.peakMemoryBytes ?? 0))[0];
-    const status = failures.length === 0 && fatalErrors.length === 0 && this.functional.length > 0 ? "PASS" : "FAIL";
+    const status = failures.length === 0 && fatalErrors.length === 0 && nonPerformanceCheckCount > 0 ? "PASS" : "FAIL";
     const durationSeconds = (finishedAt.getTime() - startedAt.getTime()) / 1_000;
     const failureLines = failures.slice(0, 10).map((item) =>
       `- ${item.scenario} / ${item.action}: expected ${item.expected}; observed ${item.observed || item.error || "no result"}`,
@@ -253,12 +474,15 @@ export class RunReporter {
       "",
       ...(failureLines.length ? failureLines : fatalErrors.length
         ? [`No functional assertion failed, but ${fatalErrors.length} runtime error(s) made this run fail.`]
-        : this.functional.length === 0 ? ["No functional checks were evaluated; an empty run is invalid."] : ["None."]),
+        : nonPerformanceCheckCount === 0
+          ? ["No non-performance functional checks were evaluated; an empty run is invalid."]
+          : ["None."]),
       "",
       "## Report files",
       "",
       "- `functional-results.csv`: one row per expected OSCAR behavior.",
       "- `performance.csv`: timestamped runner, host, and container CPU/memory samples.",
+      "- `storage-performance.csv`: PostgreSQL, archive, journal, media, backup, and batch counters.",
       "- `summary.csv`: correctness counts and aggregate resource measurements.",
       "- `errors.csv`: browser, API, cleanup, and sampling errors.",
       "- `evidence/`: screenshots and supporting artifacts.",
@@ -267,7 +491,7 @@ export class RunReporter {
     ].join("\n");
     writeFileSync(join(this.outputDir, "summary.md"), narrative);
     writeFileSync(join(this.outputDir, "run.json"), `${JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId: this.runId,
       status,
       startedAt: startedAt.toISOString(),
@@ -278,6 +502,7 @@ export class RunReporter {
       files: {
         functional: "functional-results.csv",
         performance: "performance.csv",
+        storagePerformance: "storage-performance.csv",
         summary: "summary.csv",
         errors: "errors.csv",
         narrative: "summary.md",

@@ -127,6 +127,16 @@ export class RpmEmulatorClient {
     };
   }
 
+  shortAlarmConfig(original: RpmConfig, durationSeconds = 1): RpmConfig {
+    if (!Number.isSafeInteger(durationSeconds) || durationSeconds < 1) {
+      throw new Error("Short alarm duration must be a positive whole number of seconds");
+    }
+    return {
+      ...this.quietConfig(original),
+      occupancy_duration_range: [durationSeconds, durationSeconds],
+    };
+  }
+
   extendedOccupancyConfig(original: RpmConfig, durationSeconds: number): RpmConfig {
     return {
       ...this.quietConfig(original),

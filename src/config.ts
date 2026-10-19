@@ -1,6 +1,7 @@
 import {mkdirSync, readFileSync} from "node:fs";
-import {resolve} from "node:path";
+import {isAbsolute, posix, resolve} from "node:path";
 import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane-config.js";
+import {publicObservationId} from "./public-observation-id.js";
 import type {CapabilityMode, Profile, SuiteConfig} from "./types.js";
 
 function loadDotEnv(path = resolve(".env")): void {
@@ -58,6 +59,19 @@ function integer(name: string, fallback: number, minimum: number): number {
   return value;
 }
 
+function boundedInteger(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const value = integer(name, fallback, minimum);
+  if (value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
 function boolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name]?.trim().toLowerCase();
   if (!raw) return fallback;
@@ -73,6 +87,40 @@ function capabilityMode(name: string, fallback: CapabilityMode): CapabilityMode 
     return raw as CapabilityMode;
   }
   throw new Error(`${name} must be auto, required, or disabled`);
+}
+
+function remoteAbsolutePath(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  if (!value.startsWith("/") || value.includes("\0") || /[\r\n]/.test(value)) {
+    throw new Error(`${name} must be an absolute remote POSIX path without control characters`);
+  }
+  if (value.split("/").includes("..")) {
+    throw new Error(`${name} must not contain parent-directory segments`);
+  }
+  return value.replace(/\/+$/, "") || "/";
+}
+
+function canonicalReleasePath(name: string): string | undefined {
+  const value = remoteAbsolutePath(name);
+  if (value === undefined) return undefined;
+  if (value === "/" || posix.normalize(value) !== value || !/^\/[A-Za-z0-9._/-]+$/.test(value)) {
+    throw new Error(`${name} must be a canonical, non-root absolute POSIX path using safe path characters`);
+  }
+  return value;
+}
+
+function canonicalRestorePath(name: string): string | undefined {
+  const value = remoteAbsolutePath(name);
+  if (value === undefined) return undefined;
+  if (value === "/" || posix.normalize(value) !== value || !/^\/[A-Za-z0-9._/-]+$/.test(value)) {
+    throw new Error(`${name} must be a canonical, non-root absolute POSIX path using safe path characters`);
+  }
+  return value;
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 interface ParsedArguments {
@@ -112,8 +160,9 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   loadDotEnv();
   const parsedArguments = parseArguments(args);
   const profileRaw = parsedArguments.profile ?? "smoke";
-  if (profileRaw !== "smoke" && profileRaw !== "full") {
-    throw new Error("--profile must be smoke or full");
+  if (profileRaw !== "smoke" && profileRaw !== "full" &&
+      profileRaw !== "3.9.2-release" && profileRaw !== "restore-drill") {
+    throw new Error("--profile must be smoke, full, 3.9.2-release, or restore-drill");
   }
   const profile: Profile = profileRaw;
   const {value: oscarBaseUrl, parsed} = serviceUrl("OSCAR_BASE_URL", true);
@@ -140,14 +189,58 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   }
   const knownScenarios = new Set([
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
-    "status-of-health", "lane-video", "event-filtering", "operational-views",
-    "reporting", "alarm-transfer", "rpm-connection", "rpm-faults", "rpm-alarms",
+    "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
+    "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
     "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
+    "storage-health", "storage-lifecycle",
+    "storage-restore-drill",
   ]);
   const unknownScenarios = scenarioValues.filter((value) => !knownScenarios.has(value));
   if (unknownScenarios.length) {
     throw new Error(`Unknown --scenario value(s): ${unknownScenarios.join(", ")}`);
   }
+  if (profile === "restore-drill" &&
+      (scenarioValues.length > 1 || (scenarioValues.length === 1 && scenarioValues[0] !== "storage-restore-drill"))) {
+    throw new Error("--profile restore-drill may run only storage-restore-drill");
+  }
+  if (profile !== "restore-drill" && scenarioValues.includes("storage-restore-drill")) {
+    throw new Error("storage-restore-drill requires --profile restore-drill");
+  }
+  if (profile === "3.9.2-release" && scenarioValues.length > 0) {
+    throw new Error("--profile 3.9.2-release must be an unfiltered full certification run");
+  }
+  const oscarReleaseDirectory = canonicalReleasePath("OSCAR_RELEASE_DIR");
+  const restoreArchiveDirectory = canonicalRestorePath("OSCAR_RESTORE_ARCHIVE_DIR");
+  const restoreWalArchiveDirectory = canonicalRestorePath("OSCAR_RESTORE_WAL_ARCHIVE_DIR");
+  const restoreBackupDirectory = canonicalRestorePath("OSCAR_RESTORE_BACKUP_DIR");
+  const eventUuidWorkflow = capabilityMode("EVENT_UUID_WORKFLOW", "auto");
+  const alarmTransferCameraWorkflow = capabilityMode("ALARM_TRANSFER_CAMERA_WORKFLOW", "auto");
+  const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
+  const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
+  const oscarBuildLabel = process.env.OSCAR_BUILD_LABEL?.trim();
+  const releaseRestoreEvidenceDirectory = process.env.OSCAR_3_9_2_RESTORE_EVIDENCE_DIR?.trim();
+  if (releaseRestoreEvidenceDirectory &&
+      (!isAbsolute(releaseRestoreEvidenceDirectory) || /[\0\r\n]/.test(releaseRestoreEvidenceDirectory))) {
+    throw new Error("OSCAR_3_9_2_RESTORE_EVIDENCE_DIR must be an absolute local path without control characters");
+  }
+  if (profile === "3.9.2-release") {
+    if (operationalViewWorkflow !== "required" || eventUuidWorkflow !== "required" ||
+        alarmTransferCameraWorkflow !== "required" || storageWorkflow !== "required" ||
+        storageBackupWorkflow !== "required") {
+      throw new Error(
+        "3.9.2-release requires operational-view, UUID, camera, storage, and backup workflows to be required",
+      );
+    }
+    if (!oscarBuildLabel) throw new Error("3.9.2-release requires OSCAR_BUILD_LABEL");
+    if (!releaseRestoreEvidenceDirectory) {
+      throw new Error("3.9.2-release requires OSCAR_3_9_2_RESTORE_EVIDENCE_DIR");
+    }
+  }
+
+  const retainedEventId = process.env.STORAGE_RETAINED_EVENT_ID?.trim();
+  const legacyEventId = process.env.STORAGE_LEGACY_EVENT_ID?.trim();
+  if (retainedEventId) publicObservationId(retainedEventId, "STORAGE_RETAINED_EVENT_ID");
+  if (legacyEventId) publicObservationId(legacyEventId, "STORAGE_LEGACY_EVENT_ID");
 
   return {
     profile,
@@ -173,8 +266,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
       ? {sshIdentityFile: process.env.OSCAR_SSH_IDENTITY_FILE.trim()} : {}),
     ...(process.env.BROWSER_EXECUTABLE_PATH?.trim()
       ? {browserExecutablePath: process.env.BROWSER_EXECUTABLE_PATH.trim()} : {}),
-    ...(process.env.OSCAR_BUILD_LABEL?.trim()
-      ? {oscarBuildLabel: process.env.OSCAR_BUILD_LABEL.trim()} : {}),
+    ...(oscarBuildLabel ? {oscarBuildLabel} : {}),
     ...(process.env.EMULATOR_BUILD_LABEL?.trim()
       ? {emulatorBuildLabel: process.env.EMULATOR_BUILD_LABEL.trim()} : {}),
     headless: boolean("HEADLESS", true),
@@ -182,7 +274,35 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     uiTimeoutMs: integer("UI_TIMEOUT_MS", 30_000, 1_000),
     eventTimeoutMs: integer("EVENT_TIMEOUT_MS", 90_000, 10_000),
     extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
-    eventUuidWorkflow: capabilityMode("EVENT_UUID_WORKFLOW", "auto"),
+    eventUuidWorkflow,
+    alarmTransferCameraWorkflow,
+    storageWorkflow,
+    storageExpectedRelease: "3.9.2",
+    storageBackupWorkflow,
+    storageTargetAcknowledgement: process.env.OSCAR_STORAGE_TARGET_ACK?.trim() || "",
+    restoreTargetAcknowledgement: process.env.OSCAR_RESTORE_TARGET_ACK?.trim() || "",
+    restoreDisposableAcknowledgement: process.env.OSCAR_RESTORE_DISPOSABLE_ACK?.trim() || "",
+    restoreDataLossAcknowledgement: process.env.OSCAR_RESTORE_DATA_LOSS_ACK?.trim() || "",
+    restorePathsAcknowledgement: process.env.OSCAR_RESTORE_PATHS_ACK?.trim() || "",
+    ...(restoreArchiveDirectory ? {restoreArchiveDirectory} : {}),
+    ...(restoreWalArchiveDirectory ? {restoreWalArchiveDirectory} : {}),
+    ...(restoreBackupDirectory ? {restoreBackupDirectory} : {}),
+    ...(oscarReleaseDirectory ? {oscarReleaseDirectory} : {}),
+    ...(releaseRestoreEvidenceDirectory ? {releaseRestoreEvidenceDirectory} : {}),
+    ...(retainedEventId ? {storageRetainedEventId: retainedEventId} : {}),
+    ...(legacyEventId ? {storageLegacyEventId: legacyEventId} : {}),
+    ...(process.env.STORAGE_EVENT_NODE_ID?.trim()
+      ? {storageEventNodeId: process.env.STORAGE_EVENT_NODE_ID.trim()} : {}),
+    storageDatabaseScope: integer("STORAGE_DATABASE_SCOPE", 4, 0),
+    storageHotRetentionDays: integer("STORAGE_HOT_RETENTION_DAYS", 30, 1),
+    storageArchiveTimeoutMs: integer("STORAGE_ARCHIVE_TIMEOUT_MS", 300_000, 60_000),
+    storageProbeTimeoutMs: integer("STORAGE_PROBE_TIMEOUT_MS", 1_800_000, 60_000),
+    storageRestoreProbeTimeoutMs: boundedInteger(
+      "STORAGE_RESTORE_PROBE_TIMEOUT_MS",
+      7_200_000,
+      600_000,
+      28_800_000,
+    ),
     resultsRoot,
     scenarioFilter: new Set(scenarioValues),
   };
@@ -192,9 +312,101 @@ export function assertMutationAllowed(config: SuiteConfig): void {
   if (config.targetAcknowledgement !== config.targetHost) {
     throw new Error(`Regression refused: OSCAR_TEST_TARGET_ACK must exactly equal ${config.targetHost}`);
   }
-  if (config.profile !== "full") return;
+  if (config.profile === "restore-drill") {
+    if (["localhost", "127.0.0.1", "::1"].includes(config.targetHost)) {
+      throw new Error("Restore drill refused for a loopback target");
+    }
+    if (config.storageWorkflow !== "required") {
+      throw new Error("Restore drill refused: STORAGE_WORKFLOW must be required");
+    }
+    if (config.storageBackupWorkflow !== "required") {
+      throw new Error("Restore drill refused: STORAGE_BACKUP_WORKFLOW must be required");
+    }
+    if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
+      throw new Error("Restore drill refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required");
+    }
+    if (!config.restoreArchiveDirectory || !config.restoreWalArchiveDirectory || !config.restoreBackupDirectory) {
+      throw new Error(
+        "Restore drill refused: OSCAR_RESTORE_ARCHIVE_DIR, OSCAR_RESTORE_WAL_ARCHIVE_DIR, and OSCAR_RESTORE_BACKUP_DIR are required",
+      );
+    }
+    const restorePaths = [
+      config.restoreArchiveDirectory,
+      config.restoreWalArchiveDirectory,
+      config.restoreBackupDirectory,
+    ];
+    if (restorePaths.some((path, index) => restorePaths.slice(index + 1).some(other => pathsOverlap(path, other)))) {
+      throw new Error("Restore drill refused: archive, WAL archive, and backup directories must be distinct, non-overlapping planes");
+    }
+    const storageAcknowledgement =
+      `${config.targetHost}|${config.oscarSshTarget}|${config.oscarReleaseDirectory}|DISPOSABLE-STORAGE`;
+    if (config.storageTargetAcknowledgement !== storageAcknowledgement) {
+      throw new Error(
+        `Restore drill refused: OSCAR_STORAGE_TARGET_ACK must exactly equal ${storageAcknowledgement}`,
+      );
+    }
+    const targetAcknowledgement =
+      `${config.targetHost}|${config.oscarSshTarget}|${config.oscarReleaseDirectory}|ISOLATED-RESTORE`;
+    if (config.restoreTargetAcknowledgement !== targetAcknowledgement) {
+      throw new Error(
+        `Restore drill refused: OSCAR_RESTORE_TARGET_ACK must exactly equal ${targetAcknowledgement}`,
+      );
+    }
+    const disposableAcknowledgement = `${config.targetHost}:DISPOSABLE-NO-PRODUCTION-DATA`;
+    if (config.restoreDisposableAcknowledgement !== disposableAcknowledgement) {
+      throw new Error(
+        `Restore drill refused: OSCAR_RESTORE_DISPOSABLE_ACK must exactly equal ${disposableAcknowledgement}`,
+      );
+    }
+    if (config.restoreDataLossAcknowledgement !== "I-ACCEPT-DESTRUCTIVE-RESTORE") {
+      throw new Error(
+        "Restore drill refused: OSCAR_RESTORE_DATA_LOSS_ACK must exactly equal I-ACCEPT-DESTRUCTIVE-RESTORE",
+      );
+    }
+    const pathsAcknowledgement =
+      `${config.restoreArchiveDirectory}|${config.restoreWalArchiveDirectory}|${config.restoreBackupDirectory}|DEDICATED-RESTORE-PATHS`;
+    if (config.restorePathsAcknowledgement !== pathsAcknowledgement) {
+      throw new Error(
+        `Restore drill refused: OSCAR_RESTORE_PATHS_ACK must exactly equal ${pathsAcknowledgement}`,
+      );
+    }
+    return;
+  }
+  if (requiresRemoteSuiteLease(config) &&
+      (!config.oscarSshTarget || !config.oscarReleaseDirectory)) {
+    throw new Error(
+      "Regression refused: every mutating run requires OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR for the remote suite lease",
+    );
+  }
+  const storageSelected = config.storageWorkflow !== "disabled" &&
+    (config.scenarioFilter.size === 0 || config.scenarioFilter.has("storage-health") ||
+      config.scenarioFilter.has("storage-lifecycle"));
+  if (storageSelected) {
+    if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
+      if (config.storageWorkflow !== "auto") {
+        throw new Error(
+          "Storage regression refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required",
+        );
+      }
+    } else {
+      const acknowledgement =
+        `${config.targetHost}|${config.oscarSshTarget}|${config.oscarReleaseDirectory}|DISPOSABLE-STORAGE`;
+      if (config.storageTargetAcknowledgement !== acknowledgement) {
+        throw new Error(
+          `Storage regression refused: OSCAR_STORAGE_TARGET_ACK must exactly equal ${acknowledgement}`,
+        );
+      }
+    }
+  }
+
+  if (config.profile !== "full" && config.profile !== "3.9.2-release") return;
   if (["localhost", "127.0.0.1", "::1"].includes(config.targetHost)) {
     throw new Error("Full regression refused for a loopback target");
+  }
+  if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
+    throw new Error(
+      "Full regression refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required for the remote suite lease",
+    );
   }
   if (config.rpmEmulatorAcknowledgement !== config.rpmEmulatorHost) {
     throw new Error(
@@ -207,4 +419,35 @@ export function assertMutationAllowed(config: SuiteConfig): void {
       `Full regression refused: RPM_LANE_MAPPING_ACK must exactly equal ${expectedMapping}`,
     );
   }
+
+  const lifecycleSelected = config.storageWorkflow !== "disabled" &&
+    (config.scenarioFilter.size === 0 || config.scenarioFilter.has("storage-lifecycle"));
+  if (lifecycleSelected) {
+    if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
+      if (config.storageWorkflow === "auto") return;
+      throw new Error(
+        "Full storage regression refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required",
+      );
+    }
+    const acknowledgement =
+      `${config.targetHost}|${config.oscarSshTarget}|${config.oscarReleaseDirectory}|DISPOSABLE-STORAGE`;
+    if (config.storageTargetAcknowledgement !== acknowledgement) {
+      throw new Error(
+        `Full storage regression refused: OSCAR_STORAGE_TARGET_ACK must exactly equal ${acknowledgement}`,
+      );
+    }
+  }
+}
+
+/** Whether this invocation can mutate shared OSCAR or emulator state. */
+export function requiresRemoteSuiteLease(config: SuiteConfig): boolean {
+  if (["full", "3.9.2-release", "restore-drill"].includes(config.profile)) return true;
+  if (config.scenarioFilter.size === 0) return true;
+  if (["map-national-servers", "lane-video", "reporting"].some(
+    name => config.scenarioFilter.has(name),
+  )) {
+    return true;
+  }
+  return config.storageWorkflow !== "disabled" &&
+    (config.scenarioFilter.has("storage-health") || config.scenarioFilter.has("storage-lifecycle"));
 }
