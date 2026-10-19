@@ -3219,9 +3219,9 @@ case $action in
     [[ $(scalar "SELECT coalesce((last_failed_time >= pg_postmaster_start_time())::text,'f') FROM pg_stat_archiver;") == f ]] &&
       archiver_failure_free=true
     recovery_settings_cleared=false
-    recovery_defaults=$(scalar "SELECT (current_setting('restore_command')='' AND current_setting('recovery_target')='' AND current_setting('recovery_target_timeline')='latest' AND current_setting('recovery_target_action')='pause')::text;")
+    recovery_defaults=$(scalar "SELECT CASE WHEN current_setting('restore_command')='' AND current_setting('recovery_target')='' AND current_setting('recovery_target_timeline')='latest' AND current_setting('recovery_target_action')='pause' THEN '1' ELSE '0' END;")
     recovery_pending=$(scalar "SELECT count(*) FROM pg_settings WHERE name IN ('restore_command','recovery_target','recovery_target_timeline','recovery_target_action') AND pending_restart;")
-    if [[ $recovery_defaults == t && $recovery_pending == 0 ]] &&
+    if [[ $recovery_defaults == 1 && $recovery_pending == 0 ]] &&
        compose exec -T postgres sh -eu -c '
          test -f "$PGDATA/postgresql.auto.conf" && test ! -L "$PGDATA/postgresql.auto.conf"
          ! grep -Eq "^[[:space:]]*(restore_command|recovery_target(_[a-z_]+)?|primary_conninfo|primary_slot_name|promote_trigger_file)[[:space:]]*=" "$PGDATA/postgresql.auto.conf"

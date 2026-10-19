@@ -769,6 +769,12 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
   assert.match(block, /SELECT timeline_id FROM pg_control_checkpoint\(\)/);
   assert.match(block, /restored_timeline -gt \$source_timeline/);
   assert.match(block, /future_segment_sha/);
+  assert.match(block,
+    /recovery_defaults=\$\(scalar "SELECT CASE WHEN[\s\S]*THEN '1' ELSE '0' END;"\)/,
+    "recovery defaults must use a canonical scalar instead of PostgreSQL boolean-to-text output");
+  assert.match(block, /\[\[ \$recovery_defaults == 1 && \$recovery_pending == 0 \]\]/);
+  assert.doesNotMatch(block, /recovery_defaults == t/,
+    "PostgreSQL boolean::text renders true/false, not t/f");
   assert.doesNotMatch(block, /wal_canary/);
   assert.match(block, /state='VERIFIED'/);
   assert.match(block, /archive_canary_profile="restore_\$run"/);
