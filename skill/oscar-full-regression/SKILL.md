@@ -104,6 +104,10 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    proceed to mutation if login, target identity, emulator inventory, mapping, or
    connectivity is uncertain.
 5. Run ./scripts/run-regression.sh full.
+   Require its two one-second alarm occupancies to be triggered back-to-back,
+   retain distinct generation-qualified camera paths, and leave the exact OSCAR
+   log window free of camera timeout, quarantine, rejection, result-timeout,
+   stale-generation, and command-failure symptoms.
 6. Preserve the entire latest result directory. Confirm reserved-lane-cleanup is
    correct before accepting the run.
 7. If a selector/oracle is wrong, repair the suite, validate it, repeat the
@@ -144,7 +148,9 @@ the exact direct-daily-file config, a reserved-lane UID append caused by a real
 emulator transition, exact bounded 12-key publication manifests, and byte
 durability after the supported whole-deployment restart. The restart gate must
 also report zero database/module shutdown errors so a concurrent PostgreSQL stop
-cannot pass merely because services later become healthy.
+cannot pass merely because services later become healthy, and zero camera
+recording timeout/quarantine/stale-generation errors so a healthy final container
+cannot hide a poisoned per-camera command queue.
 
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode

@@ -851,6 +851,43 @@ create_observation_fixture() {
 }
 
 case $action in
+  camera-recording-log-start)
+    (($# == 0)) || fail 'Camera-recording log start accepts no arguments.'
+    camera_log_started_at=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ)
+    [[ $camera_log_started_at =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z$ ]] ||
+      fail 'Could not capture a valid camera-recording log start time.'
+    printf '{"startedAt":"%s"}\n' "$camera_log_started_at"
+    ;;
+  camera-recording-log-check)
+    camera_log_started_at=${1:-}
+    (($# == 1)) || fail 'Camera-recording log check requires exactly one start time.'
+    [[ $camera_log_started_at =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z$ ]] ||
+      fail 'Camera-recording log check start time is invalid.'
+    camera_log=$(mktemp /tmp/oscar-camera-recording-log.XXXXXX)
+    cleanup_camera_log() { rm -f -- "$camera_log"; }
+    trap cleanup_camera_log EXIT
+    if ! compose logs --since "$camera_log_started_at" oscar >"$camera_log" 2>&1; then
+      emit_command_diagnostics 'Camera-recording service-log collection' "$camera_log"
+      fail 'Could not collect the exact camera-recording service log window.'
+    fi
+    camera_timeout_quarantines=$(grep -Eic \
+      'Timed out waiting for camera .* command; quarantining its queue' "$camera_log" || true)
+    camera_queue_rejections=$(grep -Eic \
+      'Camera .* command queue is quarantined' "$camera_log" || true)
+    recording_result_timeouts=$(grep -Eic \
+      'Timed out waiting for video files for occupancy generation' "$camera_log" || true)
+    stale_generation_results=$(grep -Eic \
+      'returned a stale or mismatched saved-video result for occupancy generation' "$camera_log" || true)
+    camera_command_failures=$(grep -Eic \
+      'Camera .* failed to close occupancy generation|Failed to finish matched camera recording generation' \
+      "$camera_log" || true)
+    printf '{"timeoutQuarantines":%s,"queueRejections":%s,"recordingResultTimeouts":%s,' \
+      "$camera_timeout_quarantines" "$camera_queue_rejections" "$recording_result_timeouts"
+    printf '"staleGenerationResults":%s,"cameraCommandFailures":%s}\n' \
+      "$stale_generation_results" "$camera_command_failures"
+    cleanup_camera_log
+    trap - EXIT
+    ;;
   alarm-media-baseline)
     run=${1:-}
     (($# == 1)) || fail 'Alarm-media baseline requires exactly one run ID.'
@@ -1870,8 +1907,9 @@ case $action in
     fi
     recovery_errors=$(grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' "$restart_service_log" || true)
     shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)|FATAL:.*terminating connection due to administrator command' "$restart_service_log" || true)
-    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s}\n' \
-      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors"
+    camera_recording_errors=$(grep -Eic 'Timed out waiting for camera .* command; quarantining its queue|Camera .* command queue is quarantined|Timed out waiting for video files for occupancy generation|returned a stale or mismatched saved-video result for occupancy generation|Camera .* failed to close occupancy generation|Failed to finish matched camera recording generation' "$restart_service_log" || true)
+    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s}\n' \
+      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors"
     cleanup_journal_restart
     trap - EXIT
     ;;

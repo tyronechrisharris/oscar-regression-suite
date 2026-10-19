@@ -249,7 +249,11 @@ advance. Those bytes and safe layout
 must survive the supported whole-deployment launcher restart. That restart also
 requires PostgreSQL to remain available through OSCAR's bounded shutdown: the
 post-start log window must contain no `BasicEventHandler`, transaction-handler,
-database-purger, module-timeout, or PostgreSQL administrator-termination failure.
+database-purger, module-timeout, PostgreSQL administrator-termination, camera
+command timeout/quarantine, recording-result timeout, queue rejection, or
+stale-generation failure. The full profile also records an exact log boundary
+before its back-to-back one-second gamma/neutron occupancies and applies the
+same camera-recording gate after both generation-qualified MP4s have loaded.
 This is evidence of direct live journal capture,
 not a renamed or fabricated publication.
 

@@ -32,10 +32,13 @@ source review before the suite can certify that version.
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
   extended-occupancy detection and recovery
 - live HLS camera playback, decoded dimensions, and advancing playback time
-- alarm ingestion and full-database event filtering; exact generated public
-  observation-ID-to-video association with one unique generation-qualified MP4 per
-  authoritative OSH lane-camera UID, nonzero source objects, and browser-loaded
-  MP4 metadata
+- back-to-back one-second gamma/neutron alarm occupancies that exercise a short
+  CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
+  rejecting camera-command timeout, quarantine, result-timeout, rejection, and
+  stale-generation symptoms; alarm ingestion and full-database event filtering;
+  exact generated public observation-ID-to-video association with one unique
+  generation-qualified MP4 per authoritative OSH lane-camera UID, nonzero source
+  objects, and browser-loaded MP4 metadata
 - occupancy “Event UUID” display, search, fresh direct links, not-found handling,
   operational-view-preserving member lookup and non-member fail-closed behavior,
   and exact public observation ID preservation in printable PDFs and truncated QR exports

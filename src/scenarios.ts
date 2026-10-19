@@ -204,6 +204,7 @@ export class RegressionScenarios {
   private alarmCameraUids: string[] | undefined;
   private alarmLaneUid: string | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
+  private cameraRecordingLogStartedAt: string | undefined;
   private readonly retainedBackupExpectations = new Map<string, string>();
   private retainedMediaProofDeferred = false;
   private stopRequested: () => boolean = () => false;
@@ -2285,6 +2286,15 @@ export class RegressionScenarios {
       return;
     }
     this.alarmMediaProbe ??= new StorageProbeClient(this.config, this.reporter.runId);
+    if (!this.cameraRecordingLogStartedAt) {
+      const marker = await this.alarmMediaProbe.runJson<{startedAt: string}>(
+        "camera-recording-log-start",
+      );
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/.test(marker.startedAt)) {
+        throw new Error("Camera-recording log probe returned an invalid start time");
+      }
+      this.cameraRecordingLogStartedAt = marker.startedAt;
+    }
     const created = await this.check({
       scenario,
       category: "alarm-media",
@@ -2515,11 +2525,26 @@ export class RegressionScenarios {
   }
 
   private async alarms(): Promise<void> {
+    if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
     const page = await this.browser.oscarPage();
+    const generated: Array<{type: "gamma" | "neutron"; occupancyCount: number}> = [];
+    const quiet = this.emulator.quietConfig(this.originalRpmConfig);
     try {
+      await this.ensureAlarmMediaBaseline("rpm-alarms");
+      await this.emulator.replaceConfig(
+        this.config.testRpmId,
+        this.emulator.shortAlarmConfig(this.originalRpmConfig),
+      );
+      // Trigger both one-second occupancies before doing any Viewer work. The second OPEN is
+      // consequently allowed to queue behind the first generation's keyframe-gated OPEN/CLOSE;
+      // resolving the events afterwards also proves that neither generation inherited the
+      // other's authoritative camera path.
       for (const type of ["gamma", "neutron"] as const) {
         const occupancyCount = await this.triggerAlarm(type);
         if (occupancyCount === undefined) throw new Error(`${type} trigger returned no occupancy count`);
+        generated.push({type, occupancyCount});
+      }
+      for (const {type, occupancyCount} of generated) {
         const ingested = await this.check({
           scenario: "rpm-alarms", category: "event-ingestion", action: `ingest ${type} alarm`,
           target: this.config.testLaneLabel, expected: `Event Log shows a new ${type} event on the reserved lane`,
@@ -2534,7 +2559,31 @@ export class RegressionScenarios {
         const eventId = await this.resolveAlarmEventUuid(page, row, type, occupancyCount, "rpm-alarms");
         if (eventId) await this.captureAlarmMedia(page, eventId, type, occupancyCount, "rpm-alarms");
       }
-    } finally { await page.close(); }
+      if (this.alarmMediaProbe && this.cameraRecordingLogStartedAt) {
+        await this.check({
+          scenario: "rpm-alarms",
+          category: "alarm-media",
+          action: "keep camera command queues healthy across short occupancies",
+          target: this.config.testLaneLabel,
+          expected: "back-to-back one-second alarm recordings emit no camera timeout, quarantine, rejection, result timeout, stale-generation result, or command failure",
+        }, async () => {
+          const value = await this.alarmMediaProbe!.runJson<{
+            timeoutQuarantines: number;
+            queueRejections: number;
+            recordingResultTimeouts: number;
+            staleGenerationResults: number;
+            cameraCommandFailures: number;
+          }>("camera-recording-log-check", [this.cameraRecordingLogStartedAt!]);
+          const counts = Object.values(value);
+          const passed = counts.every(count => Number.isSafeInteger(count) && count === 0);
+          return {passed, observed: JSON.stringify(value)};
+        });
+      }
+    } finally {
+      await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch(error =>
+        this.reporter.error("rpm-alarms", "restore-quiet-config", error));
+      await page.close();
+    }
   }
 
   private async exportSelectedAlarm(page: Page, expectedEventUuid?: string): Promise<ExportedAlarmArtifacts> {
@@ -4058,6 +4107,7 @@ export class RegressionScenarios {
           partialFiles: number;
           recoveryErrors: number;
           shutdownErrors: number;
+          cameraRecordingErrors: number;
         }>("journal-restart", [directJournalLaneUid!]);
         const lane = await probe.runJson<DirectJournalLaneState>(
           "journal-lane-state",
@@ -4072,7 +4122,7 @@ export class RegressionScenarios {
           value.segmentFailures === 0;
         return {passed: value.healthy && exactRestartPreservation &&
           value.partialFiles === 0 && value.recoveryErrors === 0 &&
-          value.shutdownErrors === 0 && laneDurable,
+          value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
           observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
       });
       if (this.config.storageBackupWorkflow !== "disabled") {

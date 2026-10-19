@@ -117,7 +117,11 @@
   pass exact header/36-byte-record checks with no legacy markers or tombstones;
   a real reserved-lane transition advances direct journal bytes and those bytes
   survive the supported whole-deployment restart, with zero database/module
-  shutdown errors in the exact restart log window
+  shutdown errors and zero camera recording timeout/quarantine/stale-generation
+  errors in the exact restart log window
+- the full alarm workflow triggers one-second gamma and neutron occupancies
+  back-to-back before Viewer resolution, proves distinct generation-qualified
+  paths, and reports zero camera queue/result errors in its exact log window
 - backup acceptance independently recomputes the core HMAC with the backup key,
   verifies every checksum and exact no-link payload inventory, and also includes regular `VERIFIED`, `JOURNAL_CONFIRMED`, `SHA256SUMS`,
   `SHA256SUMS.hmac`, `epoch.json`, `image-inventory.txt`, and

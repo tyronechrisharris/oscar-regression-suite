@@ -110,6 +110,15 @@ If source status fails, inspect only the reported paths and preserve OSCAR logs.
 If a source is nonzero but Chromium metadata fails, inspect the browser/network
 response and codec logs; file existence alone is not a valid substitute.
 
+If `keep camera command queues healthy across short occupancies` fails, preserve
+the complete result bundle and the OSCAR service logs for the reported run
+window. A nonzero timeout/quarantine or queue-rejection count means a camera
+operation inherited time spent behind another generation or remained genuinely
+hung; do not rerun until it happens to pass. A stale-generation count means the
+saved path was not owned by the occupancy that requested it. The probe reports
+counts only so routine regression artifacts do not copy unrelated service-log
+content.
+
 ## Generated alarm retention times out
 
 The full target must be disposable and its persisted OSCAR service config must

@@ -560,8 +560,38 @@ test("journal restart exercises dependency-ordered launcher shutdown", () => {
   for (const required of [
     "BasicEventHandler", "DataStreamTransactionHandler", "DatabasePurger",
     "ModuleRegistry", "terminating connection due to administrator command",
-    '"shutdownErrors":%s',
+    "Timed out waiting for camera", "command queue is quarantined",
+    "Timed out waiting for video files", "stale or mismatched saved-video result",
+    '"shutdownErrors":%s', '"cameraRecordingErrors":%s',
   ]) assert.ok(block.includes(required), `missing ordered-restart oracle: ${required}`);
+});
+
+test("camera recording log probe uses one exact guarded window and count-only output", () => {
+  const start = probe.indexOf("  camera-recording-log-start)");
+  const end = probe.indexOf("  alarm-media-baseline)", start);
+  const block = probe.slice(start, end);
+  assert.ok(start >= 0 && end > start, "camera-recording log actions are missing");
+  assert.match(block, /date --utc \+%Y-%m-%dT%H:%M:%S\.%NZ/);
+  assert.match(block, /compose logs --since "\$camera_log_started_at" oscar/);
+  for (const field of [
+    "timeoutQuarantines", "queueRejections", "recordingResultTimeouts",
+    "staleGenerationResults", "cameraCommandFailures",
+  ]) assert.ok(block.includes(`\\"${field}\\"`) || block.includes(`"${field}"`), `missing ${field}`);
+  assert.doesNotMatch(block, /cat -- "\$camera_log"/);
+});
+
+test("alarm scenario queues back-to-back short occupancies before Viewer resolution", () => {
+  const start = scenarios.indexOf("  private async alarms()");
+  const end = scenarios.indexOf("  private async exportSelectedAlarm", start);
+  const block = scenarios.slice(start, end);
+  assert.ok(start >= 0 && end > start, "alarm scenario is missing");
+  assert.match(block, /shortAlarmConfig\(this\.originalRpmConfig\)/);
+  const triggers = block.indexOf("for (const type of");
+  const resolutions = block.indexOf("for (const {type, occupancyCount} of generated)");
+  assert.ok(triggers >= 0 && resolutions > triggers,
+    "both short alarms must trigger before either event is resolved");
+  assert.match(block, /camera-recording-log-check/);
+  assert.match(block, /counts\.every\(count => Number\.isSafeInteger\(count\) && count === 0\)/);
 });
 
 test("media metadata probe validates compact checkpoint and exact binary indexes", () => {
