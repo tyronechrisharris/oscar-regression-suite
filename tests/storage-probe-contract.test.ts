@@ -486,6 +486,8 @@ test("journal status validates exact bounded v1 manifests and direct lane state"
   assert.match(block, /value->>'dataFile'='\$csv_name'/);
   assert.match(block, /'\$csv_day'::date::timestamp AT TIME ZONE '\$journal_zone'/);
   assert.match(block, /publishedAt'\)::timestamptz >=/);
+  assert.match(block, /mapfile -t manifest_paths/);
+  assert.match(block, /for manifest in "\$\{manifest_paths\[@\]\}"/);
   assert.doesNotMatch(block, /for manifest in \$\(find/);
   assert.match(block, /awk -v today="\$today" "\\\$0 ~ \/\^\[0-9\]\{4\}/);
   assert.match(block, /awk "\{ total \+= \\\$1 \} END \{ printf \\"%\.0f\\n\\", total\+0 \}"/);

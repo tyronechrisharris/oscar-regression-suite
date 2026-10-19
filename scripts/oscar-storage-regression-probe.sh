@@ -1691,7 +1691,11 @@ case $action in
     manifest_listing=$(compose exec -T oscar find /var/lib/oscar/files/dailyfiles \
       -mindepth 1 -maxdepth 1 -type f -name '*.manifest.v1.json' -print | LC_ALL=C sort)
     validated=0; failures=0
-    while IFS= read -r manifest; do
+    # Materialize the bounded listing before validation. docker compose exec
+    # commands inside the loop may read stdin even with -T; a read-driven loop
+    # would therefore lose every path after the first validation.
+    mapfile -t manifest_paths <<<"$manifest_listing"
+    for manifest in "${manifest_paths[@]}"; do
       [[ -n $manifest ]] || continue
       if [[ ! $manifest =~ ^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}\.csv\.manifest\.v1\.json$ ]]; then
         failures=$((failures+1)); continue
@@ -1754,7 +1758,7 @@ case $action in
             (value->>'windowEndExclusive')::timestamptz
         FROM doc;")
       if [[ $manifest_valid == t ]]; then validated=$((validated+1)); else failures=$((failures+1)); fi
-    done <<<"$manifest_listing"
+    done
     printf '{"publications":%s,"manifests":%s,"validatedManifests":%s,"manifestFailures":%s,"partialFiles":%s,"unsafeLinks":%s,"unsafeEntries":%s,"bounded":true,"inventoryEntries":%s,"zoneId":"%s","currentDate":"%s","eligiblePriorDayDirectories":%s,"currentDayDirectories":%s,"currentDayOpenSegments":%s,"currentDaySealedSegments":%s,"currentDayBytes":%s,"journalIntegrityFailures":%s,"openSegments":%s,"sealedSegments":%s}\n' \
       "$publications" "$manifests" "$validated" "$failures" "$partial" "$unsafe_links" "$unsafe_entries" \
       "$inventory_entries" "$journal_zone" "$journal_today" "$eligible_prior_days" \
