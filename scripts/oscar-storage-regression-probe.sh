@@ -40,8 +40,11 @@ psql_admin() {
     exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"
   ' psql-wrapper "$@"
 }
-scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" | tr -d '[:space:]'; }
-json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" | tail -n 1; }
+# These helpers are called from manifest/ledger read loops. psql/docker inherit
+# stdin by default and would otherwise consume the loop's remaining records
+# after validating the first item.
+scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tr -d '[:space:]'; }
+json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
 retention_hold_id_from_output() {

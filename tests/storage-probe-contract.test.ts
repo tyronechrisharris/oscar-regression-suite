@@ -92,6 +92,8 @@ test("query helpers suppress DML command tags before parsing scalar and JSON row
   const helpers = `${scalarHelper}\n${jsonHelper}`;
   assert.match(scalarHelper, /psql_admin --quiet --tuples-only --no-align/);
   assert.match(jsonHelper, /psql_admin --quiet --tuples-only --no-align/);
+  assert.match(scalarHelper, /<\/dev\/null/);
+  assert.match(jsonHelper, /<\/dev\/null/);
   assert.equal(runProbeQueryHelpers(helpers), '1\t{"ok":true}');
 
   const legacyHelpers = helpers.replaceAll(" --quiet", "");
