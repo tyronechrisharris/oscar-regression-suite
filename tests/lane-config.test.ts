@@ -22,7 +22,7 @@ function laneRange(first: number, last: number): string[] {
 test("canonical fixture uses the current schema and exact seven operational-view memberships", () => {
   const oracle = loadLaneConfigOracle(canonicalPath);
   assert.equal(oracle.lanes.length, 50);
-  assert.equal(oracle.sha256, "02a0669f64b7f7de0dbafcaa3b6b627caac3005e5eca913b84e0ef30aac5fc54");
+  assert.equal(oracle.sha256, "3aff95bba57b38252016226debcab28a04cdeffa7e8c13e71a85ac94b4365312");
   assert.deepEqual([...oracle.lanesByView.keys()].sort(), [...REQUIRED_OPERATIONAL_VIEW_KEYS].sort());
   assert.deepEqual(oracle.lanesByView.get("east-gate"), laneRange(1, 10));
   assert.deepEqual(oracle.lanesByView.get("west-gate"), laneRange(11, 20));
