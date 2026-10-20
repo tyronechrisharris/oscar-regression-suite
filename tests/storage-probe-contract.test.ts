@@ -92,6 +92,8 @@ test("query helpers suppress DML command tags before parsing scalar and JSON row
   const helpers = `${scalarHelper}\n${jsonHelper}`;
   assert.match(scalarHelper, /psql_admin --quiet --tuples-only --no-align/);
   assert.match(jsonHelper, /psql_admin --quiet --tuples-only --no-align/);
+  assert.match(scalarHelper, /<\/dev\/null/);
+  assert.match(jsonHelper, /<\/dev\/null/);
   assert.equal(runProbeQueryHelpers(helpers), '1\t{"ok":true}');
 
   const legacyHelpers = helpers.replaceAll(" --quiet", "");
@@ -179,6 +181,9 @@ test("alarm-media probe scopes a no-replace baseline and removes every temporary
   assert.match(block, /rm -f -- "\$marker"/);
   assert.match(block, /trap cleanup_alarm_baseline EXIT/);
   assert.match(block, /trap cleanup_alarm_forensics EXIT/);
+  assert.match(block, /printf "MISSING\\\\n"/);
+  assert.match(block, /printf '\{"exists":true,"ledger":%s\}\\n'/);
+  assert.doesNotMatch(block, /printf "\{\\\\"exists/);
   assert.match(probe, /-g\[1-9\]\[0-9\]\*\\\.mp4/);
 });
 
@@ -206,6 +211,10 @@ test("generated alarm-media scenario binds public observations, MP4 metadata, ma
     "alarm-media-forensics",
     "alarmMediaForensicsPassed",
   ]) assert.ok(block.includes(required), `missing generated alarm-media assertion: ${required}`);
+  const metadataBlock = block.slice(block.indexOf("private async browserMp4Metadata"),
+    block.indexOf("private async captureAlarmMedia"));
+  assert.doesNotMatch(metadataBlock, /const finish\s*=/,
+    "browser-evaluated callbacks must not capture the tsx __name helper");
   assert.match(block, /Buffer\.from\(item\.association\.eventId, "utf8"\)\.toString\("base64url"\)/);
   assert.match(block, /generated\.flatMap\(item =>[\s\S]*item\.association\.paths/);
   assert.doesNotMatch(block, /new Set\(generated\.flatMap/);
@@ -484,6 +493,8 @@ test("journal status validates exact bounded v1 manifests and direct lane state"
   assert.match(block, /value->>'dataFile'='\$csv_name'/);
   assert.match(block, /'\$csv_day'::date::timestamp AT TIME ZONE '\$journal_zone'/);
   assert.match(block, /publishedAt'\)::timestamptz >=/);
+  assert.match(block, /mapfile -t manifest_paths/);
+  assert.match(block, /for manifest in "\$\{manifest_paths\[@\]\}"/);
   assert.doesNotMatch(block, /for manifest in \$\(find/);
   assert.match(block, /awk -v today="\$today" "\\\$0 ~ \/\^\[0-9\]\{4\}/);
   assert.match(block, /awk "\{ total \+= \\\$1 \} END \{ printf \\"%\.0f\\n\\", total\+0 \}"/);
@@ -557,13 +568,19 @@ test("journal restart exercises dependency-ordered launcher shutdown", () => {
   assert.match(block, /sudo bash oscar[.]sh restart/);
   assert.doesNotMatch(block, /compose restart oscar/);
   assert.match(block, /compose logs --since "\$restart_started" oscar postgres/);
+  assert.match(block, /mapfile -t before_rows <"\$before_inventory"/);
+  assert.match(block, /for before_row in "\$\{before_rows\[@\]\}"/);
+  assert.match(block, /segments_verified == "\$segments_before"/);
+  assert.doesNotMatch(block, /done <"\$before_inventory"/);
   for (const required of [
     "BasicEventHandler", "DataStreamTransactionHandler", "DatabasePurger",
-    "ModuleRegistry", "terminating connection due to administrator command",
+    "ModuleRegistry", "journal-restart-partials", '! -newermt "$cutoff"',
     "Timed out waiting for camera", "command queue is quarantined",
     "Timed out waiting for video files", "stale or mismatched saved-video result",
     '"shutdownErrors":%s', '"cameraRecordingErrors":%s',
   ]) assert.ok(block.includes(required), `missing ordered-restart oracle: ${required}`);
+  assert.doesNotMatch(block, /FATAL:[^'\n]*terminating connection due to administrator command/,
+    "normal PostgreSQL disconnects during the supported restart are not shutdown failures");
 });
 
 test("camera recording log probe uses one exact guarded window and count-only output", () => {
@@ -609,6 +626,7 @@ test("media metadata probe validates compact checkpoint and exact binary indexes
   assert.doesNotMatch(helper, /records[^\n]*-gt 100000/,
     "valid high-rate five-minute index files must stream rather than fail format validation");
   assert.match(probe, /  media-metadata-health\)/);
+  assert.match(probe, /  retention-runtime-health\)/);
   assert.match(probe, /  archive-scratch-health\)/);
 });
 
@@ -631,8 +649,14 @@ test("storage snapshot emits activeHolds exactly once", () => {
   ]) assert.ok(block.includes(field), `missing media storage metric: ${field}`);
 });
 
-test("backup check authenticates markers, epoch, supported verification, and journal receipts", () => {
+test("backup check authenticates markers, epoch, verification, and exact journal outcomes", () => {
   const block = probe.slice(probe.indexOf("  backup-check)"), probe.indexOf("  restore-drill)"));
+  const liveMember = probe.slice(probe.indexOf("append_live_backup_member()"),
+    probe.indexOf("verify_retained_backup_members()"));
+  assert.match(liveMember, /awk "\{print \\\$1\}"/,
+    "the inner container shell must receive one escaped awk field reference");
+  assert.doesNotMatch(liveMember, /awk "\{print \\\\\$1\}"/,
+    "a doubled backslash is passed through to awk as an invalid character");
   for (const required of [
     "SHA256SUMS.hmac",
     "JOURNAL_CONFIRMED",
@@ -642,6 +666,7 @@ test("backup check authenticates markers, epoch, supported verification, and jou
     "backup-verify",
     "oscar-backup-epoch",
     "journalReceipts",
+    "journalConfirmedPublications",
     "backup-confirmations",
     "journalConfirmationAuthenticated",
     "archiveGenerationInventoryExact",
@@ -687,6 +712,18 @@ test("backup check authenticates markers, epoch, supported verification, and jou
   assert.match(block, /duckdb-tmp/);
   assert.match(block, /retention-processed-index\/\[0-9\]\{19\}-\(0\[0-9\]\|1\[01\]\)/);
   assert.match(block, /verify_retained_backup_members/);
+  assert.match(block, /append_quiesced_backup_member/);
+  assert.match(block, /copy_quiesced_confirmation_member "\$confirmation_set_member"/);
+  assert.match(block, /copy_quiesced_confirmation_member "\$receipt_member"/);
+  assert.match(block, /if \(\(journal_confirmed_count > 0\)\); then/);
+  assert.match(block, /Zero-candidate daily-journal confirmation unexpectedly published a set marker/);
+  assert.match(block, /receipt_count == "\$journal_confirmed_count"/);
+  assert.doesNotMatch(block, /tar -xOf "\$root\/oscar-state[.]tar[.]gz" -- "\$confirmation_set_raw"/,
+    "the post-verification confirmation set is live authorization, not a member of its prior snapshot");
+  assert.match(block, /compose stop gateway/);
+  assert.match(block, /compose stop oscar/);
+  assert.match(block, /sudo bash oscar[.]sh start/);
+  assert.doesNotMatch(block, /Backup certification requires at least one processed-observation index/);
   assert.match(block, /expected-retained-members[.]txt/);
   assert.match(block, /retainedMediaExactMembersVerified/);
   assert.match(block, /expectedProcessedIndexes/);
@@ -745,6 +782,12 @@ test("restore drill is a separate exact-confirmation action with multi-plane can
   assert.match(block, /SELECT timeline_id FROM pg_control_checkpoint\(\)/);
   assert.match(block, /restored_timeline -gt \$source_timeline/);
   assert.match(block, /future_segment_sha/);
+  assert.match(block,
+    /recovery_defaults=\$\(scalar "SELECT CASE WHEN[\s\S]*THEN '1' ELSE '0' END;"\)/,
+    "recovery defaults must use a canonical scalar instead of PostgreSQL boolean-to-text output");
+  assert.match(block, /\[\[ \$recovery_defaults == 1 && \$recovery_pending == 0 \]\]/);
+  assert.doesNotMatch(block, /recovery_defaults == t/,
+    "PostgreSQL boolean::text renders true/false, not t/f");
   assert.doesNotMatch(block, /wal_canary/);
   assert.match(block, /state='VERIFIED'/);
   assert.match(block, /archive_canary_profile="restore_\$run"/);
@@ -1048,6 +1091,16 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "mediaMetadataHealthIsSafe", "fixture-hot-hold-create", "HOT_EXACT",
     ".delete(", "fixture-hot-hold-release", "GENERATION_EXACT", "COLD_RANGE_CONSERVATIVE",
     "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
+    "return {passed: clean, value: clean",
+    "storage-lifecycle-export-disruption", 'this.metrics.setPhase("storage-lifecycle-post-export")',
+    "storage-lifecycle-purge-disruption", 'this.metrics.setPhase("storage-lifecycle-post-purge")',
+    "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
+    "storage-lifecycle-backup-disruption", 'this.metrics.setPhase("storage-lifecycle-post-backup")',
+    "await this.metrics.sample()", "retained-media indexes to repopulate and stabilize after restart",
+    "REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000",
+    "verify accelerated retained-media worker is active", "retention-runtime-health",
+    "retentionRuntimeReady", "REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS",
+    "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",
@@ -1105,6 +1158,8 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   assert.match(health, /this\.retainedMediaProofDeferred = true/);
   assert.match(health, /full profile will self-seed an exact alarm UUID/);
   assert.match(health, /STORAGE_RETAINED_EVENT_ID is missing and this run cannot self-seed/);
+  assert.match(health, /daily-journal inventory to reach an atomic clean boundary/);
+  assert.match(health, /candidate => assessDailyJournalStatus\(candidate\)\.passed/);
 
   const generatedStart = scenarios.indexOf("private async verifyGeneratedAlarmRetention");
   const generatedEnd = scenarios.indexOf("private storageUnavailable", generatedStart);

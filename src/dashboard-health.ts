@@ -28,6 +28,15 @@ export interface DashboardConnectionAssessment {
   unresolved: string[];
 }
 
+/** Match the RPM's own Status-of-Health state without accepting a camera state later in the row. */
+export function healthRowHasRpmConnectionState(
+  text: string,
+  state: "online" | "offline",
+): boolean {
+  const expected = state === "online" ? "Online" : "Offline";
+  return new RegExp(`\\bRPM\\s*\\([^)]*\\)\\s*·\\s*${expected}\\b`, "i").test(text);
+}
+
 export interface ConnectionRewriteSummary {
   matched: number;
   offlineMatched: number;

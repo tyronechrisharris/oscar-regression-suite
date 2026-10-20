@@ -40,8 +40,11 @@ psql_admin() {
     exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"
   ' psql-wrapper "$@"
 }
-scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" | tr -d '[:space:]'; }
-json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" | tail -n 1; }
+# These helpers are called from manifest/ledger read loops. psql/docker inherit
+# stdin by default and would otherwise consume the loop's remaining records
+# after validating the first item.
+scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tr -d '[:space:]'; }
+json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
 retention_hold_id_from_output() {
@@ -430,6 +433,56 @@ EOF
       "${legacy_deleted:-0}" "${partials:-0}" "${unsafe:-0}" "$format_failures"
   ' media-metadata-health "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema"
 }
+retention_runtime_health_json() {
+  local checkpoint=/var/lib/oscar/files/videos/retained-media/v1/.retention-scan-checkpoint.json
+  local encoded='' result='' schema=null valid=false processed=null updated=null lag=null
+  encoded=$(compose exec -T oscar sh -eu -c '
+    path=$1
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then exit 0; fi
+    [ -f "$path" ] && [ ! -L "$path" ] || exit 20
+    size=$(stat -c %s -- "$path")
+    [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || exit 21
+    openssl base64 -A -in "$path"
+  ' retention-scan-checkpoint "$checkpoint") ||
+    fail 'Retention scan checkpoint is linked, non-regular, empty, or over 1 MiB.'
+  if [[ -z $encoded ]]; then
+    printf '{"checkpointPresent":false,"checkpointValid":false,"checkpointSchemaVersion":null,"processedThrough":null,"updatedAt":null,"cursorLagSeconds":null}\n'
+    return
+  fi
+  [[ $encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#encoded} -le 1398104 ]] ||
+    fail 'Retention scan checkpoint is not bounded canonical base64.'
+  result=$(scalar "WITH source AS (
+      SELECT convert_from(decode('$encoded','base64'),'UTF8') AS text),
+    doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source),
+    checked AS (
+      SELECT raw,value,(
+        jsonb_typeof(value)='object'
+        AND (SELECT count(*) FROM json_object_keys(raw))=3
+        AND value ?& ARRAY['schemaVersion','processedThrough','updatedAt']
+        AND value->'schemaVersion'='1'::jsonb
+        AND jsonb_typeof(value->'processedThrough')='string'
+        AND value->>'processedThrough' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+        AND jsonb_typeof(value->'updatedAt')='string'
+        AND value->>'updatedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
+      ) AS valid FROM doc)
+    SELECT coalesce(value->>'schemaVersion','')||'|'||valid::text||'|'||
+      CASE WHEN valid THEN value->>'processedThrough' ELSE '' END||'|'||
+      CASE WHEN valid THEN value->>'updatedAt' ELSE '' END||'|'||
+      CASE WHEN valid THEN greatest(0,floor(extract(epoch FROM
+        (clock_timestamp()-(value->>'processedThrough')::timestamptz))))::bigint::text ELSE '' END
+    FROM checked;")
+  IFS='|' read -r schema valid_text processed_text updated_text lag_text extra <<<"$result"
+  [[ -z ${extra:-} ]] || fail 'Retention scan checkpoint produced an ambiguous result.'
+  [[ $schema =~ ^[0-9]+$ ]] || schema=null
+  if [[ $valid_text == true ]]; then
+    valid=true
+    safe_json_text "$processed_text"; safe_json_text "$updated_text"
+    [[ $lag_text =~ ^[0-9]+$ ]] || fail 'Retention scan checkpoint lag is invalid.'
+    processed=\"$processed_text\"; updated=\"$updated_text\"; lag=$lag_text
+  fi
+  printf '{"checkpointPresent":true,"checkpointValid":%s,"checkpointSchemaVersion":%s,"processedThrough":%s,"updatedAt":%s,"cursorLagSeconds":%s}\n' \
+    "$valid" "$schema" "$processed" "$updated" "$lag"
+}
 safe_json_text() {
   [[ ${1:-} =~ ^[A-Za-z0-9._/:@+,-]*$ ]] || fail "Unsafe value in probe JSON: ${1:-}"
 }
@@ -576,7 +629,7 @@ append_live_backup_member() {
     [ -f "$path" ] && [ ! -L "$path" ]
     size=$(stat -c %s -- "$path")
     [ "$size" -gt 0 ]
-    sha=$(sha256sum -- "$path" | awk "{print \\$1}")
+    sha=$(sha256sum -- "$path" | awk "{print \$1}")
     printf "%s|%s\\n" "$sha" "$size"
   ' retained-backup-member "$member") || fail "Expected retained backup member is missing or unsafe: $member"
   IFS='|' read -r result_sha result_bytes extra <<<"$live"
@@ -587,6 +640,68 @@ append_live_backup_member() {
   [[ -z $expected_bytes || $result_bytes == "$expected_bytes" ]] ||
     fail "Live retained frame size does not match its authenticated API manifest: $member"
   printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
+}
+append_quiesced_backup_member() {
+  local inventory=$1 kind=$2 member=$3 image=$4 expected_sha=${5:-} expected_bytes=${6:-}
+  local snapshot result_sha result_bytes extra
+  [[ $kind =~ ^(M|J|C|P|D)$ && -n $image ]] ||
+    fail 'Quiesced retained backup expectation has an invalid member kind or image.'
+  [[ $member =~ ^files/videos/retained-media/v1/[A-Za-z0-9._/-]+$ &&
+     $member != *'/../'* && $member != */.. && $member != *'//' ]] ||
+    fail 'Quiesced retained backup expectation has an unsafe member path.'
+  snapshot=$(docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+    --volume oscar_oscar_state:/state:ro "$image" -eu -c '
+      path=/state/$1
+      [ -f "$path" ] && [ ! -L "$path" ]
+      size=$(stat -c %s -- "$path")
+      [ "$size" -gt 0 ]
+      sha=$(sha256sum -- "$path" | awk "{print \$1}")
+      printf "%s|%s\\n" "$sha" "$size"
+    ' retained-backup-member "$member") ||
+    fail "Expected quiesced retained backup member is missing or unsafe: $member"
+  IFS='|' read -r result_sha result_bytes extra <<<"$snapshot"
+  [[ -z ${extra:-} && $result_sha =~ ^[0-9a-f]{64}$ && $result_bytes =~ ^[1-9][0-9]*$ ]] ||
+    fail 'Quiesced retained backup member snapshot returned invalid hash/size metadata.'
+  [[ -z $expected_sha || $result_sha == "$expected_sha" ]] ||
+    fail "Quiesced retained frame hash does not match its authenticated API manifest: $member"
+  [[ -z $expected_bytes || $result_bytes == "$expected_bytes" ]] ||
+    fail "Quiesced retained frame size does not match its authenticated API manifest: $member"
+  printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
+}
+copy_quiesced_confirmation_member() {
+  local member=$1 destination=$2 image=$3 byte_limit=$4 actual_bytes
+  [[ -n $image && $byte_limit =~ ^[1-9][0-9]*$ && $byte_limit -le 1048576 ]] ||
+    fail 'Quiesced daily-journal confirmation copy has invalid bounds.'
+  [[ $member =~ ^files/[.]dailyfile-journal/backup-confirmations/([.]sets/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}|[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2})[.]json$ ]] ||
+    fail 'Quiesced daily-journal confirmation member has an unsafe path.'
+  docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+    --volume oscar_oscar_state:/state:ro "$image" -eu -c '
+      member=$1
+      limit=$2
+      path=/state/$member
+      current=/state
+      old_ifs=$IFS
+      IFS=/
+      set -- $member
+      IFS=$old_ifs
+      for component do
+        [ -n "$component" ] && [ "$component" != . ] && [ "$component" != .. ]
+        current=$current/$component
+        [ ! -L "$current" ]
+      done
+      [ -f "$path" ]
+      size=$(stat -c %s -- "$path")
+      [ "$size" -gt 0 ] && [ "$size" -le "$limit" ]
+      cat -- "$path"
+    ' live-journal-confirmation "$member" "$byte_limit" >"$destination" ||
+    fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+  [[ -f $destination && ! -L $destination ]] ||
+    fail 'Quiesced daily-journal confirmation copy is not a regular file.'
+  actual_bytes=$(file_size "$destination")
+  [[ $actual_bytes =~ ^[1-9][0-9]*$ && $actual_bytes -le $byte_limit ]] ||
+    fail 'Quiesced daily-journal confirmation copy violated its byte bound.'
 }
 verify_retained_backup_members() {
   local archive=$1 inventory=$2 work=$3 listing member_file line kind member expected_sha expected_bytes
@@ -961,14 +1076,18 @@ case $action in
     ledger_json=$(compose exec -T oscar sh -eu -c '
       ledger=/var/lib/oscar/files/videos/$1
       if test ! -f "$ledger" || test -L "$ledger"; then
-        printf "{\\"exists\\":false}\\n"
+        printf "MISSING\\n"
         exit 0
       fi
-      compact=$(tr -d "\\r\\n" <"$ledger")
-      case $compact in \{*\}) ;; *) exit 2 ;; esac
-      printf "{\\"exists\\":true,\\"ledger\\":%s}\\n" "$compact"
+      cat -- "$ledger"
     ' alarm-media-ledger "$ledger_key")
-    printf '%s\n' "$ledger_json"
+    if [[ $ledger_json == MISSING ]]; then
+      printf '{"exists":false}\n'
+    else
+      compact=$(printf '%s' "$ledger_json" | tr -d '\r\n')
+      case $compact in \{*\}) ;; *) fail 'Alarm-media ledger is not a JSON object.' ;; esac
+      printf '{"exists":true,"ledger":%s}\n' "$compact"
+    fi
     ;;
   alarm-media-forensics)
     run=${1:-}; shift || true
@@ -1466,6 +1585,10 @@ case $action in
     media_metadata_health_json
     ;;
 
+  retention-runtime-health)
+    retention_runtime_health_json
+    ;;
+
   snapshot)
     archive_dir=$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ./data/archive)")
     backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ./backups)")
@@ -1688,7 +1811,11 @@ case $action in
     manifest_listing=$(compose exec -T oscar find /var/lib/oscar/files/dailyfiles \
       -mindepth 1 -maxdepth 1 -type f -name '*.manifest.v1.json' -print | LC_ALL=C sort)
     validated=0; failures=0
-    while IFS= read -r manifest; do
+    # Materialize the bounded listing before validation. docker compose exec
+    # commands inside the loop may read stdin even with -T; a read-driven loop
+    # would therefore lose every path after the first validation.
+    mapfile -t manifest_paths <<<"$manifest_listing"
+    for manifest in "${manifest_paths[@]}"; do
       [[ -n $manifest ]] || continue
       if [[ ! $manifest =~ ^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}\.csv\.manifest\.v1\.json$ ]]; then
         failures=$((failures+1)); continue
@@ -1751,7 +1878,7 @@ case $action in
             (value->>'windowEndExclusive')::timestamptz
         FROM doc;")
       if [[ $manifest_valid == t ]]; then validated=$((validated+1)); else failures=$((failures+1)); fi
-    done <<<"$manifest_listing"
+    done
     printf '{"publications":%s,"manifests":%s,"validatedManifests":%s,"manifestFailures":%s,"partialFiles":%s,"unsafeLinks":%s,"unsafeEntries":%s,"bounded":true,"inventoryEntries":%s,"zoneId":"%s","currentDate":"%s","eligiblePriorDayDirectories":%s,"currentDayDirectories":%s,"currentDayOpenSegments":%s,"currentDaySealedSegments":%s,"currentDayBytes":%s,"journalIntegrityFailures":%s,"openSegments":%s,"sealedSegments":%s}\n' \
       "$publications" "$manifests" "$validated" "$failures" "$partial" "$unsafe_links" "$unsafe_entries" \
       "$inventory_entries" "$journal_zone" "$journal_today" "$eligible_prior_days" \
@@ -1861,11 +1988,14 @@ case $action in
       [[ $state == *healthy* ]] && { healthy=true; break; }
       sleep 2
     done
-    segments_preserved=0; segment_failures=0
-    while IFS='|' read -r relative before_bytes before_sha extra; do
+    segments_preserved=0; segment_failures=0; segments_verified=0
+    mapfile -t before_rows <"$before_inventory"
+    for before_row in "${before_rows[@]}"; do
+      IFS='|' read -r relative before_bytes before_sha extra <<<"$before_row"
       [[ -z ${extra:-} && $relative =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}\.(open|seg)$ &&
          $before_bytes =~ ^[1-9][0-9]*$ && $before_sha =~ ^[0-9a-f]{64}$ ]] ||
         fail 'Pre-restart segment inventory is malformed.'
+      segments_verified=$((segments_verified+1))
       lane_root="/var/lib/oscar/files/.dailyfile-journal/segments/$directory_id"
       preserved=false
       if [[ $relative == *.seg ]]; then
@@ -1898,15 +2028,27 @@ case $action in
       fi
       if $preserved; then segments_preserved=$((segments_preserved+1));
       else segment_failures=$((segment_failures+1)); fi
-    done <"$before_inventory"
-    partial=$(compose exec -T oscar sh -c 'find /var/lib/oscar/files -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) 2>/dev/null | wc -l')
+    done
+    [[ $segments_verified == "$segments_before" ]] ||
+      fail 'Restart verification did not inspect every captured journal segment.'
+    # Hidden camera partials created after the restart are legitimate active recordings on a
+    # live multi-lane site.  Count only pre-restart partials that survived the supported restart,
+    # plus every temporary publication artifact (which is never a live camera output).
+    partial=$(compose exec -T oscar sh -eu -c '
+      root=/var/lib/oscar/files; cutoff=$1
+      {
+        find "$root" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" \) \
+          ! -newermt "$cutoff" -print
+        find "$root" -type f \( -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print
+      } 2>/dev/null | wc -l
+    ' journal-restart-partials "$restart_started")
     restart_service_log=$restart_work/restart-services.log
     if ! compose logs --since "$restart_started" oscar postgres >"$restart_service_log" 2>&1; then
       emit_command_diagnostics 'Supported restart service-log collection' "$restart_service_log"
       fail 'Could not collect the exact supported-restart service log window.'
     fi
     recovery_errors=$(grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' "$restart_service_log" || true)
-    shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)|FATAL:.*terminating connection due to administrator command' "$restart_service_log" || true)
+    shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)' "$restart_service_log" || true)
     camera_recording_errors=$(grep -Eic 'Timed out waiting for camera .* command; quarantining its queue|Camera .* command queue is quarantined|Timed out waiting for video files for occupancy generation|returned a stale or mismatched saved-video result for occupancy generation|Camera .* failed to close occupancy generation|Failed to finish matched camera recording generation' "$restart_service_log" || true)
     printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s}\n' \
       "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors"
@@ -2331,11 +2473,27 @@ case $action in
     (($# > 0 && $# <= 8)) ||
       fail 'Backup certification requires one to eight exact retained-media set expectations.'
     backup_work=$(mktemp -d /tmp/oscar-regression-backup-check.XXXXXXXX)
-    cleanup_backup_check() { rm -rf -- "$backup_work"; }
+    backup_services_quiesced=false
+    cleanup_backup_check() {
+      local status=$? recovery_log=$backup_work/service-recovery.log had_errexit=false
+      [[ $- == *e* ]] && had_errexit=true
+      trap - EXIT
+      set +e
+      if $backup_services_quiesced; then
+        if ! sudo bash oscar.sh start >"$recovery_log" 2>&1; then
+          emit_command_diagnostics 'OSCAR backup-check service recovery' "$recovery_log"
+          status=1
+        fi
+      fi
+      rm -rf -- "$backup_work"
+      $had_errexit && set -e
+      return "$status"
+    }
     trap cleanup_backup_check EXIT
     expected_inventory=$backup_work/expected-retained-members.txt
     : >"$expected_inventory"
     expected_sets=0
+    retained_records=("$@")
     for retained_record in "$@"; do
       IFS='.' read -r event_token lane_token camera_token \
         frame_1_sha frame_1_bytes frame_2_sha frame_2_bytes frame_3_sha frame_3_bytes \
@@ -2344,20 +2502,46 @@ case $action in
         valid_media_token "$camera_token" || fail 'Retained-media backup expectation has an invalid identity.'
       frame_shas=("$frame_1_sha" "$frame_2_sha" "$frame_3_sha" "$frame_4_sha" "$frame_5_sha")
       frame_bytes=("$frame_1_bytes" "$frame_2_bytes" "$frame_3_bytes" "$frame_4_bytes" "$frame_5_bytes")
-      base="files/videos/retained-media/v1/events/$event_token/lanes/$lane_token/cameras/$camera_token"
-      append_live_backup_member "$expected_inventory" M "$base/manifest.json"
       for frame_index in 0 1 2 3 4; do
         [[ ${frame_shas[$frame_index]} =~ ^[0-9a-f]{64}$ &&
            ${frame_bytes[$frame_index]} =~ ^[1-9][0-9]*$ ]] ||
           fail 'Retained-media backup expectation has an invalid frame hash or size.'
-        frame_name=$(printf 'frame-%02d.jpg' "$((frame_index+1))")
-        append_live_backup_member "$expected_inventory" J "$base/$frame_name" \
-          "${frame_shas[$frame_index]}" "${frame_bytes[$frame_index]}"
       done
       expected_sets=$((expected_sets+1))
     done
-    metadata_paths=$(compose exec -T oscar sh -eu -c '
-      root=/var/lib/oscar/files/videos/retained-media/v1
+    app_image=''
+    while IFS= read -r candidate_image; do
+      case $candidate_image in
+        oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
+      esac
+    done < <(compose config --images)
+    [[ -n $app_image ]] ||
+      fail 'Could not resolve the OSCAR application image for quiesced backup inventory.'
+    for service in gateway oscar postgres; do
+      compose ps --status running --services | grep -Fxq "$service" ||
+        fail "Backup certification requires the running $service service."
+    done
+    backup_services_quiesced=true
+    compose stop gateway >/dev/null
+    compose stop oscar >/dev/null
+    for retained_record in "${retained_records[@]}"; do
+      IFS='.' read -r event_token lane_token camera_token \
+        frame_1_sha frame_1_bytes frame_2_sha frame_2_bytes frame_3_sha frame_3_bytes \
+        frame_4_sha frame_4_bytes frame_5_sha frame_5_bytes extra <<<"$retained_record"
+      frame_shas=("$frame_1_sha" "$frame_2_sha" "$frame_3_sha" "$frame_4_sha" "$frame_5_sha")
+      frame_bytes=("$frame_1_bytes" "$frame_2_bytes" "$frame_3_bytes" "$frame_4_bytes" "$frame_5_bytes")
+      base="files/videos/retained-media/v1/events/$event_token/lanes/$lane_token/cameras/$camera_token"
+      append_quiesced_backup_member "$expected_inventory" M "$base/manifest.json" "$app_image"
+      for frame_index in 0 1 2 3 4; do
+        frame_name=$(printf 'frame-%02d.jpg' "$((frame_index+1))")
+        append_quiesced_backup_member "$expected_inventory" J "$base/$frame_name" "$app_image" \
+          "${frame_shas[$frame_index]}" "${frame_bytes[$frame_index]}"
+      done
+    done
+    metadata_paths=$(docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+      --volume oscar_oscar_state:/state:ro "$app_image" -eu -c '
+      root=/state/files/videos/retained-media/v1
       checkpoint=$root/.metadata-reclamation-checkpoint.json
       [ -f "$checkpoint" ] && [ ! -L "$checkpoint" ]
       printf "%s\\n" "$checkpoint"
@@ -2369,33 +2553,36 @@ case $action in
     processed_expected=0
     deletion_expected=0
     while IFS= read -r metadata_path; do
-      [[ -n $metadata_path && $metadata_path == /var/lib/oscar/files/videos/retained-media/v1/* ]] ||
+      [[ -n $metadata_path && $metadata_path == /state/files/videos/retained-media/v1/* ]] ||
         fail 'Retained-media metadata inventory escaped its expected root.'
-      metadata_member=${metadata_path#/var/lib/oscar/}
+      metadata_member=${metadata_path#/state/}
       case $metadata_member in
         files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json)
-          append_live_backup_member "$expected_inventory" C "$metadata_member"
+          append_quiesced_backup_member "$expected_inventory" C "$metadata_member" "$app_image"
           ;;
         files/videos/retained-media/v1/retention-processed-index/*.idx)
           [[ ${metadata_member##*/} =~ ^[0-9]{19}-(0[0-9]|1[01])[.]idx$ ]] ||
             fail 'Retained-media processed index has a noncanonical name.'
-          append_live_backup_member "$expected_inventory" P "$metadata_member"
+          append_quiesced_backup_member "$expected_inventory" P "$metadata_member" "$app_image"
           processed_expected=$((processed_expected+1))
           ;;
         files/videos/retained-media/v1/deletion-index/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f][0-9a-f].idx)
-          append_live_backup_member "$expected_inventory" D "$metadata_member"
+          append_quiesced_backup_member "$expected_inventory" D "$metadata_member" "$app_image"
           deletion_expected=$((deletion_expected+1))
           ;;
         *) fail 'Retained-media metadata inventory contains an unexpected path.' ;;
       esac
     done <<<"$metadata_paths"
-    ((processed_expected > 0)) || fail 'Backup certification requires at least one processed-observation index.'
     expected_member_count=$(wc -l <"$expected_inventory" | tr -d '[:space:]')
     [[ $expected_member_count == $((expected_sets * 6 + 1 + processed_expected + deletion_expected)) ]] ||
       fail 'Retained backup expectation inventory has an inconsistent exact member count.'
     output=$(sudo bash oscar.sh backup)
     backup=$(printf '%s' "$output" | sed -n 's#^Backup created: .*/##p' | tail -n1)
     [[ $backup =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]] || fail 'Backup command did not return a backup ID.'
+    journal_confirmed_count=$(printf '%s\n' "$output" | sed -n \
+      "s#^Confirmed \([0-9][0-9]*\) daily-file lane/day publication(s) from verified backup $backup\$#\1#p")
+    [[ $journal_confirmed_count =~ ^[0-9]+$ && $journal_confirmed_count -le 100000 ]] ||
+      fail 'Backup command did not report one bounded daily-journal confirmation outcome.'
     backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ./backups)")
     retention=$(env_value OSCAR_BACKUP_RETENTION_COUNT 14)
     verified=$(find "$backup_dir" -mindepth 2 -maxdepth 2 -type f -name VERIFIED | wc -l)
@@ -2407,12 +2594,6 @@ case $action in
     [[ -f $root/archive-generation-ids.txt && ! -L $root/archive-generation-ids.txt ]] ||
       fail 'Archive-generation inventory is missing, linked, or non-regular.'
     backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
-    app_image=''
-    while IFS= read -r candidate_image; do
-      case $candidate_image in
-        oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
-      esac
-    done < <(compose config --images)
     [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file ]] ||
       fail 'Cannot independently authenticate the backup core.'
     [[ $(verify_backup_core_authentication "$root" "$backup_key_file" "$app_image") == verified ]] ||
@@ -2513,20 +2694,10 @@ case $action in
     receipt_count=0; invalid_receipts=0; receipt_segments_verified=0
     receipt_root=files/.dailyfile-journal/backup-confirmations
     confirmation_set_member="$receipt_root/.sets/$backup.json"
-    confirmation_set_lookup=$(awk -v expected="$confirmation_set_member" '
-      { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
-        if (normalized==expected) { count++; raw=$0 } }
-      END { printf "%d|%s", count+0, raw }
-    ' "$state_listing")
-    IFS='|' read -r confirmation_set_matches confirmation_set_raw <<<"$confirmation_set_lookup"
-    [[ $confirmation_set_matches == 1 && -n $confirmation_set_raw ]] ||
-      fail 'Authenticated state tar must contain exactly one current daily-journal confirmation set.'
-    confirmation_set_verbose=$(tar -tvzf "$root/oscar-state.tar.gz" -- "$confirmation_set_raw")
-    [[ $(printf '%s\n' "$confirmation_set_verbose" | wc -l | tr -d '[:space:]') == 1 &&
-       ${confirmation_set_verbose:0:1} == - ]] ||
-      fail 'Daily-journal confirmation set in authenticated state tar is not a regular file.'
-    confirmation_set_file=$backup_work/confirmation-set.json
-    tar -xOf "$root/oscar-state.tar.gz" -- "$confirmation_set_raw" >"$confirmation_set_file"
+    if ((journal_confirmed_count > 0)); then
+      confirmation_set_file=$backup_work/confirmation-set.json
+      copy_quiesced_confirmation_member "$confirmation_set_member" "$confirmation_set_file" \
+        "$app_image" 786432
     set_bytes=$(file_size "$confirmation_set_file")
     [[ $set_bytes =~ ^[1-9][0-9]*$ && $set_bytes -le 786432 ]] ||
       fail 'Daily-journal confirmation-set marker exceeds its 768 KiB decoded safety bound.'
@@ -2571,20 +2742,8 @@ case $action in
         fail 'Authenticated daily-journal receipt identity is outside the exact receipt layout.'
       receipt_day=${receipt_relative##*/}; receipt_day=${receipt_day%.json}
       receipt_member="$receipt_root/$receipt_relative"
-      receipt_lookup=$(awk -v expected="$receipt_member" '
-        { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
-          if (normalized==expected) { count++; raw=$0 } }
-        END { printf "%d|%s", count+0, raw }
-      ' "$state_listing")
-      IFS='|' read -r receipt_matches receipt_raw <<<"$receipt_lookup"
-      [[ $receipt_matches == 1 && -n $receipt_raw ]] || {
-        invalid_receipts=$((invalid_receipts+1)); continue; }
-      receipt_verbose=$(tar -tvzf "$root/oscar-state.tar.gz" -- "$receipt_raw")
-      [[ $(printf '%s\n' "$receipt_verbose" | wc -l | tr -d '[:space:]') == 1 &&
-         ${receipt_verbose:0:1} == - ]] || {
-        invalid_receipts=$((invalid_receipts+1)); continue; }
       receipt_file=$backup_work/receipt-$receipt_count.json
-      tar -xOf "$root/oscar-state.tar.gz" -- "$receipt_raw" >"$receipt_file"
+      copy_quiesced_confirmation_member "$receipt_member" "$receipt_file" "$app_image" 786432
       receipt_bytes=$(file_size "$receipt_file")
       [[ $receipt_bytes =~ ^[1-9][0-9]*$ && $receipt_bytes -le 786432 &&
          $(sha256_file "$receipt_file") == "$receipt_expected_sha" ]] || {
@@ -2670,9 +2829,19 @@ case $action in
     set_count=$(scalar "WITH doc AS (
         SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
       SELECT (value->>'receiptCount')::bigint FROM doc;")
-    [[ $set_count == "$receipt_count" ]] || invalid_receipts=$((invalid_receipts+1))
-    [[ $receipt_count =~ ^[0-9]+$ && $receipt_count -gt 0 && $invalid_receipts == 0 ]] ||
-      fail 'New backup did not produce valid, authenticated daily-journal receipts.'
+      [[ $set_count == "$receipt_count" ]] || invalid_receipts=$((invalid_receipts+1))
+      [[ $receipt_count =~ ^[1-9][0-9]*$ && $receipt_count == "$journal_confirmed_count" &&
+         $invalid_receipts == 0 ]] ||
+        fail 'New backup did not produce its exact valid daily-journal confirmation set.'
+    else
+      docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+        --volume oscar_oscar_state:/state:ro "$app_image" -eu -c '
+          path=/state/$1
+          [ ! -e "$path" ] && [ ! -L "$path" ]
+        ' empty-journal-confirmation "$confirmation_set_member" ||
+        fail 'Zero-candidate daily-journal confirmation unexpectedly published a set marker.'
+    fi
     duck_scratch_excluded=true
     grep -Eq '^([.]/)?duckdb-tmp(/|$)' "$state_listing" && duck_scratch_excluded=false
     retained_prefix=false
@@ -2690,8 +2859,8 @@ case $action in
       fail 'Backup did not preserve the complete exact retained-media expectation inventory.'
     cleanup_backup_check
     trap - EXIT
-    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
-      "$backup" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)" \
+    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"journalConfirmedPublications":%s,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
+      "$backup" "$journal_confirmed_count" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)" \
       "$duck_scratch_excluded" "$retained_prefix" "$checkpoint_included" "$processed_indexes" \
       "$deletion_indexes" "$retained_manifests" "$retained_jpegs" "$expected_sets" \
       "$expected_member_count" "$exact_retained_members" "$processed_expected" "$deletion_expected" "$member_count"
@@ -3139,9 +3308,9 @@ case $action in
     [[ $(scalar "SELECT coalesce((last_failed_time >= pg_postmaster_start_time())::text,'f') FROM pg_stat_archiver;") == f ]] &&
       archiver_failure_free=true
     recovery_settings_cleared=false
-    recovery_defaults=$(scalar "SELECT (current_setting('restore_command')='' AND current_setting('recovery_target')='' AND current_setting('recovery_target_timeline')='latest' AND current_setting('recovery_target_action')='pause')::text;")
+    recovery_defaults=$(scalar "SELECT CASE WHEN current_setting('restore_command')='' AND current_setting('recovery_target')='' AND current_setting('recovery_target_timeline')='latest' AND current_setting('recovery_target_action')='pause' THEN '1' ELSE '0' END;")
     recovery_pending=$(scalar "SELECT count(*) FROM pg_settings WHERE name IN ('restore_command','recovery_target','recovery_target_timeline','recovery_target_action') AND pending_restart;")
-    if [[ $recovery_defaults == t && $recovery_pending == 0 ]] &&
+    if [[ $recovery_defaults == 1 && $recovery_pending == 0 ]] &&
        compose exec -T postgres sh -eu -c '
          test -f "$PGDATA/postgresql.auto.conf" && test ! -L "$PGDATA/postgresql.auto.conf"
          ! grep -Eq "^[[:space:]]*(restore_command|recovery_target(_[a-z_]+)?|primary_conninfo|primary_slot_name|promote_trigger_file)[[:space:]]*=" "$PGDATA/postgresql.auto.conf"

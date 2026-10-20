@@ -86,6 +86,13 @@ encoded values such as `0i4d0ko` are valid. Do not translate one into a syntheti
 RFC 4122 UUID. The suite requires the configured string to match the observation,
 retained-media response, manifest, asset paths, and Viewer result exactly.
 
+For a fresh disposable full run, leave `STORAGE_RETAINED_EVENT_ID` and
+`STORAGE_LEGACY_EVENT_ID` empty so the suite self-seeds current evidence. An ID
+left over from a previous database is not reusable: if its observation API
+lookup returns 404, clear it or replace it with an event that exists in the
+current deployment. Never weaken the retained-media oracle to accept a stale
+identifier.
+
 ## Daily-file publication is empty on a fresh same-day install
 
 Read the `daily-file` result's `zoneId`, `currentDate`, and
@@ -128,6 +135,16 @@ have `timeToRetention=0`, `videoQueryPeriod=1`,
 Lifecycle preflight reports the observed `videoRetention` object and refuses the
 test before polling if any value differs. Seven days is the correct production
 default, but cannot retain a freshly generated alarm during this run.
+
+Also inspect the `verify accelerated retained-media worker is active` row. A
+correct saved form with a stale scan cursor means OSCAR started before that form
+was applied: perform a supported restart. A cursor many hours or days behind is
+bounded catch-up from an earlier seven-day runtime profile. On an otherwise empty,
+fresh disposable target, recreate the disposable database and application state,
+save the accelerated profile before provisioning lanes, restart, and verify the
+cursor before allowing emulator traffic. Do not delete or fast-forward retention
+scan/reconciliation checkpoints; doing so can force a safety-first scan from an
+old datastore range instead of proving that the intended runtime profile is active.
 
 For a manifest/ledger failure, use the exact event and camera UIDs in the result.
 Confirm `manifest.source.objectKey` equals the earlier observation path and

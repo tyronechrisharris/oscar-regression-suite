@@ -158,6 +158,15 @@ other `videoRetentionConfig` fields. Full-profile preflight reads the persisted 
 config and requires all seven values before retained-media polling or cold-fixture
 creation, so a normal seven-day deployment fails early instead of timing out.
 Do not change the packaged default; use `timeToRetention=7` in production.
+Saving the form does not reconfigure an already running retained-media worker.
+On a newly initialized disposable site, save this profile and use the supported
+OSCAR restart before importing lanes or permitting emulator traffic. Require
+`retention-runtime-health` to observe a valid schema-1 durable scan checkpoint
+within 180 seconds of the zero-day eligible cutoff, then provision the lane fixture
+and perform its supported restart. If setup occurred in the wrong order, recreate
+the disposable database and application state or allow bounded oldest-first
+catch-up. Scan and reconciliation checkpoints are durable history and must never
+be deleted or fast-forwarded.
 The platform preflight also requires the archive purge helper to read from
 `/dev/null`; this proves that a helper invoked inside the work-list loop cannot
 consume subsequent rows and leave a multi-object purge plan partially applied.
@@ -194,6 +203,17 @@ after release the same DELETE must succeed and GET must return 404. The CLI is
 never allowed to create `LEGACY_UNKNOWN`. Schema v5 retains that fourth value
 only for observation holds migrated from pre-v5 catalogs; migrated generation
 holds must be normalized to `GENERATION_EXACT`.
+
+Portable export uses the supported coordinated storage command and therefore
+briefly stops and restarts OSCAR to freeze a consistent copy. The confirmed
+tokenized purge follows the same consistency boundary. The suite records every
+raw resource sample but labels only these exact windows
+`storage-lifecycle-export-disruption` and
+`storage-lifecycle-purge-disruption`; they are excluded from steady-state
+service-availability assertions only in `full` and `3.9.2-release`. Healthy
+post-export/post-purge samples, immutable image identity, and zero OOM kills
+remain mandatory. Compose one-off command containers are not OSCAR services and
+are excluded from service inventory and resource aggregates.
 
 This live lifecycle runs the required accelerated archive-enabled profile. It
 does not rewrite/restart the target into an archive-disabled profile merely to
@@ -247,7 +267,11 @@ that lane's direct
 `{lane-directory}/{configured-zone-date}/{six-digit}.open|seg` bytes to
 advance. Those bytes and safe layout
 must survive the supported whole-deployment launcher restart. That restart also
-requires PostgreSQL to remain available through OSCAR's bounded shutdown: the
+closes the current metrics sample before entering the restart-exempt phase, so
+an in-flight pre-restart CPU interval cannot be mislabeled as steady-state
+load. It requires the retention worker to cancel and drain its scoped PostGIS
+query before OSCAR reports a successful bounded stop, and requires PostgreSQL
+to remain available through that shutdown: the
 post-start log window must contain no `BasicEventHandler`, transaction-handler,
 database-purger, module-timeout, PostgreSQL administrator-termination, camera
 command timeout/quarantine, recording-result timeout, queue rejection, or
@@ -256,6 +280,13 @@ before its back-to-back one-second gamma/neutron occupancies and applies the
 same camera-recording gate after both generation-qualified MP4s have loaded.
 This is evidence of direct live journal capture,
 not a renamed or fabricated publication.
+
+A `.partial` journal path may exist momentarily while an atomic rotation is in
+progress. `storage-health` polls for a clean atomic boundary for up to 30
+seconds; a partial that persists beyond that window, or any unsafe entry, still
+fails the release gate. The restart proof inventories all captured segments
+before shutdown and requires every one—not merely the first stdin row—to retain
+its exact prefix afterward.
 
 The smoke check requires either eligible published CSV/manifest pairs or the
 strict durable-current-day state described above, and no partial artifacts;
@@ -320,7 +351,10 @@ duration and dimensions.
 After the accelerated cycle, each exact event UUID must return one retained
 manifest per source camera. Its `source.objectKey` must equal the already
 validated observation path, and its five quality-85 JPEGs must still pass size,
-hash, baseline-structure, dimension, and Chromium decode checks. The exact
+hash, baseline-structure, dimension, and Chromium decode checks. The manifest's
+`laneUid` must be the authoritative parent system UID in
+`urn:osh:system:lane:*` form; an RPM child UID or an unresolved placeholder is
+never accepted as a lane identity. The exact
 event/lane/camera `.job.json` ledger must be `PUBLISHED` or `SOURCE_DELETED`,
 have `attempts=1`, and have no failure. Finally, the probe derives only the
 authoritative camera tokens from this run's paths and compares those directories
@@ -348,7 +382,12 @@ and five-JPEG population mandatory. These counts and bytes are written to
 
 ## Backup and performance
 
-The backup check creates a coordinated backup and then invokes the supported
+After the supported deployment restart, the suite first crosses one complete
+configured media-retention query interval plus 15 seconds, then waits for a
+nonempty processed-index inventory and three consecutive stable file-count
+snapshots. This prevents a backup from racing startup reclamation and the first
+durable-index reconstruction scan.
+The backup check then creates a coordinated backup and invokes the supported
 `backup-verify` command again. Independently, it recomputes `SHA256SUMS.hmac`
 with the configured backup key, verifies every listed checksum, and rejects
 unlisted, duplicate, linked, or special payloads. It requires regular, non-symlink `VERIFIED`,

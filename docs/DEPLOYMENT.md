@@ -36,6 +36,24 @@ Provision every canonical 50-lane regression build with
 same tracked file so the UI assertions are derived from the deployed source of
 truth rather than duplicated expectations.
 
+When provisioning through SensorHub Admin, a successful upload is only the
+in-memory step. Select **Apply Changes**, select the header's global **Save**,
+confirm **Yes** in the separate dialog, and require the **SensorHub Configuration
+Saved** notification. Perform one supported OSCAR restart and require all 50
+Lane, RPM, and camera modules to return before starting regression. Clicking
+Save without confirming Yes must fail provisioning.
+
+The retained-media worker reads its profile at OSCAR startup. On a newly initialized
+disposable 3.9.2 target, save the accelerated profile and perform a supported restart
+before importing the lane fixture or permitting emulator traffic. Require
+`retention-runtime-health` to report a valid schema-1 scan checkpoint no more than
+180 seconds behind the zero-day eligible cutoff, then import and persist the lanes
+and perform the fixture restart. A cursor created while the seven-day default was
+active catches up monotonically and must not be mistaken for an active accelerated
+profile. Never delete or fast-forward scan or reconciliation checkpoints. If setup
+was performed in the wrong order, recreate the disposable database and application
+state or allow oldest-first catch-up.
+
 ## Strict SSH for performance and storage validation
 
 The 3.9.2 target-side storage helper is a Linux Bash/Docker probe. Native

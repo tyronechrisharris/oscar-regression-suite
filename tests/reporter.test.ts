@@ -275,7 +275,7 @@ test("restore metrics retain the exact disruption while requiring healthy pre/po
   const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
   const performance = readFileSync(join(result.outputDir, "performance.csv"), "utf8");
   assert.doesNotMatch(functional, /,incorrect,/);
-  assert.match(functional, /retain exact expected restore-disruption metrics/);
+  assert.match(functional, /retain exact expected service-disruption metrics/);
   assert.match(functional, /3 raw samples retained for storage-restore-drill-disruption/);
   assert.match(performance, /storage-restore-drill-disruption/);
   assert.match(performance, /exited/);
@@ -316,13 +316,13 @@ test("restore disruption exemption does not hide OOM or a steady-state outage", 
   assert.match(functional, /not healthy: restore-after\/postgres/);
 });
 
-test("restore disruption exemption rejects any profile or phase outside the exact contract", () => {
+test("service disruption exemption rejects any profile or phase outside the exact contract", () => {
   for (const profile of ["smoke", "full"] as const) {
     const root = mkdtempSync(join(tmpdir(), `oscar-regression-${profile}-disruption-misuse-`));
     const reporter = new RunReporter(`disruption-${profile}`, root, [], {...metadata, profile});
     assert.throws(
       () => reporter.expectRemoteMetricDisruptionPhase("storage-restore-drill-disruption"),
-      /restricted to the exact restore-drill disruption phase/,
+      /restricted to exact supported disruption phases/,
     );
   }
   const root = mkdtempSync(join(tmpdir(), "oscar-regression-restore-disruption-misuse-"));
@@ -332,8 +332,57 @@ test("restore disruption exemption rejects any profile or phase outside the exac
   });
   assert.throws(
     () => reporter.expectRemoteMetricDisruptionPhase("restore-disruption"),
-    /restricted to the exact restore-drill disruption phase/,
+    /restricted to exact supported disruption phases/,
   );
+});
+
+test("full lifecycle permits only its exact export, purge, restart, and backup disruption phases", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-lifecycle-disruption-contract-"));
+  const reporter = new RunReporter("lifecycle-disruption-contract", root, [], {
+    ...metadata,
+    profile: "full",
+  });
+  for (const phase of [
+    "storage-lifecycle-export-disruption",
+    "storage-lifecycle-purge-disruption",
+    "storage-lifecycle-restart-disruption",
+    "storage-lifecycle-backup-disruption",
+  ]) assert.doesNotThrow(() => reporter.expectRemoteMetricDisruptionPhase(phase));
+  assert.throws(
+    () => reporter.expectRemoteMetricDisruptionPhase("storage-lifecycle-other-disruption"),
+    /restricted to exact supported disruption phases/,
+  );
+});
+
+test("full lifecycle restart metrics retain disruption while enforcing surrounding health", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-regression-lifecycle-restart-metrics-"));
+  const reporter = new RunReporter("lifecycle-restart-metrics", root, [], {
+    ...metadata,
+    profile: "full",
+    remoteMetricsExpected: true,
+  });
+  const disruption = "storage-lifecycle-restart-disruption";
+  for (const phase of ["storage-lifecycle", disruption, "storage-lifecycle-post-restart"])
+    reporter.requireRemoteMetricPhase(phase);
+  reporter.expectRemoteMetricDisruptionPhase(disruption);
+  for (const service of ["gateway", "oscar", "postgres"] as const) {
+    reporter.metric(containerMetric("storage-lifecycle", service));
+    reporter.metric(containerMetric(disruption, service, {
+      containerState: "exited", containerHealth: "unhealthy", containerStatsAvailable: false,
+      cpuPercent: null, memoryUsedBytes: null, memoryLimitBytes: null, memoryPercent: null, pids: null,
+    }));
+    reporter.metric(containerMetric("storage-lifecycle-post-restart", service));
+  }
+  reporter.metric(hostMetric(disruption));
+  reporter.outcome("storage-lifecycle", "daily-file", "supported restart", "fixture",
+    "recovers", "recovered", "correct", 1);
+
+  const result = reporter.finalize(new Date());
+  assert.equal(result.exitCode, 0);
+  const functional = readFileSync(join(result.outputDir, "functional-results.csv"), "utf8");
+  assert.match(functional, /retain exact expected service-disruption metrics/);
+  assert.match(functional, /storage-lifecycle-restart-disruption/);
+  assert.doesNotMatch(functional, /,incorrect,/);
 });
 
 test("synthetic restore-disruption service rows do not replace a successful host sample", () => {

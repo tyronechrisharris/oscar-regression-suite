@@ -576,6 +576,15 @@ export interface ArchiveScratchProbe {
   entryCount: number;
 }
 
+export interface RetentionRuntimeHealthProbe {
+  checkpointPresent: boolean;
+  checkpointValid: boolean;
+  checkpointSchemaVersion: number | null;
+  processedThrough: string | null;
+  updatedAt: string | null;
+  cursorLagSeconds: number | null;
+}
+
 export interface MediaMetadataHealthProbe {
   rootPresent: boolean;
   checkpointPresent: boolean;
@@ -912,6 +921,33 @@ export function assessArchiveScratch(value: unknown): ArchiveScratchProbe {
     archiveDisjoint: scratch.archiveDisjoint === true,
     entryCount: integer(scratch.entryCount, "archiveScratch.entryCount"),
   };
+}
+
+export function assessRetentionRuntimeHealth(value: unknown): RetentionRuntimeHealthProbe {
+  const probe = object(value, "retention runtime health probe");
+  const parsedInstant = (candidate: unknown, field: string): string | null => {
+    if (candidate === null || candidate === undefined) return null;
+    return instant(candidate, field);
+  };
+  return {
+    checkpointPresent: probe.checkpointPresent === true,
+    checkpointValid: probe.checkpointValid === true,
+    checkpointSchemaVersion: nullableNumber(probe.checkpointSchemaVersion),
+    processedThrough: parsedInstant(probe.processedThrough, "processedThrough"),
+    updatedAt: parsedInstant(probe.updatedAt, "updatedAt"),
+    cursorLagSeconds: nullableNumber(probe.cursorLagSeconds),
+  };
+}
+
+export function retentionRuntimeReady(
+  value: RetentionRuntimeHealthProbe,
+  maximumCursorLagSeconds: number,
+): boolean {
+  return value.checkpointPresent && value.checkpointValid &&
+    value.checkpointSchemaVersion === 1 && value.processedThrough !== null &&
+    value.updatedAt !== null && Number.isFinite(value.cursorLagSeconds) &&
+    (value.cursorLagSeconds as number) >= 0 &&
+    (value.cursorLagSeconds as number) <= maximumCursorLagSeconds;
 }
 
 export function archiveScratchIsSafe(value: ArchiveScratchProbe, requirePresent: boolean): boolean {

@@ -128,6 +128,10 @@ An unfiltered full run must generate and validate at least one exact set; a
 lifecycle-only selection must configure `STORAGE_RETAINED_EVENT_ID` and pass
 the same API, five-JPEG identity/hash/type/structure, Chromium decode, and
 gallery proof before any lifecycle mutation.
+For a fresh unfiltered full run, clear stale `STORAGE_RETAINED_EVENT_ID` and
+`STORAGE_LEGACY_EVENT_ID` values so current alarms self-seed the proof. A
+configured retained ID must exist in the current deployment; a 404 is not a
+permitted compatibility fallback.
 Before mutation, require the running OSCAR service's persisted
 `videoRetentionConfig` to contain exactly the regression-only acceleration
 values `timeToRetention=0`, `videoQueryPeriod=1`,
@@ -138,6 +142,15 @@ suite (`intervalMinutes=1`, `rollbackGraceDays=1`,
 `deleteHotAfterArchive=true`). Do not edit the packaged defaults to satisfy this
 gate: production media aging remains seven days and the production archive
 policy remains conservative.
+The retained-media worker reads this configuration at OSCAR startup. After
+saving the accelerated profile, use the supported OSCAR restart and require the
+`retention-runtime-health` preflight to report a valid schema-1 scan checkpoint
+no more than 180 seconds behind the zero-day eligible cutoff before triggering
+alarms. A much older cursor is bounded catch-up from a previous runtime profile,
+not proof that acceleration is active. Only on a completely fresh disposable
+site with no recordings or retained-media jobs may preparation stop OSCAR,
+remove the new retention scan/reconciliation checkpoints, and restart. Never
+reset or fast-forward these durable checkpoints on production.
 Require exact storage schema v5 checksum
 `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`
 before lifecycle mutation and before/after restore. Require DuckDB's exact 256
@@ -151,6 +164,16 @@ also report zero database/module shutdown errors so a concurrent PostgreSQL stop
 cannot pass merely because services later become healthy, and zero camera
 recording timeout/quarantine/stale-generation errors so a healthy final container
 cannot hide a poisoned per-camera command queue.
+Allow the exact supported portable export, confirmed purge, and deployment
+restart to enter only their named `storage-lifecycle-*-disruption` metric
+phases. Retain all raw samples, exclude those exact windows only from
+steady-state service availability, and require healthy post-boundary samples,
+unchanged images, and zero OOM kills. Exclude Compose one-off command containers
+from the OSCAR service inventory. Poll briefly through an in-progress atomic
+journal rotation, but fail any persistent `.partial`; prove every captured
+journal segment survives restart. Before backup, cross one complete configured
+media-retention query interval plus 15 seconds and require a nonempty,
+three-snapshot-stable metadata inventory.
 
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode
@@ -310,9 +333,19 @@ and duplicate `view` parameters must each fail closed with zero health rows.
 
 CSV upload does not migrate matching `UniqueID` values. If a persistent target
 already has the 50 lanes, prove its live memberships match the fixture before
-testing. A successful upload alone is insufficient; use supported Admin edits
-and global save or explicitly reprovision a disposable site when migration is
-needed. Do not delete volumes or reinitialize a target as a shortcut.
+testing. A successful upload alone is insufficient; use supported Admin edits,
+select global Save, confirm **Yes** in its separate dialog, and require the
+**SensorHub Configuration Saved** notification. Then perform one supported
+restart and prove all expected Lane, RPM, and camera modules return. Merely
+opening the confirmation dialog is not a save. Explicitly reprovision a
+disposable site when migration is needed. Do not delete volumes or reinitialize
+a target as a shortcut.
+
+For every 50-lane restart acceptance, inspect the new OSCAR container's startup
+log window. Require zero `ERNIE_lane` `ReaderException`/`ClassNotFoundException`
+entries and zero `Error processing RPM message: GX` entries. Counting Started
+RPM modules alone is insufficient because the legacy ERNIE constructor can
+otherwise fail internally while its enclosing RPM module still starts.
 
 ## Interruption and recovery
 

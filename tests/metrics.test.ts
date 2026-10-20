@@ -76,6 +76,7 @@ test("remote command scopes all-state discovery to the exact OSCAR Compose servi
   assert.match(command, /docker ps --all --quiet --no-trunc/);
   assert.match(command, /label=com\.docker\.compose\.project=oscar/);
   assert.match(command, /label=com\.docker\.compose\.service=\$service/);
+  assert.match(command, /label=com\.docker\.compose\.oneoff=False/);
   assert.match(command, /for service in gateway oscar postgres/);
   assert.doesNotMatch(command, /docker stats --no-stream --format '\{\{json \.\}\}'\s*(?:\n|$)/);
   const syntax = spawnSync("sh", ["-n"], {input: command, encoding: "utf8"});
@@ -137,6 +138,7 @@ test("OSCAR snapshot parsing includes stopped and missing services while ignorin
   const gatewayId = "a".repeat(64);
   const oscarId = "b".repeat(64);
   const unrelatedId = "c".repeat(64);
+  const oneoffId = "e".repeat(64);
   const inspection = (
     id: string,
     name: string,
@@ -146,6 +148,7 @@ test("OSCAR snapshot parsing includes stopped and missing services while ignorin
     health: string,
     oomKilled: boolean,
     restartCount: number,
+    oneoff = "False",
   ) => JSON.stringify({
     Id: id,
     Name: `/${name}`,
@@ -153,6 +156,7 @@ test("OSCAR snapshot parsing includes stopped and missing services while ignorin
     Config: {Labels: {
       "com.docker.compose.project": project,
       "com.docker.compose.service": service,
+      "com.docker.compose.oneoff": oneoff,
     }},
     State: {Status: state, Running: state === "running", OOMKilled: oomKilled, Health: {Status: health}},
   });
@@ -161,6 +165,7 @@ test("OSCAR snapshot parsing includes stopped and missing services while ignorin
     inspection(gatewayId, "oscar-gateway-1", "oscar", "gateway", "running", "healthy", false, 0),
     inspection(oscarId, "oscar-oscar-1", "oscar", "oscar", "exited", "unhealthy", true, 2),
     inspection(unrelatedId, "other-gateway-1", "other", "gateway", "running", "healthy", false, 0),
+    inspection(oneoffId, "oscar-oscar-run-probe", "oscar", "oscar", "running", "healthy", false, 0, "True"),
     "__MISSING__\tpostgres",
     "__STATS__",
     JSON.stringify({
@@ -226,6 +231,7 @@ test("OSCAR snapshot parsing includes stopped and missing services while ignorin
     oomKilled: null,
   });
   assert.equal(snapshots.some((item) => item.containerId === unrelatedId), false);
+  assert.equal(snapshots.some((item) => item.containerId === oneoffId), false);
 });
 
 test("OSCAR snapshot parsing flags a running container whose stats disappear", () => {

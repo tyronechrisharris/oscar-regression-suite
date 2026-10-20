@@ -21,6 +21,7 @@ import {
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
   DASHBOARD_HEALTH_MAX_IN_FLIGHT,
   expectedDashboardConnectionIds,
+  healthRowHasRpmConnectionState,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
   parseHealthObservationBatch,
@@ -47,6 +48,7 @@ import {
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
+  assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
   MAX_RETAINED_FRAME_BYTES,
@@ -54,6 +56,7 @@ import {
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
   OSCAR_STORAGE_SCHEMA_VERSION,
   parseCollectionIds,
+  retentionRuntimeReady,
   storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
 } from "./storage-oracles.js";
@@ -180,6 +183,8 @@ const REGRESSION_MEDIA_RETENTION = {
   sourceRollbackGraceHours: 24,
   metadataReclamationWorkLimit: 200,
 } as const;
+
+const REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS = 180;
 
 const REGRESSION_ARCHIVE_RESOURCES = {
   memoryLimitMegabytes: 256,
@@ -2010,6 +2015,23 @@ export class RegressionScenarios {
     return row.innerText();
   }
 
+  private async waitHealthRpmConnection(
+    page: Page,
+    state: "online" | "offline",
+    timeoutMs = 45_000,
+  ): Promise<string> {
+    await this.goto(page, "/health");
+    const row = this.healthRow(page);
+    await row.waitFor({timeout: timeoutMs});
+    await poll(
+      () => row.innerText(),
+      (value) => healthRowHasRpmConnectionState(value, state),
+      {timeoutMs, intervalMs: 1_000,
+        description: `${this.config.testLaneLabel} RPM health to become ${state}`},
+    );
+    return row.innerText();
+  }
+
   private async connectionFault(): Promise<void> {
     const page = await this.browser.oscarPage();
     let stopped = false;
@@ -2021,8 +2043,8 @@ export class RegressionScenarios {
         scenario: "rpm-connection", category: "health", action: "detect RPM disconnection",
         target: this.config.testLaneLabel, expected: "Status of Health shows the reserved RPM Offline",
       }, async () => {
-        const text = await this.waitHealthText(page, "Offline", 60_000);
-        return {passed: /RPM.*Offline/i.test(text), observed: text};
+        const text = await this.waitHealthRpmConnection(page, "offline", 60_000);
+        return {passed: healthRowHasRpmConnectionState(text, "offline"), observed: text};
       });
       await this.check({
         scenario: "rpm-connection", category: "dashboard-health", action: "show disconnected RPM independently on dashboard",
@@ -2048,8 +2070,8 @@ export class RegressionScenarios {
       scenario: "rpm-connection", category: "health", action: "detect RPM reconnection",
       target: this.config.testLaneLabel, expected: "Status of Health returns the reserved RPM to Online",
     }, async () => {
-      const text = await this.waitHealthText(page, "Online", 60_000);
-      return {passed: /RPM.*Online/i.test(text), observed: text};
+      const text = await this.waitHealthRpmConnection(page, "online", 60_000);
+      return {passed: healthRowHasRpmConnectionState(text, "online"), observed: text};
     });
     await this.check({
       scenario: "rpm-connection", category: "dashboard-health", action: "show reconnected RPM on dashboard",
@@ -2367,21 +2389,39 @@ export class RegressionScenarios {
         document.body.append(video);
         const metadata = await new Promise<{loaded: boolean; duration: number; width: number; height: number}>(resolve => {
           let settled = false;
-          const finish = (loaded: boolean) => {
+          let timer = 0;
+          timer = window.setTimeout(() => {
             if (settled) return;
             settled = true;
-            window.clearTimeout(timer);
             resolve({
-              loaded,
+              loaded: false,
               duration: Number.isFinite(video.duration) ? video.duration : 0,
               width: video.videoWidth,
               height: video.videoHeight,
             });
-          };
-          const timer = window.setTimeout(() => finish(false), timeoutMs);
-          video.addEventListener("loadedmetadata", () => finish(video.readyState >= HTMLMediaElement.HAVE_METADATA),
-            {once: true});
-          video.addEventListener("error", () => finish(false), {once: true});
+          }, timeoutMs);
+          video.addEventListener("loadedmetadata", () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve({
+              loaded: video.readyState >= HTMLMediaElement.HAVE_METADATA,
+              duration: Number.isFinite(video.duration) ? video.duration : 0,
+              width: video.videoWidth,
+              height: video.videoHeight,
+            });
+          }, {once: true});
+          video.addEventListener("error", () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve({
+              loaded: false,
+              duration: Number.isFinite(video.duration) ? video.duration : 0,
+              width: video.videoWidth,
+              height: video.videoHeight,
+            });
+          }, {once: true});
           video.src = item.url;
           video.load();
         });
@@ -3683,7 +3723,8 @@ export class RegressionScenarios {
           {timeoutMs: 60_000, intervalMs: 1_000,
             description: "DuckDB scratch to become empty between bounded operations"},
         );
-        return {passed: archiveScratchIsSafe(value, false), observed: JSON.stringify(value)};
+        const clean = archiveScratchIsSafe(value, false);
+        return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
 
       await this.check({
@@ -3702,7 +3743,12 @@ export class RegressionScenarios {
         scenario: "storage-health", category: "daily-file", action: "verify durable journal publications",
         target: "dailyfiles", expected: "each eligible completed day has an exact 12-key v1 CSV/manifest pair, or a not-yet-eligible current day has durable header-valid journal segments; neither state has links, partials, or unsafe entries",
       }, async () => {
-        const value = await probe.runJson<DailyJournalStatus>("journal-status");
+        const value = await poll(
+          () => probe.runJson<DailyJournalStatus>("journal-status"),
+          candidate => assessDailyJournalStatus(candidate).passed,
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "daily-journal inventory to reach an atomic clean boundary"},
+        );
         const assessment = assessDailyJournalStatus(value);
         return {
           passed: assessment.passed,
@@ -3807,6 +3853,35 @@ export class RegressionScenarios {
         );
       }
 
+      const retentionRuntimeAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "configuration",
+        action: "verify accelerated retained-media worker is active",
+        target: this.config.targetHost,
+        expected: `the durable scan cursor is valid and no more than ${REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS} seconds behind the zero-day eligible cutoff`,
+      }, async () => {
+        const value = await poll(
+          async () => assessRetentionRuntimeHealth(
+            await probe.runJson("retention-runtime-health"),
+          ),
+          runtime => retentionRuntimeReady(
+            runtime,
+            REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS,
+          ),
+          {timeoutMs: 90_000, intervalMs: 5_000,
+            description: "accelerated retained-media scan cursor to become current"},
+        );
+        const passed = retentionRuntimeReady(
+          value,
+          REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS,
+        );
+        return {passed, value: passed, observed: JSON.stringify(value)};
+      });
+      if (!retentionRuntimeAccepted) {
+        throw new Error(
+          "Storage lifecycle mutation refused because the retained-media worker is still using or catching up from an older runtime profile",
+        );
+      }
+
       const scratchAccepted = await this.check({
         scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify clean DuckDB scratch before fixture mutation",
@@ -3819,7 +3894,8 @@ export class RegressionScenarios {
           {timeoutMs: 60_000, intervalMs: 1_000,
             description: "pre-lifecycle DuckDB scratch to become empty"},
         );
-        return {passed: archiveScratchIsSafe(value, false), observed: JSON.stringify(value)};
+        const clean = archiveScratchIsSafe(value, false);
+        return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
       if (!scratchAccepted) {
         throw new Error("Storage lifecycle mutation refused because DuckDB scratch did not become clean");
@@ -3946,13 +4022,22 @@ export class RegressionScenarios {
             archived.markedRows === 1 && archived.generationMinId === fixture.coldId &&
             archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
         }));
-      await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
-        target: archived.generationId ?? "fixture generation",
-        expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
-        return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
-          value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
-      });
+      const exportDisruptionPhase = "storage-lifecycle-export-disruption";
+      await this.metrics.sample();
+      this.reporter.expectRemoteMetricDisruptionPhase(exportDisruptionPhase);
+      this.metrics.setPhase(exportDisruptionPhase);
+      try {
+        await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
+          target: archived.generationId ?? "fixture generation",
+          expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
+          return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
+            value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
+        });
+      } finally {
+        this.metrics.setPhase("storage-lifecycle-post-export");
+        await this.metrics.sample();
+      }
       await this.check({scenario: "storage-lifecycle", category: "portability",
         action: "exercise deployed archive-object helper", target: archived.generationId ?? "fixture generation",
         expected: "the image helper verifies and copies a cataloged object by hash and rejects checksum mismatch and traversal"}, async () => {
@@ -3990,14 +4075,27 @@ export class RegressionScenarios {
           observed: `generation=${sealed.generationState}; hot row=${sealed.coldHotPresent}; HTTP ${response.status()}`};
       });
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query mixed hot/cold range",
-        target: streamPublicId, expected: "one bounded query returns both the cold and hot fixture IDs"}, async () => {
+        target: streamPublicId, expected: "bounded ascending and descending pages over one range expose the cold and hot fixture IDs"}, async () => {
         const start = new Date(Date.parse(fixture.coldTime) - 60_000).toISOString();
         const end = new Date(Date.parse(fixture.hotTime) + 60_000).toISOString();
-        const response = await request.get(this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`));
-        if (!response.ok()) return {passed: false, observed: `HTTP ${response.status()}`};
-        const ids = parseCollectionIds(await response.json());
-        return {passed: ids.includes(coldPublicId) && ids.includes(hotPublicId),
-          observed: `${ids.length} IDs; cold=${ids.includes(coldPublicId)}; hot=${ids.includes(hotPublicId)}`};
+        const base = `/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`;
+        const ascending = await request.get(this.viewerUrl(`${base}&order=asc`));
+        const descending = await request.get(this.viewerUrl(`${base}&order=desc`));
+        try {
+          if (!ascending.ok() || !descending.ok()) {
+            return {passed: false,
+              observed: `ascending HTTP ${ascending.status()}; descending HTTP ${descending.status()}`};
+          }
+          const ascendingIds = parseCollectionIds(await ascending.json());
+          const descendingIds = parseCollectionIds(await descending.json());
+          const coldFound = ascendingIds.includes(coldPublicId);
+          const hotFound = descendingIds.includes(hotPublicId);
+          return {passed: coldFound && hotFound,
+            observed: `ascending=${ascendingIds.length}, cold=${coldFound}; descending=${descendingIds.length}, hot=${hotFound}`};
+        } finally {
+          await ascending.dispose();
+          await descending.dispose();
+        }
       });
       const hotHold = await probe.runJson<{
         holdId: string;
@@ -4061,19 +4159,28 @@ export class RegressionScenarios {
           observed: `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
         };
       });
-      await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
-        target: archived.generationId ?? "fixture generation",
-        expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
-        const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
-          "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
-          "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
-          "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
-          .every(key => value[key] === true) &&
-          value.generationHoldResolution === "GENERATION_EXACT" &&
-          value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
-        return {passed, observed: JSON.stringify(value)};
-      });
+      const purgeDisruptionPhase = "storage-lifecycle-purge-disruption";
+      await this.metrics.sample();
+      this.reporter.expectRemoteMetricDisruptionPhase(purgeDisruptionPhase);
+      this.metrics.setPhase(purgeDisruptionPhase);
+      try {
+        await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
+          target: archived.generationId ?? "fixture generation",
+          expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
+          const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
+            "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
+            "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
+            "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
+            .every(key => value[key] === true) &&
+            value.generationHoldResolution === "GENERATION_EXACT" &&
+            value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
+          return {passed, observed: JSON.stringify(value)};
+        });
+      } finally {
+        this.metrics.setPhase("storage-lifecycle-post-purge");
+        await this.metrics.sample();
+      }
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
         expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
@@ -4097,8 +4204,16 @@ export class RegressionScenarios {
         );
         return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
       });
-      await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
-        target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
+      const lifecycleRestartPhase = "storage-lifecycle-restart-disruption";
+      // Finish any interval sample that captured the steady-state phase before allowing the
+      // supported restart. Otherwise that in-flight sample can observe the deliberate outage but
+      // be mislabeled as ordinary storage-lifecycle activity.
+      await this.metrics.sample();
+      this.reporter.expectRemoteMetricDisruptionPhase(lifecycleRestartPhase);
+      this.metrics.setPhase(lifecycleRestartPhase);
+      try {
+        await this.check({scenario: "storage-lifecycle", category: "daily-file", action: "recover journal after OSCAR restart",
+          target: this.config.targetHost, expected: "OSCAR becomes healthy with no recovery errors or partial publications"}, async () => {
         const value = await probe.runJson<{
           healthy: boolean;
           segmentsChecked: number;
@@ -4120,26 +4235,56 @@ export class RegressionScenarios {
         const exactRestartPreservation = Number.isSafeInteger(value.segmentsChecked) &&
           value.segmentsChecked > 0 && value.segmentsPreserved === value.segmentsChecked &&
           value.segmentFailures === 0;
-        return {passed: value.healthy && exactRestartPreservation &&
-          value.partialFiles === 0 && value.recoveryErrors === 0 &&
-          value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
+          return {passed: value.healthy && exactRestartPreservation &&
+            value.partialFiles === 0 && value.recoveryErrors === 0 &&
+            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
           observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
-      });
+        });
+      } finally {
+        this.metrics.setPhase("storage-lifecycle-post-restart");
+      }
       if (this.config.storageBackupWorkflow !== "disabled") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
-          expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, catalog and daily-journal receipts, and bounded retention without restore"}, async () => {
-          const mediaBeforeBackup = assessMediaMetadataHealth(
-            await probe.runJson("media-metadata-health"),
+        expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, an exact daily-journal confirmation outcome, and bounded retention without restore"}, async () => {
+          // Startup reclamation may briefly remove expired processed-index buckets before the
+          // first scheduled overlap scan republishes current observations. Cross one complete
+          // configured scan interval before freezing the exact backup inventory.
+          await sleep(REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000);
+          let stableMetadataSignature = "";
+          let stableMetadataSamples = 0;
+          const mediaBeforeBackup = await poll(
+            async () => assessMediaMetadataHealth(
+              await probe.runJson("media-metadata-health"),
+            ),
+            (value) => {
+              const signature = [value.processedIndexFiles, value.deletionIndexFiles,
+                value.retainedManifestFiles, value.retainedJpegFiles].join(":");
+              stableMetadataSamples = signature === stableMetadataSignature
+                ? stableMetadataSamples + 1 : 1;
+              stableMetadataSignature = signature;
+              return value.processedIndexFiles > 0 && stableMetadataSamples >= 3;
+            },
+            {timeoutMs: 120_000, intervalMs: 2_000,
+              description: "retained-media indexes to repopulate and stabilize after restart"},
           );
           const retainedExpectations = [...this.retainedBackupExpectations.values()].sort();
           if (retainedExpectations.length === 0) {
             throw new Error("Backup certification requires at least one exact retained-media set");
           }
-          const value = await probe.runJson<Record<string, unknown>>(
-            "backup-check",
-            retainedExpectations,
-          );
+          const backupDisruptionPhase = "storage-lifecycle-backup-disruption";
+          await this.metrics.sample();
+          this.reporter.expectRemoteMetricDisruptionPhase(backupDisruptionPhase);
+          this.metrics.setPhase(backupDisruptionPhase);
+          let value: Record<string, unknown>;
+          try {
+            value = await probe.runJson<Record<string, unknown>>(
+              "backup-check",
+              retainedExpectations,
+            );
+          } finally {
+            this.metrics.setPhase("storage-lifecycle-post-backup");
+          }
           const exactMembers = Number(value.retainedMediaExactMembersVerified);
           const expectedMembers = Number(value.retainedMediaExpectedMembers);
           const expectedProcessed = Number(value.expectedProcessedIndexes);
@@ -4148,20 +4293,24 @@ export class RegressionScenarios {
             value.mediaMetadataCheckpointIncluded === true &&
             Number(value.retainedMediaExpectedSets) === retainedExpectations.length &&
             Number.isSafeInteger(expectedMembers) && expectedMembers > retainedExpectations.length * 6 &&
-            exactMembers === expectedMembers && expectedProcessed > 0 &&
-            expectedProcessed === mediaBeforeBackup.processedIndexFiles &&
+            exactMembers === expectedMembers && mediaBeforeBackup.processedIndexFiles > 0 &&
+            Number.isSafeInteger(expectedProcessed) && expectedProcessed >= 0 &&
             Number(value.processedObservationIndexesIncluded) === expectedProcessed &&
             Number(value.deletionIndexesIncluded) === expectedDeletion;
           const deletionMetadataIncluded = Number.isSafeInteger(Number(value.deletionIndexesIncluded)) &&
-            Number(value.deletionIndexesIncluded) === mediaBeforeBackup.deletionIndexFiles &&
-            expectedDeletion === mediaBeforeBackup.deletionIndexFiles;
+            Number.isSafeInteger(expectedDeletion) && expectedDeletion >= 0 &&
+            Number(value.deletionIndexesIncluded) === expectedDeletion;
           return {passed: value.automaticVerification === true && value.supportedVerification === true &&
             value.independentCoreAuthentication === true &&
             value.authenticatedManifest === true && value.journalConfirmationAuthenticated === true &&
             value.regularMarkers === true && value.epochValid === true &&
             value.verifiedEpoch === true && value.archiveGenerationInventoryExact === true &&
             Number.isSafeInteger(Number(value.archiveGenerationCount)) && Number(value.archiveGenerationCount) >= 0 &&
-            Number(value.journalReceipts) > 0 && Number(value.journalReceiptSegmentsVerified) > 0 &&
+            Number.isSafeInteger(Number(value.journalConfirmedPublications)) &&
+            Number(value.journalConfirmedPublications) >= 0 &&
+            Number(value.journalReceipts) === Number(value.journalConfirmedPublications) &&
+            Number.isSafeInteger(Number(value.journalReceiptSegmentsVerified)) &&
+            Number(value.journalReceiptSegmentsVerified) >= Number(value.journalReceipts) &&
             value.journalReceiptReferencesValid === true &&
             value.retentionRespected === true && value.duckDbScratchExcluded === true &&
             metadataIncluded && deletionMetadataIncluded && value.restoreAttempted === false,

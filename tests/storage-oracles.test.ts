@@ -9,11 +9,13 @@ import {
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
+  assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
   mediaMetadataHealthIsSafe,
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
   parseBaselineJpeg,
+  retentionRuntimeReady,
   storagePlatformHasExactReleaseIdentity,
   storageMetricFromProbe,
 } from "../src/storage-oracles.js";
@@ -413,6 +415,19 @@ test("archive scratch and retained-media metadata contracts fail closed", () => 
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointPresent: false,
     checkpointValid: false, checkpointSchemaVersion: null}, false), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, retainedJpegFiles: 4}, true), false);
+});
+
+test("retained-media runtime requires a valid current durable scan cursor", () => {
+  const runtime = assessRetentionRuntimeHealth({checkpointPresent: true,
+    checkpointValid: true, checkpointSchemaVersion: 1,
+    processedThrough: "2026-10-19T19:00:00Z", updatedAt: "2026-10-19T19:01:00Z",
+    cursorLagSeconds: 120});
+  assert.equal(retentionRuntimeReady(runtime, 180), true);
+  assert.equal(retentionRuntimeReady({...runtime, cursorLagSeconds: 181}, 180), false);
+  assert.equal(retentionRuntimeReady({...runtime, checkpointValid: false}, 180), false);
+  assert.equal(retentionRuntimeReady({...runtime, checkpointSchemaVersion: 2}, 180), false);
+  assert.throws(() => assessRetentionRuntimeHealth({...runtime, processedThrough: "invalid"}),
+    /ISO timestamp/);
 });
 
 test("archive health counts partial archive and WAL artifacts independently", () => {
