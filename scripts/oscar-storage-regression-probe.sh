@@ -2346,7 +2346,7 @@ COMMANDS
       'generationMinId',(SELECT min_id::text FROM g),'generationMaxId',(SELECT max_id::text FROM g),
       'markedRows',coalesce((SELECT count(*) FROM obs o,g WHERE o.archivegenerationid=g.id),0),
       'fixtureColdMarked',coalesce((SELECT count(*) FROM obs o,g
-        WHERE o.id=ANY((SELECT cold_ids FROM f)) AND o.archivegenerationid=g.id),0)
+        WHERE o.id IN (SELECT unnest(cold_ids) FROM f) AND o.archivegenerationid=g.id),0)
         =coalesce((SELECT cardinality(cold_ids) FROM f),-1),
       'fixtureHotUnmarked',coalesce((SELECT o.archivegenerationid IS NULL FROM obs o,f WHERE o.id=f.hot_id),false),
       'exactRowOwnership',coalesce((SELECT g.row_count=cardinality(f.cold_ids)
