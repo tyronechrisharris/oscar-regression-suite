@@ -99,7 +99,8 @@ export function validateRestoreEvidenceBundle(
   }
   if (environment.storageExpectedRelease !== "3.9.2" ||
       environment.storageWorkflow !== "required" ||
-      environment.storageBackupWorkflow !== "required") {
+      environment.storageBackupWorkflow !== "required" ||
+      environment.storageBackupMode !== "single") {
     throw new Error("Restore evidence did not run all required 3.9.2 storage gates");
   }
   for (const [field, actual, wanted] of [
@@ -112,7 +113,7 @@ export function validateRestoreEvidenceBundle(
       throw new Error(`Restore evidence ${field} does not match this release candidate`);
     }
   }
-  if (attestation.schemaVersion !== 1 ||
+  if (attestation.schemaVersion !== 2 ||
       typeof attestation.backupId !== "string" ||
       !BACKUP_ID_PATTERN.test(attestation.backupId) ||
       attestation.authenticatedBackupReverified !== true ||

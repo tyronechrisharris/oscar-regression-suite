@@ -225,16 +225,17 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     markerOwner: 0, markerGroup: 0, markerMode: "600", rootOwner: 0, rootGroup, rootMode, exact: true,
   });
   const platform = assessStoragePlatform({expectedRelease: "3.9.2", configuredRelease: "3.9.2",
-    templateRelease: "3.9.2", deploymentId,
+    templateRelease: "3.9.2", deploymentId, backupMode: "single",
     storageRoots: {archive: root("archive", 10001, "1770"), backup: root("backup", 0, "700"),
-      walArchive: root("wal-archive", 999, "1770")},
+    },
     storageLock: {directory: "/run/lock/oscar-storage", file: `/run/lock/oscar-storage/${deploymentId}.lock`,
       stablePath: true, private: true, behaviorTested: true, concurrentRejected: true},
-    walArchive: {...helper, helperPath: "/usr/local/bin/oscar-archive-wal", archiveMode: "on",
-      archiveCommandExact: true, publicationContractExact: true}, archiveObjectHelper: helper, appImage: image,
+    postgresWal: {archiveMode: "off", archiveTimeout: "0", archiveCommand: "(disabled)",
+      archiveCommandInactive: true, externalWalMountAbsent: true},
+    legacyWalArchive: {configured: false, present: false, bytes: 0},
+    archiveObjectHelper: helper, appImage: image,
     restoreHelpers: {
       prepare: {...helper, helperPath: "/usr/local/bin/oscar-prepare-restore"},
-      mergeWal: {...helper, helperPath: "/usr/local/bin/oscar-merge-wal-restore"},
     },
     atomicPublisher: {helperPath: "/usr/local/bin/oscar-atomic-publish",
       sourceStampPath: "/usr/local/share/oscar-atomic-publish.source.sha256",
@@ -286,7 +287,7 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   assert.equal(platform.schemaVersion, 5);
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
-  assert.equal(platform.storageRoots.walArchive.rootKind, "wal-archive");
+  assert.equal(platform.backupMode, "single");
   assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
   assert.deepEqual(platform.videoRetention, {enabled: true, timeToRetentionDays: 0,
     queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
@@ -332,15 +333,15 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, storageRoots: {...platform.storageRoots,
-      backup: {...platform.storageRoots.backup, rootKind: "archive"}}},
+      backup: {...platform.storageRoots.backup!, rootKind: "archive"}}},
     "3.9.2",
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
-    {...platform, walArchive: {...platform.walArchive, archiveCommandExact: false}},
+    {...platform, postgresWal: {...platform.postgresWal, archiveMode: "on"}},
     "3.9.2",
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
-    {...platform, walArchive: {...platform.walArchive, publicationContractExact: false}},
+    {...platform, postgresWal: {...platform.postgresWal, externalWalMountAbsent: false}},
     "3.9.2",
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
@@ -349,11 +350,6 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, archiveObjectHelper: {...platform.archiveObjectHelper, cliPurgeIntegrated: false}},
-    "3.9.2",
-  ), false);
-  assert.equal(storagePlatformHasExactReleaseIdentity(
-    {...platform, restoreHelpers: {...platform.restoreHelpers,
-      mergeWal: {...platform.restoreHelpers.mergeWal, deployedSha256: "f".repeat(64)}}},
     "3.9.2",
   ), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
@@ -392,6 +388,10 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   ]) {
     assert.equal(storagePlatformHasExactReleaseIdentity({...platform, nativeRuntime}, "3.9.2"), false);
   }
+  const disabled = {...platform, backupMode: "disabled" as const,
+    storageRoots: {...platform.storageRoots, backup: null}};
+  assert.equal(storagePlatformHasExactReleaseIdentity(disabled, "3.9.2", "disabled"), true);
+  assert.equal(storagePlatformHasExactReleaseIdentity(disabled, "3.9.2", "single"), false);
   const metric = storageMetricFromProbe("batch", {databaseSizeBytes: "100", observationInsertCalls: 2,
     observationInsertRows: 20, observationRowsPerCall: 10});
   assert.equal(metric.databaseSizeBytes, 100);

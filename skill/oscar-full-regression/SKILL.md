@@ -42,12 +42,12 @@ checks. Preserve its evidence and restore the reserved RPM even when a test fail
   smoke/full and requires the exact target/storage acknowledgements plus the
   restore-specific path binding documented in `docs/STORAGE_REGRESSION.md`.
   Require both `STORAGE_WORKFLOW=required` and
-  `STORAGE_BACKUP_WORKFLOW=required`. Run it and the matching
+  `STORAGE_BACKUP_WORKFLOW=required`, plus `OSCAR_BACKUP_MODE=single`. Run it and the matching
   `3.9.2-release` only from the same available, committed, clean canonical
   40-hex suite HEAD; ignored `.env` and `results/` remain permitted.
-  Require the three canonical archive/WAL/backup paths and exact path
+  Require the two canonical archive/backup paths and exact path
   acknowledgement, and run it only on an isolated disposable deployment whose
-  PostgreSQL, OSCAR state, archive, WAL, and credentials may all be overwritten.
+  PostgreSQL, OSCAR state, archive, and credentials may all be overwritten.
   Preserve its backup, permission-restricted plaintext safety directory, and
   root-owned bounded failure-diagnostics bundle. If recovery replaces an
   approved credential leaf, require Compose force recreation to guarantee
@@ -117,7 +117,12 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    merely to obtain a pass.
 
 For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
-`STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
+`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, and set the
+expected `OSCAR_BACKUP_MODE` (`disabled` is the product and suite default). In
+disabled mode require inactive PostgreSQL archiving, no external WAL bind, and
+exact fail-before-mutation behavior. In single mode require one authenticated
+schema-v2 CURRENT snapshot with streamed WAL and no cumulative WAL tar. Run
+`storage-health` after an overnight daily-file
 rotation and a configured retained-media fixture for smoke/non-lifecycle coverage,
 then run the full `storage-lifecycle` only on its separately acknowledged
 disposable database. A full run can self-seed its retained-media proof from the
@@ -196,13 +201,14 @@ retained-media checkpoint, every processed/deletion index, and each proved
 event/lane/camera manifest plus `frame-01.jpg` through `frame-05.jpg` in the
 authenticated app-state backup with pre-backup path/type/size/SHA-256 identity,
 exact tags/running image IDs/OCI labels and
-checksum plus all three deployment-bound storage-root markers, stable private
-deployment lock rejection, exact WAL command and packaged/running helper hashes,
+checksum plus the archive marker and optional single-mode backup marker, stable private
+deployment lock rejection, inactive PostgreSQL WAL archiving with no external
+WAL bind, and packaged/running helper hashes,
 compiled atomic-publisher source provenance and no-replace collision behavior,
 no full backup-root mount in either long-running service and isolated one-shot
-base-backup wiring, atomic no-replace hard-link WAL publication, no archive/WAL partial artifacts,
+base-backup wiring and no archive partial artifacts,
 controlled stale-activation rollback with
-exact-row retry ownership, deployed archive/WAL helper behavior,
+exact-row retry ownership and deployed archive-helper behavior,
 checksums/pg_stat, and storage/resource metrics.
 
 `LEGACY_UNKNOWN` is migration-only for pre-v5 observation holds; never accept it
@@ -210,20 +216,18 @@ as CLI output. Pre-v5 generation holds must migrate to `GENERATION_EXACT`.
 
 Only when the user has explicitly authorized a destructive isolated recovery
 test and all documented acknowledgements are present, set both
-`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, then run
+`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, set
+`OSCAR_BACKUP_MODE=single`, then run
 `npm run test:restore-drill` separately. Require pre-backup canaries to return
-across the database, application state, archive, WAL, `.env`, secrets, and TLS;
-require every component of the empty archive partition/profile canary hierarchy
-to be runtime-owned and owner-writable/searchable before backup;
-require promotion onto a timeline newer than the base backup, byte-identical
-append-only preservation of fingerprinted backup-era and post-backup source-timeline
-WAL, an archived timeline-history
-file and new-timeline segment with no post-start archiver failure, exact reconstruction
+across the database, application state, and archive;
+require promotion onto a timeline newer than the base backup, no external WAL
+dependency or cumulative WAL payload, a durable post-promotion write across
+checkpoint/restart, and exact reconstruction
 of the authenticated `VERIFIED` epoch receipt, removal of one-time recovery settings
 and signals, healthy services, archive verification, and unchanged immutable image
 IDs. The acknowledged storage planes must resolve exactly and remain distinct and
-non-overlapping. Require the private safety copy to preserve the exact mutated
-`.env`/secrets/TLS names, contents, owners, groups, and modes with no links.
+non-overlapping. Require the private safety copy to be root-owned mode 0700 and
+to contain safe, non-linked `.env`, `secrets/`, and `tls/` entries.
 Keep every raw resource sample. Exempt only the exact
 `storage-restore-drill-disruption` phase from steady-state service checks, and
 only in this profile; require a real target-host sample during it, healthy
@@ -243,13 +247,16 @@ linked, or incorrectly permissioned control state as nonterminal and retain the
 remote lease for investigation.
 Never reinterpret a smoke/full request as restore authorization.
 
-For final 3.9.2 certification, first preserve a complete unfiltered
-`restore-drill` PASS. Set all five operational-view/UUID/camera/storage/backup
-workflows to `required`, set the exact `OSCAR_BUILD_LABEL`, point
-`OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching result directory, and run
-`npm run test:3.9.2-release` with no scenario filter. Do not accept a release run
-with mismatched identity, missing evidence, any skip/failure, or an incomplete
-restore attestation.
+For final 3.9.2 certification, set all five operational-view/UUID/camera/storage/
+backup workflows to `required`, set the exact `OSCAR_BUILD_LABEL` and expected
+`OSCAR_BACKUP_MODE`, and run `npm run test:3.9.2-release` with no scenario
+filter. Disabled mode is fully certified by its live refusal/non-mutation gate
+and needs no restore evidence. For single mode, first preserve a complete
+unfiltered `restore-drill` PASS and point
+`OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching result directory. Do not
+accept a release run with mismatched identity, any skip/failure, or—when single
+mode is selected—missing evidence or an incomplete schema-v2 restore
+attestation.
 
 The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
 they do not disconnect cameras or mutate SensorHub. The full profile separately

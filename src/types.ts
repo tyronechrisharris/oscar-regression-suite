@@ -4,6 +4,8 @@ export type Profile = "smoke" | "full" | "3.9.2-release" | "restore-drill";
 
 export type CapabilityMode = "auto" | "required" | "disabled";
 
+export type BackupMode = "disabled" | "single";
+
 export type ResultStatus = "correct" | "incorrect" | "skipped";
 
 export const OSCAR_COMPOSE_SERVICES = ["gateway", "oscar", "postgres"] as const;
@@ -43,13 +45,13 @@ export interface SuiteConfig {
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.9.2";
   storageBackupWorkflow: CapabilityMode;
+  storageBackupMode: BackupMode;
   storageTargetAcknowledgement: string;
   restoreTargetAcknowledgement: string;
   restoreDisposableAcknowledgement: string;
   restoreDataLossAcknowledgement: string;
   restorePathsAcknowledgement: string;
   restoreArchiveDirectory?: string;
-  restoreWalArchiveDirectory?: string;
   restoreBackupDirectory?: string;
   oscarReleaseDirectory?: string;
   releaseRestoreEvidenceDirectory?: string;
@@ -196,6 +198,7 @@ export interface RunMetadata {
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.9.2";
   storageBackupWorkflow: CapabilityMode;
+  storageBackupMode: BackupMode;
   storageProbeTimeoutMs: number;
   storageRestoreProbeTimeoutMs: number;
   oscarReleaseDirectory?: string;
@@ -211,7 +214,7 @@ export interface RunMetadata {
 }
 
 export interface RestoreDrillCertification {
-  schemaVersion: 1;
+  schemaVersion: 2;
   backupId: string;
   authenticatedBackupReverified: true;
   allCanariesRestored: true;

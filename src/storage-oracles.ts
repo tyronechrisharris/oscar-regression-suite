@@ -1,5 +1,5 @@
 import {createHash} from "node:crypto";
-import type {StorageMetricSample} from "./types.js";
+import type {BackupMode, StorageMetricSample} from "./types.js";
 import {isCanonicalProductUuid} from "./product-uuid.js";
 import {publicObservationId} from "./public-observation-id.js";
 
@@ -426,10 +426,10 @@ export interface StoragePlatformProbe {
   configuredRelease: string;
   templateRelease: string;
   deploymentId: string;
+  backupMode: BackupMode;
   storageRoots: {
     archive: StorageRootIdentity;
-    backup: StorageRootIdentity;
-    walArchive: StorageRootIdentity;
+    backup: StorageRootIdentity | null;
   };
   storageLock: {
     directory: string;
@@ -439,11 +439,17 @@ export interface StoragePlatformProbe {
     behaviorTested: boolean;
     concurrentRejected: boolean;
   };
-  walArchive: {
+  postgresWal: {
     archiveMode: string;
-    archiveCommandExact: boolean;
-    publicationContractExact: boolean;
-    helper: StorageHelperIdentity;
+    archiveTimeout: string;
+    archiveCommand: string;
+    archiveCommandInactive: boolean;
+    externalWalMountAbsent: boolean;
+  };
+  legacyWalArchive: {
+    configured: boolean;
+    present: boolean;
+    bytes: number;
   };
   archiveObjectHelper: StorageHelperIdentity & {
     cliExportIntegrated: boolean;
@@ -451,7 +457,6 @@ export interface StoragePlatformProbe {
   };
   restoreHelpers: {
     prepare: StorageHelperIdentity;
-    mergeWal: StorageHelperIdentity;
   };
   atomicPublisher: {
     helperPath: string;
@@ -700,16 +705,21 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
   const probe = object(value, "storage platform probe");
   const roots = object(probe.storageRoots, "storageRoots");
   const lock = object(probe.storageLock, "storageLock");
-  const wal = object(probe.walArchive, "walArchive");
+  const wal = object(probe.postgresWal, "postgresWal");
+  const legacyWal = object(probe.legacyWalArchive, "legacyWalArchive");
+  const backupMode = text(probe.backupMode, "backupMode");
+  if (backupMode !== "disabled" && backupMode !== "single") {
+    throw new Error("backupMode must be disabled or single");
+  }
   return {
     expectedRelease: text(probe.expectedRelease, "expectedRelease"),
     configuredRelease: text(probe.configuredRelease, "configuredRelease"),
     templateRelease: text(probe.templateRelease, "templateRelease"),
     deploymentId: text(probe.deploymentId, "deploymentId"),
+    backupMode,
     storageRoots: {
       archive: rootIdentity(roots.archive, "storageRoots.archive"),
-      backup: rootIdentity(roots.backup, "storageRoots.backup"),
-      walArchive: rootIdentity(roots.walArchive, "storageRoots.walArchive"),
+      backup: roots.backup === null ? null : rootIdentity(roots.backup, "storageRoots.backup"),
     },
     storageLock: {
       directory: text(lock.directory, "storageLock.directory"),
@@ -719,11 +729,17 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
       behaviorTested: lock.behaviorTested === true,
       concurrentRejected: lock.concurrentRejected === true,
     },
-    walArchive: {
-      archiveMode: text(wal.archiveMode, "walArchive.archiveMode"),
-      archiveCommandExact: wal.archiveCommandExact === true,
-      publicationContractExact: wal.publicationContractExact === true,
-      helper: helperIdentity(wal, "walArchive"),
+    postgresWal: {
+      archiveMode: text(wal.archiveMode, "postgresWal.archiveMode"),
+      archiveTimeout: text(wal.archiveTimeout, "postgresWal.archiveTimeout"),
+      archiveCommand: typeof wal.archiveCommand === "string" ? wal.archiveCommand : "",
+      archiveCommandInactive: wal.archiveCommandInactive === true,
+      externalWalMountAbsent: wal.externalWalMountAbsent === true,
+    },
+    legacyWalArchive: {
+      configured: legacyWal.configured === true,
+      present: legacyWal.present === true,
+      bytes: integer(legacyWal.bytes, "legacyWalArchive.bytes"),
     },
     archiveObjectHelper: (() => {
       const helper = object(probe.archiveObjectHelper, "archiveObjectHelper");
@@ -737,7 +753,6 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
       const helpers = object(probe.restoreHelpers, "restoreHelpers");
       return {
         prepare: helperIdentity(helpers.prepare, "restoreHelpers.prepare"),
-        mergeWal: helperIdentity(helpers.mergeWal, "restoreHelpers.mergeWal"),
       };
     })(),
     atomicPublisher: (() => {
@@ -1007,12 +1022,17 @@ export function mediaMetadataHealthIsSafe(
 export function storagePlatformHasExactReleaseIdentity(
   value: StoragePlatformProbe,
   release: string,
+  expectedBackupMode: BackupMode = value.backupMode,
 ): boolean {
   const roots: Array<[StorageRootIdentity, string, number, string]> = [
     [value.storageRoots.archive, "archive", 10001, "1770"],
-    [value.storageRoots.backup, "backup", 0, "700"],
-    [value.storageRoots.walArchive, "wal-archive", 999, "1770"],
   ];
+  if (expectedBackupMode === "single") {
+    if (value.storageRoots.backup === null) return false;
+    roots.push([value.storageRoots.backup, "backup", 0, "700"]);
+  } else if (value.storageRoots.backup !== null) {
+    return false;
+  }
   const rootsExact = roots.every(([root, kind, group, mode]) => root.exact &&
     root.format === "oscar-storage-root-identity" && root.version === "1" &&
     root.deploymentId === value.deploymentId && root.rootKind === kind &&
@@ -1029,6 +1049,7 @@ export function storagePlatformHasExactReleaseIdentity(
   return value.expectedRelease === release &&
     value.configuredRelease === release &&
     value.templateRelease === release &&
+    value.backupMode === expectedBackupMode &&
     isCanonicalProductUuid(value.deploymentId) &&
     rootsExact &&
     value.storageLock.file === `${value.storageLock.directory}/${value.deploymentId}.lock` &&
@@ -1039,13 +1060,13 @@ export function storagePlatformHasExactReleaseIdentity(
     value.batchRewriteObservedCalls > 0 &&
     value.batchRewriteObservedRows > value.batchRewriteObservedCalls &&
     value.dailyJournalConfigured &&
-    value.walArchive.archiveMode === "on" && value.walArchive.archiveCommandExact &&
-    value.walArchive.publicationContractExact &&
-    helperExact(value.walArchive.helper, "/usr/local/bin/oscar-archive-wal") &&
+    value.postgresWal.archiveMode === "off" && value.postgresWal.archiveTimeout === "0" &&
+    value.postgresWal.archiveCommandInactive &&
+    ["", "(disabled)"].includes(value.postgresWal.archiveCommand) &&
+    value.postgresWal.externalWalMountAbsent &&
     helperExact(value.archiveObjectHelper, "/usr/local/bin/oscar-archive-object") &&
     value.archiveObjectHelper.cliExportIntegrated && value.archiveObjectHelper.cliPurgeIntegrated &&
     helperExact(value.restoreHelpers.prepare, "/usr/local/bin/oscar-prepare-restore") &&
-    helperExact(value.restoreHelpers.mergeWal, "/usr/local/bin/oscar-merge-wal-restore") &&
     value.atomicPublisher.helperPath === "/usr/local/bin/oscar-atomic-publish" &&
     value.atomicPublisher.sourceStampPath ===
       "/usr/local/share/oscar-atomic-publish.source.sha256" &&

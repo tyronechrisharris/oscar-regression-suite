@@ -9,7 +9,7 @@ umask 077
 # oscar_regression_fixture and fail closed if a cold-deletion plan includes any
 # other generation. The separately selected restore-drill action intentionally
 # replaces the isolated database, application state, cold archive, and credentials
-# while preserving the append-only WAL archive; the runner binds that profile to
+# from the self-contained schema-v2 snapshot; the runner binds that profile to
 # exact target, data-loss, and canonical storage-path acknowledgements, and the
 # probe additionally requires an exact per-run token.
 
@@ -26,7 +26,7 @@ action=${1:-}; (($#)) && shift
 cd "$release_dir"
 
 compose() {
-  env -u OSCAR_ARCHIVE_DIR -u OSCAR_BACKUP_DIR -u OSCAR_DEPLOYMENT_ID \
+  env -u OSCAR_ARCHIVE_DIR -u OSCAR_BACKUP_DIR -u OSCAR_BACKUP_MODE -u OSCAR_DEPLOYMENT_ID \
     -u OSCAR_HTTPS_PORT -u OSCAR_JAVA_OPTS -u OSCAR_POSTGIS_PLATFORM \
     -u OSCAR_SECRETS_DIR -u OSCAR_TLS_DIR -u OSCAR_VERSION \
     -u OSCAR_WAL_ARCHIVE_DIR \
@@ -101,26 +101,6 @@ env_value() {
   local name=$1 fallback=$2 value
   value=$(awk -F= -v name="$name" '$1 == name { print substr($0, index($0, "=") + 1); exit }' .env)
   printf '%s' "${value:-$fallback}"
-}
-ensure_restore_archive_canary_hierarchy() {
-  local expected_uid=${1:-} expected_gid=${2:-} component component_mode
-  shift 2 || fail 'Restore archive-canary ownership arguments are missing.'
-  [[ $expected_uid =~ ^[0-9]+$ && $expected_gid =~ ^[0-9]+$ && $# -gt 0 ]] ||
-    fail 'Restore archive-canary ownership or hierarchy is invalid.'
-  for component in "$@"; do
-    [[ $component == /* ]] || fail 'Restore archive-canary hierarchy must use absolute paths.'
-    if [[ ! -e $component && ! -L $component ]]; then
-      install -d -o "$expected_uid" -g "$expected_gid" -m 0750 -- "$component" ||
-        fail 'Could not create a canonical restore archive-canary directory.'
-    fi
-    [[ -d $component && ! -L $component &&
-       $(stat -c '%u:%g' -- "$component") == "$expected_uid:$expected_gid" ]] ||
-      fail 'Restore archive-canary hierarchy has unsafe ownership or type.'
-    component_mode=$(stat -c %a -- "$component")
-    [[ $component_mode =~ ^[0-7]{3,4}$ ]] &&
-      (( (8#$component_mode & 0700) == 0700 )) ||
-      fail 'Restore archive-canary hierarchy is not owner-readable, writable, and searchable.'
-  done
 }
 platform_config_fields() {
   local config_path=$1
@@ -483,8 +463,18 @@ retention_runtime_health_json() {
   printf '{"checkpointPresent":true,"checkpointValid":%s,"checkpointSchemaVersion":%s,"processedThrough":%s,"updatedAt":%s,"cursorLagSeconds":%s}\n' \
     "$valid" "$schema" "$processed" "$updated" "$lag"
 }
+tree_fingerprint() {
+  local path=$1
+  if [[ ! -e $path && ! -L $path ]]; then printf absent; return; fi
+  [[ -d $path && ! -L $path ]] || fail "Fingerprint target is not a real directory: $path"
+  find "$path" -xdev -printf '%P|%y|%s|%T@\n' | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+running_services_fingerprint() {
+  compose ps --status running --format '{{.Service}}|{{.ID}}' | LC_ALL=C sort |
+    sha256sum | awk '{print $1}'
+}
 safe_json_text() {
-  [[ ${1:-} =~ ^[A-Za-z0-9._/:@+,-]*$ ]] || fail "Unsafe value in probe JSON: ${1:-}"
+  [[ ${1:-} =~ ^[A-Za-z0-9._/:@+,()%\ -]*$ ]] || fail "Unsafe value in probe JSON: ${1:-}"
 }
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$1" | awk '{print $1}'
@@ -570,31 +560,6 @@ verify_backup_core_authentication() (
     printf 'Authenticated manifest does not exactly cover backup payload files.\n' >&2; return 1; }
   printf verified
 )
-credential_tree_inventory() {
-  local root=$1 output=$2 entry relative kind uid gid mode bytes digest count=0
-  [[ -d $root && ! -L $root && -f $root/.env && ! -L $root/.env &&
-     -d $root/secrets && ! -L $root/secrets && -d $root/tls && ! -L $root/tls ]] || return 1
-  : >"$output"
-  while IFS= read -r -d '' entry; do
-    count=$((count+1)); [[ $count -le 4096 ]] || return 1
-    [[ ! -L $entry ]] || return 1
-    relative=${entry#"$root/"}
-    [[ $relative =~ ^([.]env|secrets|tls)(/[A-Za-z0-9._-]+)*$ &&
-       $relative != *'/../'* && $relative != *'//' ]] || return 1
-    uid=$(stat -c %u -- "$entry"); gid=$(stat -c %g -- "$entry"); mode=$(stat -c %a -- "$entry")
-    if [[ -d $entry ]]; then
-      kind=D; bytes=-; digest=-
-    elif [[ -f $entry ]]; then
-      kind=F; bytes=$(stat -c %s -- "$entry"); digest=$(sha256_file "$entry")
-      [[ $bytes =~ ^[0-9]+$ && $digest =~ ^[0-9a-f]{64}$ ]] || return 1
-    else return 1
-    fi
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$relative" "$uid" "$gid" "$mode" "$bytes" "$digest" >>"$output"
-  done < <(find "$root/.env" "$root/secrets" "$root/tls" -mindepth 0 -print0)
-  [[ $count -gt 0 ]] || return 1
-  LC_ALL=C sort -o "$output" "$output"
-  [[ -z $(cut -d'|' -f2 "$output" | LC_ALL=C sort | uniq -d) ]]
-}
 file_size() {
   if stat -c %s "$1" >/dev/null 2>&1; then stat -c %s "$1"; else stat -f %z "$1"; fi
 }
@@ -1134,44 +1099,45 @@ case $action in
     template_release=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' .env.example)
     deployment_id=$(env_value OSCAR_DEPLOYMENT_ID missing)
     valid_deployment_id "$deployment_id" || fail 'OSCAR_DEPLOYMENT_ID is missing or is not a lowercase UUID.'
+    backup_mode=$(env_value OSCAR_BACKUP_MODE disabled)
+    [[ $backup_mode == disabled || $backup_mode == single ]] ||
+      fail 'OSCAR_BACKUP_MODE must be exactly disabled or single.'
     archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ../oscar-storage/archive)")")
-    wal_archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_WAL_ARCHIVE_DIR ../oscar-storage/wal-archive)")")
-    backup_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_BACKUP_DIR ../oscar-storage/backups)")")
     archive_identity=$(storage_root_identity_json "$archive_dir" archive "$deployment_id")
-    wal_identity=$(storage_root_identity_json "$wal_archive_dir" wal-archive "$deployment_id")
-    backup_identity=$(storage_root_identity_json "$backup_dir" backup "$deployment_id")
+    backup_identity=null
+    if [[ $backup_mode == single ]]; then
+      backup_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_BACKUP_DIR ../oscar-storage/backups)")")
+      backup_identity=$(storage_root_identity_json "$backup_dir" backup "$deployment_id")
+    fi
+    legacy_wal_configured=false
+    legacy_wal_present=false
+    legacy_wal_bytes=0
+    legacy_wal_value=$(awk -F= '$1 == "OSCAR_WAL_ARCHIVE_DIR" { print substr($0, index($0, "=") + 1); exit }' .env)
+    legacy_wal_path=$(absolute_path "${legacy_wal_value:-../oscar-storage/wal-archive}")
+    if [[ -n $legacy_wal_value ]]; then
+      legacy_wal_configured=true
+    fi
+    if [[ -d $legacy_wal_path && ! -L $legacy_wal_path ]]; then
+      legacy_wal_present=true
+      legacy_wal_bytes=$(directory_bytes "$legacy_wal_path")
+    fi
 
-    packaged_wal_helper=postgis/archive-wal.sh
     packaged_archive_helper=docker/oscar/archive-object-helper.sh
     packaged_prepare_restore_helper=postgis/prepare-restore.sh
-    packaged_merge_wal_restore_helper=postgis/merge-wal-restore.sh
     packaged_atomic_source=docker/oscar/atomic-publish.c
     packaged_entrypoint=docker/oscar/entrypoint.sh
-    [[ -f $packaged_wal_helper && ! -L $packaged_wal_helper &&
-       -f $packaged_archive_helper && ! -L $packaged_archive_helper &&
+    [[ -f $packaged_archive_helper && ! -L $packaged_archive_helper &&
        -f $packaged_prepare_restore_helper && ! -L $packaged_prepare_restore_helper &&
-       -f $packaged_merge_wal_restore_helper && ! -L $packaged_merge_wal_restore_helper &&
        -f $packaged_atomic_source && ! -L $packaged_atomic_source &&
        -f $packaged_entrypoint && ! -L $packaged_entrypoint ]] ||
       fail 'A packaged storage helper is missing, linked, or non-regular.'
-    packaged_wal_sha=$(sha256_file "$packaged_wal_helper")
     packaged_archive_sha=$(sha256_file "$packaged_archive_helper")
     packaged_prepare_restore_sha=$(sha256_file "$packaged_prepare_restore_helper")
-    packaged_merge_wal_restore_sha=$(sha256_file "$packaged_merge_wal_restore_helper")
     packaged_atomic_source_sha=$(sha256_file "$packaged_atomic_source")
     packaged_entrypoint_sha=$(sha256_file "$packaged_entrypoint")
     entrypoint_tmp_contract=false
     if entrypoint_has_managed_tmp_contract "$packaged_entrypoint"; then
       entrypoint_tmp_contract=true
-    fi
-    wal_publication_contract=false
-    if grep -Fq 'cmp -s -- "$source_path" "$destination"' "$packaged_wal_helper" &&
-       grep -Fq 'sync -d "$partial"' "$packaged_wal_helper" &&
-       grep -Fq 'if ln -- "$partial" "$destination"' "$packaged_wal_helper" &&
-       grep -Fq 'sync -d "$destination"' "$packaged_wal_helper" &&
-       grep -Fq 'sync -f "$archive_root"' "$packaged_wal_helper" &&
-       ! grep -Eq '^[[:space:]]*mv[[:space:]]+-n([[:space:]]|$)' "$packaged_wal_helper"; then
-      wal_publication_contract=true
     fi
     archive_export_helper_wired=false
     grep -Eq '^[[:space:]]+archive_object_helper copy "\$relative" "\$expected_sha" ro "\$partial"$' oscar-storage.sh &&
@@ -1182,30 +1148,23 @@ case $action in
     # remaining object rows and silently leave a multi-object plan partial.
     grep -Eq '^[[:space:]]+delete_outcome=\$\(archive_object_helper delete "\$relative" "\$expected_sha" rw </dev/null\)$' oscar-storage.sh &&
       archive_purge_helper_wired=true
-    wal_helper_regular=false
-    compose exec -T postgres sh -c 'test -f /usr/local/bin/oscar-archive-wal && test ! -L /usr/local/bin/oscar-archive-wal && test -x /usr/local/bin/oscar-archive-wal' && wal_helper_regular=true
     archive_helper_regular=false
     compose exec -T oscar sh -c 'test -f /usr/local/bin/oscar-archive-object && test ! -L /usr/local/bin/oscar-archive-object && test -x /usr/local/bin/oscar-archive-object' && archive_helper_regular=true
     prepare_restore_helper_regular=false
     compose exec -T postgres sh -c 'test -f /usr/local/bin/oscar-prepare-restore && test ! -L /usr/local/bin/oscar-prepare-restore && test -x /usr/local/bin/oscar-prepare-restore' && prepare_restore_helper_regular=true
-    merge_wal_restore_helper_regular=false
-    compose exec -T postgres sh -c 'test -f /usr/local/bin/oscar-merge-wal-restore && test ! -L /usr/local/bin/oscar-merge-wal-restore && test -x /usr/local/bin/oscar-merge-wal-restore' && merge_wal_restore_helper_regular=true
     atomic_publisher_regular=false
     compose exec -T oscar sh -c 'test -f /usr/local/bin/oscar-atomic-publish && test ! -L /usr/local/bin/oscar-atomic-publish && test -x /usr/local/bin/oscar-atomic-publish' && atomic_publisher_regular=true
     atomic_source_stamp_regular=false
     compose exec -T oscar sh -c 'test -f /usr/local/share/oscar-atomic-publish.source.sha256 && test ! -L /usr/local/share/oscar-atomic-publish.source.sha256' && atomic_source_stamp_regular=true
     entrypoint_regular=false
     compose exec -T oscar sh -c 'test -f /usr/local/bin/oscar-entrypoint && test ! -L /usr/local/bin/oscar-entrypoint && test -x /usr/local/bin/oscar-entrypoint' && entrypoint_regular=true
-    deployed_wal_sha=$(compose exec -T postgres sha256sum /usr/local/bin/oscar-archive-wal | awk '{print $1}')
     deployed_archive_sha=$(compose exec -T oscar sha256sum /usr/local/bin/oscar-archive-object | awk '{print $1}')
     deployed_prepare_restore_sha=$(compose exec -T postgres sha256sum /usr/local/bin/oscar-prepare-restore | awk '{print $1}')
-    deployed_merge_wal_restore_sha=$(compose exec -T postgres sha256sum /usr/local/bin/oscar-merge-wal-restore | awk '{print $1}')
     deployed_atomic_sha=$(compose exec -T oscar sha256sum /usr/local/bin/oscar-atomic-publish | awk '{print $1}')
     deployed_atomic_source_sha=$(compose exec -T oscar cat /usr/local/share/oscar-atomic-publish.source.sha256 | tr -d '[:space:]')
     deployed_entrypoint_sha=$(compose exec -T oscar sha256sum /usr/local/bin/oscar-entrypoint | awk '{print $1}')
-    for digest in "$packaged_wal_sha" "$packaged_archive_sha" "$packaged_prepare_restore_sha" \
-      "$packaged_merge_wal_restore_sha" "$packaged_atomic_source_sha" "$deployed_wal_sha" \
-      "$deployed_archive_sha" "$deployed_prepare_restore_sha" "$deployed_merge_wal_restore_sha" \
+    for digest in "$packaged_archive_sha" "$packaged_prepare_restore_sha" \
+      "$packaged_atomic_source_sha" "$deployed_archive_sha" "$deployed_prepare_restore_sha" \
       "$deployed_atomic_sha" "$deployed_atomic_source_sha" "$packaged_entrypoint_sha" \
       "$deployed_entrypoint_sha"; do
       [[ $digest =~ ^[0-9a-f]{64}$ ]] || fail 'A packaged/deployed storage helper has an invalid SHA-256 identity.'
@@ -1246,9 +1205,10 @@ case $action in
       atomic_behavior_tested=true
     fi
     archive_mode=$(scalar 'SHOW archive_mode;')
+    archive_timeout=$(scalar 'SHOW archive_timeout;')
     archive_command=$(psql_admin --tuples-only --no-align --command 'SHOW archive_command;' | sed -e 's/[[:space:]]*$//' | tail -n1)
-    expected_archive_command='/usr/local/bin/oscar-archive-wal "%p" "%f" /var/lib/postgresql/wal-archive'
-    archive_command_exact=false; [[ $archive_command == "$expected_archive_command" ]] && archive_command_exact=true
+    archive_command_inactive=false
+    [[ -z $archive_command || $archive_command == '(disabled)' ]] && archive_command_inactive=true
 
     case $(uname -s) in
       Linux) expected_lock_directory=/run/lock/oscar-storage ;;
@@ -1286,7 +1246,7 @@ case $action in
     fi
     rm -f -- "$lock_log"
     trap - EXIT
-    for value in "$deployment_id" "$archive_mode" "$expected_lock_directory" "$lock_directory" "$lock_file" \
+    for value in "$deployment_id" "$backup_mode" "$archive_mode" "$archive_timeout" "$archive_command" "$expected_lock_directory" "$lock_directory" "$lock_file" \
       "$lock_owner" "$lock_mode" "$lock_directory_owner" "$lock_directory_mode"; do safe_json_text "$value"; done
     images=$(compose config --images)
     app_image=''; postgis_image=''; gateway_image=''
@@ -1307,6 +1267,11 @@ case $action in
     app_container_id=$(container_image_id oscar); postgis_container_id=$(container_image_id postgres); gateway_container_id=$(container_image_id gateway)
     app_container=$(compose ps -q oscar)
     postgres_container=$(compose ps -q postgres)
+    external_wal_mount_absent=false
+    if ! docker inspect "$postgres_container" --format '{{range .Mounts}}{{println .Destination}}{{end}}' |
+         grep -Fqx /var/lib/postgresql/wal-archive; then
+      external_wal_mount_absent=true
+    fi
     container_entrypoint_exact=false
     [[ $(docker inspect "$app_container" --format '{{json .Config.Entrypoint}}') == \
       '["/usr/local/bin/oscar-entrypoint"]' ]] && container_entrypoint_exact=true
@@ -1518,19 +1483,20 @@ case $action in
     batch=false
     if [[ $batch_calls -gt 0 && $batch_rows -gt $batch_calls ]]; then batch=true; fi
     journal=true
-    printf '{"expectedRelease":"%s","configuredRelease":"%s","templateRelease":"%s","deploymentId":"%s",' \
-      "$expected_release" "$configured_release" "$template_release" "$deployment_id"
-    printf '"storageRoots":{"archive":%s,"backup":%s,"walArchive":%s},' \
-      "$archive_identity" "$backup_identity" "$wal_identity"
+    printf '{"expectedRelease":"%s","configuredRelease":"%s","templateRelease":"%s","deploymentId":"%s","backupMode":"%s",' \
+      "$expected_release" "$configured_release" "$template_release" "$deployment_id" "$backup_mode"
+    printf '"storageRoots":{"archive":%s,"backup":%s},' \
+      "$archive_identity" "$backup_identity"
     printf '"storageLock":{"directory":"%s","file":"%s","stablePath":%s,"private":%s,"behaviorTested":%s,"concurrentRejected":%s},' \
       "$lock_directory" "$lock_file" "$lock_path_stable" "$lock_private" "$lock_behavior_tested" "$concurrent_lock_rejected"
-    printf '"walArchive":{"archiveMode":"%s","archiveCommandExact":%s,"publicationContractExact":%s,"helperPath":"/usr/local/bin/oscar-archive-wal","packagedSha256":"%s","deployedSha256":"%s","regularExecutable":%s},' \
-      "$archive_mode" "$archive_command_exact" "$wal_publication_contract" "$packaged_wal_sha" "$deployed_wal_sha" "$wal_helper_regular"
+    printf '"postgresWal":{"archiveMode":"%s","archiveTimeout":"%s","archiveCommand":"%s","archiveCommandInactive":%s,"externalWalMountAbsent":%s},' \
+      "$archive_mode" "$archive_timeout" "$archive_command" "$archive_command_inactive" "$external_wal_mount_absent"
+    printf '"legacyWalArchive":{"configured":%s,"present":%s,"bytes":%s},' \
+      "$legacy_wal_configured" "$legacy_wal_present" "$legacy_wal_bytes"
     printf '"archiveObjectHelper":{"helperPath":"/usr/local/bin/oscar-archive-object","packagedSha256":"%s","deployedSha256":"%s","regularExecutable":%s,"cliExportIntegrated":%s,"cliPurgeIntegrated":%s},' \
       "$packaged_archive_sha" "$deployed_archive_sha" "$archive_helper_regular" "$archive_export_helper_wired" "$archive_purge_helper_wired"
-    printf '"restoreHelpers":{"prepare":{"helperPath":"/usr/local/bin/oscar-prepare-restore","packagedSha256":"%s","deployedSha256":"%s","regularExecutable":%s},"mergeWal":{"helperPath":"/usr/local/bin/oscar-merge-wal-restore","packagedSha256":"%s","deployedSha256":"%s","regularExecutable":%s}},' \
-      "$packaged_prepare_restore_sha" "$deployed_prepare_restore_sha" "$prepare_restore_helper_regular" \
-      "$packaged_merge_wal_restore_sha" "$deployed_merge_wal_restore_sha" "$merge_wal_restore_helper_regular"
+    printf '"restoreHelpers":{"prepare":{"helperPath":"/usr/local/bin/oscar-prepare-restore","packagedSha256":"%s","deployedSha256":"%s","regularExecutable":%s}},' \
+      "$packaged_prepare_restore_sha" "$deployed_prepare_restore_sha" "$prepare_restore_helper_regular"
     printf '"atomicPublisher":{"helperPath":"/usr/local/bin/oscar-atomic-publish","sourceStampPath":"/usr/local/share/oscar-atomic-publish.source.sha256","packagedSourceSha256":"%s","deployedSourceSha256":"%s","deployedBinarySha256":"%s","regularExecutable":%s,"sourceStampRegular":%s,"behaviorTested":%s,"firstPublishSucceeded":%s,"collisionRejected":%s,"sourcePreserved":%s,"destinationPreserved":%s},' \
       "$packaged_atomic_source_sha" "$deployed_atomic_source_sha" "$deployed_atomic_sha" \
       "$atomic_publisher_regular" "$atomic_source_stamp_regular" "$atomic_behavior_tested" \
@@ -1589,9 +1555,63 @@ case $action in
     retention_runtime_health_json
     ;;
 
+  backup-mode-check)
+    backup_mode=$(env_value OSCAR_BACKUP_MODE disabled)
+    [[ $backup_mode == disabled ]] || fail 'backup-mode-check is valid only for disabled mode.'
+    backup_path=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ../oscar-storage/backups)")
+    legacy_wal_value=$(awk -F= '$1 == "OSCAR_WAL_ARCHIVE_DIR" { print substr($0, index($0, "=") + 1); exit }' .env)
+    legacy_wal_path=$(absolute_path "${legacy_wal_value:-../oscar-storage/wal-archive}")
+    services_before=$(running_services_fingerprint)
+    backup_before=$(tree_fingerprint "$backup_path")
+    wal_before=$(tree_fingerprint "$legacy_wal_path")
+    wal_bytes_before=$(directory_bytes "$legacy_wal_path")
+    epochs_before=$(scalar 'SELECT count(*) FROM oscar_backup_epoch;')
+    work=$(mktemp -d /tmp/oscar-regression-disabled-backup.XXXXXXXX)
+    cleanup_disabled_backup_check() { rm -rf -- "$work"; }
+    trap cleanup_disabled_backup_check EXIT
+    expected_message='OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+    commands_rejected=true
+    index=0
+    while IFS= read -r command; do
+      index=$((index+1)); log="$work/$index.log"
+      set +e
+      bash -c "$command" >"$log" 2>&1
+      status=$?
+      set -e
+      if [[ $status -eq 0 || $(grep -Fxc "$expected_message" "$log") -ne 1 ]]; then
+        commands_rejected=false
+      fi
+    done <<'COMMANDS'
+bash oscar.sh backup
+bash oscar.sh backup-verify 20000101T000000Z-00000000
+bash oscar.sh backup-prune
+bash oscar.sh restore --backup 20000101T000000Z-00000000 --confirm 20000101T000000Z-00000000
+COMMANDS
+    # A forced segment switch proves that an inactive external WAL directory
+    # does not grow. The internal pg_wal volume is intentionally outside this
+    # fingerprint and remains PostgreSQL-managed.
+    scalar 'SELECT pg_switch_wal();' >/dev/null
+    sleep 2
+    services_after=$(running_services_fingerprint)
+    backup_after=$(tree_fingerprint "$backup_path")
+    wal_after=$(tree_fingerprint "$legacy_wal_path")
+    wal_bytes_after=$(directory_bytes "$legacy_wal_path")
+    epochs_after=$(scalar 'SELECT count(*) FROM oscar_backup_epoch;')
+    backup_unchanged=false; [[ $backup_before == "$backup_after" ]] && backup_unchanged=true
+    wal_unchanged=false
+    [[ $wal_before == "$wal_after" && $wal_bytes_before == "$wal_bytes_after" ]] && wal_unchanged=true
+    services_unchanged=false; [[ $services_before == "$services_after" ]] && services_unchanged=true
+    epochs_unchanged=false; [[ $epochs_before == "$epochs_after" ]] && epochs_unchanged=true
+    cleanup_disabled_backup_check
+    trap - EXIT
+    printf '{"mode":"disabled","commandsRejected":%s,"backupTreeUnchanged":%s,"legacyWalTreeUnchanged":%s,"legacyWalBytesBefore":%s,"legacyWalBytesAfter":%s,"servicesUnchanged":%s,"backupEpochsUnchanged":%s}\n' \
+      "$commands_rejected" "$backup_unchanged" "$wal_unchanged" "$wal_bytes_before" \
+      "$wal_bytes_after" "$services_unchanged" "$epochs_unchanged"
+    ;;
+
   snapshot)
-    archive_dir=$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ./data/archive)")
-    backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ./backups)")
+    archive_dir=$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ../oscar-storage/archive)")
+    backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ../oscar-storage/backups)")
     journal_bytes=$(compose exec -T oscar sh -c "du -sb /var/lib/oscar/files/.dailyfile-journal 2>/dev/null | awk '{print \$1+0}'" || echo 0)
     daily_bytes=$(compose exec -T oscar sh -c "du -sb /var/lib/oscar/files/dailyfiles 2>/dev/null | awk '{print \$1+0}'" || echo 0)
     media_bytes=$(compose exec -T oscar sh -c "du -sb /var/lib/oscar/files/videos/retained-media 2>/dev/null | awk '{print \$1+0}'" || echo 0)
@@ -1666,9 +1686,10 @@ case $action in
       emit_command_diagnostics 'OSCAR archive verification' "$archive_verify_log"
     fi
     archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ../oscar-storage/archive)")")
-    wal_archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_WAL_ARCHIVE_DIR ../oscar-storage/wal-archive)")")
     archive_partials=$(find "$archive_dir" -mindepth 1 \( -name '*.partial' -o -name '*.partial.*' -o -name '*.tmp' -o -name '*.tmp.*' \) -print | wc -l | tr -d '[:space:]')
-    wal_partials=$(find "$wal_archive_dir" -mindepth 1 \( -name '*.partial' -o -name '*.partial.*' -o -name '*.tmp' -o -name '*.tmp.*' \) -print | wc -l | tr -d '[:space:]')
+    # OSCAR 3.9.2 does not have an active external WAL archive. This retained
+    # field stays zero for report-schema compatibility.
+    wal_partials=0
     json_query "WITH generations AS (
         SELECT count(*) FILTER(WHERE state='ACTIVE') active,
           count(*) FILTER(WHERE state='SEALED') sealed,
@@ -2270,47 +2291,6 @@ case $action in
       "$generation" "$mismatch_rejected" "$traversal_rejected"
     ;;
 
-  wal-helper-check)
-    run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'
-    wal_name=$(printf '%s' "$run" | sha256sum | awk '{print toupper(substr($1,1,8)) ".history"}')
-    wal_root=/var/lib/postgresql/wal-archive
-    work="/tmp/oscar-regression-wal-$run"
-    wal_published=false
-    compose exec -T postgres sh -eu -c '
-      test ! -e "$2/$3" && test ! -L "$2/$3"
-      test ! -e "$1" && test ! -L "$1"
-      mkdir -m 0700 "$1"
-      printf "first:%s\n" "$4" >"$1/one"
-      printf "second:%s\n" "$4" >"$1/two"
-    ' wal-fixture "$work" "$wal_root" "$wal_name" "$run"
-    cleanup_wal_helper_fixture() {
-      compose exec -T postgres sh -eu -c '
-        case $1 in /tmp/oscar-regression-wal-*) rm -rf -- "$1" ;; *) exit 2 ;; esac
-        if [ "$4" = true ]; then rm -f -- "$2/$3"; fi
-        find "$2" -maxdepth 1 -type f -name ".$3.partial.*" -exec rm -f -- {} +
-      ' wal-cleanup "$work" "$wal_root" "$wal_name" "$wal_published" >/dev/null 2>&1 || true
-    }
-    trap cleanup_wal_helper_fixture EXIT
-    compose exec -T postgres /usr/local/bin/oscar-archive-wal "$work/one" "$wal_name" "$wal_root" >/dev/null
-    wal_published=true
-    compose exec -T postgres /usr/local/bin/oscar-archive-wal "$work/one" "$wal_name" "$wal_root" >/dev/null
-    mismatch_rejected=false
-    if ! compose exec -T postgres /usr/local/bin/oscar-archive-wal "$work/two" "$wal_name" "$wal_root" >/dev/null 2>&1; then
-      mismatch_rejected=true
-    fi
-    compose exec -T postgres cmp -s -- "$work/one" "$wal_root/$wal_name" ||
-      fail 'WAL helper mismatch attempt replaced the originally published bytes.'
-    helper_partials=$(compose exec -T postgres sh -c 'find "$1" -maxdepth 1 -type f -name ".$2.partial.*" -print | wc -l' \
-      wal-partials "$wal_root" "$wal_name" | tr -d '[:space:]')
-    [[ $helper_partials == 0 ]] || fail 'WAL helper left a synthetic partial artifact.'
-    cleanup_wal_helper_fixture
-    trap - EXIT
-    final_removed=false
-    compose exec -T postgres sh -c 'test ! -e "$1/$2" && test ! -L "$1/$2"' wal-clean "$wal_root" "$wal_name" && final_removed=true
-    printf '{"walName":"%s","published":true,"idempotentRetry":true,"mismatchRejected":%s,"originalPreserved":true,"partialArtifacts":%s,"fixtureRemoved":%s}\n' \
-      "$wal_name" "$mismatch_rejected" "$helper_partials" "$final_removed"
-    ;;
-
   fixture-hot-hold-create)
     run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
     generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
@@ -2470,6 +2450,8 @@ case $action in
     ;;
 
   backup-check)
+    [[ $(env_value OSCAR_BACKUP_MODE disabled) == single ]] ||
+      fail 'Backup certification requires OSCAR_BACKUP_MODE=single.'
     (($# > 0 && $# <= 8)) ||
       fail 'Backup certification requires one to eight exact retained-media set expectations.'
     backup_work=$(mktemp -d /tmp/oscar-regression-backup-check.XXXXXXXX)
@@ -2583,9 +2565,7 @@ case $action in
       "s#^Confirmed \([0-9][0-9]*\) daily-file lane/day publication(s) from verified backup $backup\$#\1#p")
     [[ $journal_confirmed_count =~ ^[0-9]+$ && $journal_confirmed_count -le 100000 ]] ||
       fail 'Backup command did not report one bounded daily-journal confirmation outcome.'
-    backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ./backups)")
-    retention=$(env_value OSCAR_BACKUP_RETENTION_COUNT 14)
-    verified=$(find "$backup_dir" -mindepth 2 -maxdepth 2 -type f -name VERIFIED | wc -l)
+    backup_dir=$(absolute_path "$(env_value OSCAR_BACKUP_DIR ../oscar-storage/backups)")
     root=$backup_dir/$backup
     for required in VERIFIED JOURNAL_CONFIRMED SHA256SUMS SHA256SUMS.hmac epoch.json image-inventory.txt; do
       [[ -f $root/$required && ! -L $root/$required && -s $root/$required ]] ||
@@ -2596,6 +2576,24 @@ case $action in
     backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
     [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file ]] ||
       fail 'Cannot independently authenticate the backup core.'
+    current=$backup_dir/CURRENT
+    [[ -f $current && ! -L $current && $(stat -c %u -- "$current") == 0 &&
+       $(stat -c %a -- "$current") == 600 &&
+       $(wc -l <"$current" | tr -d '[:space:]') == 4 &&
+       $(sed -n '1p' "$current") == format=oscar-current-backup &&
+       $(sed -n '2p' "$current") == version=1 &&
+       $(sed -n '3p' "$current") == "backup_id=$backup" &&
+       $(sed -n '4p' "$current") =~ ^hmac_sha256=[A-Za-z0-9+/]{43}=$ ]] ||
+      fail 'CURRENT does not safely and exactly identify the new single snapshot.'
+    current_expected=$(sed -n 's/^hmac_sha256=//p' "$current")
+    current_actual=$(sudo docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --user 0 --entrypoint sh \
+      --volume "$current:/current:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
+      "$app_image" -eu -c '
+        key=$(cat /backup-key.txt)
+        head -n 3 /current | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A
+      ' | tr -d '\r\n')
+    [[ $current_actual == "$current_expected" ]] || fail 'CURRENT HMAC authentication failed.'
     [[ $(verify_backup_core_authentication "$root" "$backup_key_file" "$app_image") == verified ]] ||
       fail 'Independent backup HMAC/checksum/inventory verification failed.'
     hmac=$(tr -d '\r\n' <"$root/SHA256SUMS.hmac")
@@ -2611,10 +2609,24 @@ case $action in
     epoch_state=$(awk -F'"' '/"state"/ {print $4; exit}' "$root/epoch.json")
     epoch_created=$(awk -F'"' '/"createdAt"/ {print $4; exit}' "$root/epoch.json")
     valid_uuid "$epoch_id" || fail 'Backup epoch UUID is invalid.'
-    [[ $epoch_backup == "$backup" && $epoch_format == oscar-backup-epoch && $epoch_version == 1 &&
+    [[ $epoch_backup == "$backup" && $epoch_format == oscar-backup-epoch && $epoch_version == 2 &&
           $epoch_release == 3.9.2 && $epoch_state == CREATED &&
           $epoch_created =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
       fail 'Backup epoch identity, format, state, or release is invalid.'
+    [[ ! -e $root/wal-archive.tar.gz && ! -L $root/wal-archive.tar.gz ]] ||
+      fail 'Schema-v2 backup unexpectedly contains cumulative wal-archive.tar.gz.'
+    [[ -d $root/postgres/pg_wal && ! -L $root/postgres/pg_wal &&
+       $(find "$root/postgres/pg_wal" -mindepth 1 -maxdepth 1 -type f -name '[0-9A-F][0-9A-F]*' -print | wc -l | tr -d '[:space:]') -gt 0 ]] ||
+      fail 'Schema-v2 base backup does not contain streamed WAL.'
+    schema2_count=0
+    while IFS= read -r candidate; do
+      candidate_version=$(awk -F'[: ,]+' '/"version"/ {print $3; exit}' "$candidate/epoch.json" 2>/dev/null || true)
+      [[ $candidate_version != 2 ]] || schema2_count=$((schema2_count+1))
+    done < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z-????????' -print)
+    [[ $schema2_count == 1 ]] || fail 'Single mode must retain exactly one committed schema-v2 snapshot.'
+    staging_count=$(find "$backup_dir" -mindepth 1 -maxdepth 1 \
+      \( -name '*.partial' -o -name '.CURRENT.tmp.*' -o -name '.deleting-*' \) -print | wc -l | tr -d '[:space:]')
+    [[ $staging_count == 0 ]] || fail 'Single-backup publication left staging or deletion artifacts.'
     oscar_state_sha=$(awk '$2=="./oscar-state.tar.gz" {print $1}' "$root/SHA256SUMS")
     [[ $oscar_state_sha =~ ^[0-9a-f]{64}$ ]] || fail 'Authenticated manifest has no unique OSCAR state checksum.'
     [[ $(awk '$2=="./oscar-state.tar.gz" {count++} END {print count+0}' "$root/SHA256SUMS") == 1 ]] ||
@@ -2857,533 +2869,197 @@ case $action in
     [[ $exact_retained_members == "$expected_member_count" &&
        $processed_indexes == "$processed_expected" && $deletion_indexes == "$deletion_expected" ]] ||
       fail 'Backup did not preserve the complete exact retained-media expectation inventory.'
+    atomic_state_machine_exact=false
+    if grep -Fq 'recover_single_backup_state "$image"' oscar-storage.sh &&
+       grep -Fq 'publish_export_directory "$work" "$final"' oscar-storage.sh &&
+       grep -Fq 'write_current_backup_pointer "$backup_id" "$image"' oscar-storage.sh &&
+       grep -Fq 'durably_flush_tree "$work"' oscar-storage.sh; then
+      atomic_state_machine_exact=true
+    fi
+    before_prune=$(tree_fingerprint "$backup_dir")
+    prune_log=$backup_work/backup-prune.log
+    set +e
+    sudo bash oscar.sh backup-prune >"$prune_log" 2>&1
+    prune_status=$?
+    set -e
+    prune_retired=false
+    if [[ $prune_status -ne 0 ]] &&
+       grep -Fq 'backup-prune is retired in single-backup mode' "$prune_log" &&
+       [[ $(tree_fingerprint "$backup_dir") == "$before_prune" ]]; then
+      prune_retired=true
+    fi
     cleanup_backup_check
     trap - EXIT
-    printf '{"backupId":"%s","automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"journalConfirmedPublications":%s,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"verifiedBackups":%s,"retentionLimit":%s,"retentionRespected":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
-      "$backup" "$journal_confirmed_count" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" "$verified" "$retention" "$([[ $verified -le $retention ]] && echo true || echo false)" \
+    printf '{"backupId":"%s","backupMode":"single","schemaVersion":2,"currentAuthenticated":true,"currentSnapshotCount":1,"walArchiveTarAbsent":true,"streamedWalPresent":true,"stagingArtifacts":0,"atomicStateMachineExact":%s,"pruneRetired":%s,"automaticVerification":true,"supportedVerification":true,"independentCoreAuthentication":true,"authenticatedManifest":true,"journalConfirmationAuthenticated":true,"journalConfirmedPublications":%s,"regularMarkers":true,"epochValid":true,"verifiedEpoch":%s,"archiveGenerationInventoryExact":true,"archiveGenerationCount":%s,"journalReceipts":%s,"journalReceiptReferencesValid":true,"journalReceiptSegmentsVerified":%s,"duckDbScratchExcluded":%s,"retainedMediaPrefixPresent":%s,"mediaMetadataCheckpointIncluded":%s,"processedObservationIndexesIncluded":%s,"deletionIndexesIncluded":%s,"retainedMediaManifestsIncluded":%s,"retainedMediaJpegsIncluded":%s,"retainedMediaExpectedSets":%s,"retainedMediaExpectedMembers":%s,"retainedMediaExactMembersVerified":%s,"expectedProcessedIndexes":%s,"expectedDeletionIndexes":%s,"backupMemberCount":%s,"restoreAttempted":false}\n' \
+      "$backup" "$atomic_state_machine_exact" "$prune_retired" "$journal_confirmed_count" "$([[ $epoch == 1 ]] && echo true || echo false)" "$generation_count" "$receipt_count" "$receipt_segments_verified" \
       "$duck_scratch_excluded" "$retained_prefix" "$checkpoint_included" "$processed_indexes" \
       "$deletion_indexes" "$retained_manifests" "$retained_jpegs" "$expected_sets" \
       "$expected_member_count" "$exact_retained_members" "$processed_expected" "$deletion_expected" "$member_count"
     ;;
 
   restore-drill)
-    run=${1:-}; confirmation=${2:-}; expected_archive=${3:-}; expected_wal=${4:-}; expected_backup=${5:-}
+    run=${1:-}; confirmation=${2:-}; expected_archive=${3:-}; expected_backup=${4:-}
     valid_run "$run" || fail 'Invalid restore-drill run ID.'
+    [[ $run =~ ^[A-Za-z0-9_]{1,96}$ ]] || fail 'Restore-drill run ID must be SQL-identifier safe.'
     [[ $confirmation == "$run:DESTRUCTIVE-RESTORE" ]] ||
       fail 'Restore drill is destructive and requires the exact per-run confirmation token.'
-    [[ $(env_value OSCAR_VERSION missing) == 3.9.2 ]] || fail 'Restore drill requires OSCAR_VERSION=3.9.2.'
-    for expected in "$expected_archive" "$expected_wal" "$expected_backup"; do
+    [[ $(env_value OSCAR_VERSION missing) == 3.9.2 &&
+       $(env_value OSCAR_BACKUP_MODE disabled) == single ]] ||
+      fail 'Restore drill requires OSCAR 3.9.2 with OSCAR_BACKUP_MODE=single.'
+    for expected in "$expected_archive" "$expected_backup"; do
       [[ $expected == /* && $expected != / && $expected =~ ^/[A-Za-z0-9._/-]+$ ]] ||
-        fail 'Restore drill requires three canonical acknowledged storage paths.'
+        fail 'Restore drill requires two canonical acknowledged storage paths.'
     done
-    archive_dir=$(canonical_directory "$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ./data/archive)")")
-    wal_dir=$(canonical_directory "$(absolute_path "$(env_value OSCAR_WAL_ARCHIVE_DIR ./data/wal-archive)")")
-    backup_dir=$(canonical_directory "$(absolute_path "$(env_value OSCAR_BACKUP_DIR ./backups)")")
-    [[ $archive_dir == "$expected_archive" && $wal_dir == "$expected_wal" && $backup_dir == "$expected_backup" ]] ||
-      fail 'Restore storage planes do not exactly match the acknowledged archive/WAL/backup paths.'
-    if paths_overlap "$archive_dir" "$wal_dir" || paths_overlap "$archive_dir" "$backup_dir" ||
-       paths_overlap "$wal_dir" "$backup_dir"; then
-      fail 'Restore archive, WAL, and backup directories must be distinct, non-overlapping planes.'
+    archive_dir=$(canonical_directory "$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ../oscar-storage/archive)")")
+    backup_dir=$(canonical_directory "$(absolute_path "$(env_value OSCAR_BACKUP_DIR ../oscar-storage/backups)")")
+    [[ $archive_dir == "$expected_archive" && $backup_dir == "$expected_backup" ]] ||
+      fail 'Restore storage planes do not exactly match the acknowledged archive/backup paths.'
+    ! paths_overlap "$archive_dir" "$backup_dir" ||
+      fail 'Restore archive and backup directories must be distinct, non-overlapping planes.'
+    postgres_container=$(compose ps -q postgres)
+    if docker inspect "$postgres_container" --format '{{range .Mounts}}{{println .Destination}}{{end}}' |
+       grep -Fqx /var/lib/postgresql/wal-archive; then
+      fail 'Restore drill refuses a PostgreSQL container with an external WAL archive mount.'
     fi
-    ensure_fixture_table
-    marker="$run:before"
-    mutated="$run:after"
+    archive_mode=$(scalar 'SHOW archive_mode;')
+    archive_timeout=$(scalar 'SHOW archive_timeout;')
+    archive_command=$(psql_admin --tuples-only --no-align --command 'SHOW archive_command;' | sed -e 's/[[:space:]]*$//' | tail -n1)
+    [[ $archive_mode == off && $archive_timeout == 0 &&
+       ( -z $archive_command || $archive_command == '(disabled)' ) ]] ||
+      fail 'Restore drill requires inactive PostgreSQL WAL archiving.'
+
+    marker="$run-before"; mutated="$run-after"; durable="$run-durable"
     state_relative="files/.restore-regression/$run.canary"
-    archive_canary_day=$(date -u +%F)
-    archive_canary_profile="restore_$run"
-    archive_canary_parent="$archive_dir/datasets/observations/date=$archive_canary_day"
-    archive_canary="$archive_canary_parent/profile=$archive_canary_profile"
-    secret_canary="$release_dir/secrets/oscar-admin-password.txt"
-    tls_canary="$release_dir/tls/server.crt"
-    env_canary="# OSCAR_RESTORE_DRILL_CANARY=$marker"
-    env_mutated="# OSCAR_RESTORE_DRILL_CANARY=$mutated"
-    umask 077
-    secret_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-admin-password"
-    tls_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-server-cert"
-    failure_bundle="/var/tmp/oscar-regression-restore-failure-$run"
-    if ! stale_restore_stage=$(find "$release_dir" -mindepth 1 -maxdepth 1 \
-        -name '.oscar-regression-restore-stage-*' -print -quit); then
-      fail 'Could not inspect the release root for stale restore staging entries.'
-    fi
-    [[ -z $stale_restore_stage ]] ||
-      fail 'A stale root-level restore staging entry exists; recover it before another drill.'
-    [[ ! -e $secret_restore_stage && ! -L $secret_restore_stage &&
-       ! -e $tls_restore_stage && ! -L $tls_restore_stage ]] ||
-      fail 'A root-level restore staging path already exists; investigate a prior interrupted run.'
-    [[ ! -e $failure_bundle && ! -L $failure_bundle ]] ||
-      fail 'A restore-drill failure bundle already exists for this run ID.'
-    restore_work=$(mktemp -d "/tmp/oscar-regression-restore-$run.XXXXXXXX")
-    wal_baseline=$restore_work/source-wal.sha256
-    secret_original=$restore_work/oscar-admin-password.original
-    tls_original=$restore_work/server.crt.original
-    private_originals_ready=false
-    credentials_mutated=false
-    credential_files_replaced=false
-    restore_drill_verified=false
-
-    restore_private_original() {
-      local source=$1 target=$2 temporary=$3 source_sha source_metadata
-      [[ -f $source && ! -L $source && -d ${target%/*} && ! -L ${target%/*} &&
-         ${temporary%/*} == "$release_dir" ]] || return 1
-      [[ ! -e $temporary && ! -L $temporary ]] || return 1
-      source_sha=$(sha256_file "$source")
-      source_metadata=$(stat -c '%u:%g:%a' -- "$source")
-      [[ $source_sha =~ ^[0-9a-f]{64}$ && $source_metadata =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ ]] ||
-        return 1
-      if [[ -f $target && ! -L $target ]] &&
-         cmp -s -- "$source" "$target" &&
-         [[ $(sha256_file "$target") == "$source_sha" &&
-            $(stat -c '%u:%g:%a' -- "$target") == "$source_metadata" ]]; then
-        return 0
-      fi
-      if ! install -o 0 -g 0 -m 0600 -- "$source" "$temporary" ||
-         [[ ! -f $temporary || -L $temporary ]] ||
-         ! cmp -s -- "$source" "$temporary" ||
-         [[ $(sha256_file "$temporary") != "$source_sha" ]] ||
-         [[ $(stat -c '%u:%g:%a' -- "$temporary") != 0:0:600 ]] ||
-         ! mv -fT -- "$temporary" "$target" ||
-         ! chown --reference="$source" -- "$target" ||
-         ! chmod --reference="$source" -- "$target" ||
-         [[ ! -f $target || -L $target ]] ||
-         ! cmp -s -- "$source" "$target" ||
-         [[ $(sha256_file "$target") != "$source_sha" ]] ||
-         [[ $(stat -c '%u:%g:%a' -- "$target") != "$source_metadata" ]]; then
-        rm -f -- "$temporary"
-        return 1
-      fi
-      credential_files_replaced=true
-      return 0
-    }
-
-    oscar_services_healthy() {
-      local service container state health
-      for service in gateway oscar postgres; do
-        container=$(compose ps -q "$service" 2>/dev/null) || return 1
-        [[ $container =~ ^[0-9a-f]{64}$ ]] || return 1
-        state=$(docker inspect "$container" --format '{{.State.Status}}' 2>/dev/null) || return 1
-        health=$(docker inspect "$container" \
-          --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null) ||
-          return 1
-        [[ $state == running && $health == healthy ]] || return 1
-      done
-      return 0
-    }
-
-    preserve_restore_diagnostics() {
-      local source destination name
-      [[ ! -e $failure_bundle && ! -L $failure_bundle ]] || return 1
-      mkdir -m 0700 -- "$failure_bundle" || return 1
-      chown 0:0 -- "$failure_bundle" && chmod 0700 -- "$failure_bundle" || return 1
-      for source in "$wal_baseline" "$restore_work/backup-verify.log" \
-                    "$restore_work/pre-restore-expected.tsv" "$restore_work/restore.log" \
-                    "$restore_work/archive-verify.log" "$restore_work/pre-restore-actual.tsv" \
-                    "$restore_work/credential-recovery-force-recreate.log" \
-                    "$restore_work/credential-recovery-restart.log"; do
-        [[ -f $source && ! -L $source ]] || continue
-        name=${source##*/}
-        destination=$failure_bundle/$name
-        case $name in
-          *.log) tail -c 1048576 -- "$source" >"$destination" || return 1 ;;
-          *) head -c 4194304 -- "$source" >"$destination" || return 1 ;;
-        esac
-        chown 0:0 -- "$destination" && chmod 0600 -- "$destination" || return 1
-      done
-      printf 'run=%s\nbackup=%s\nrelease=%s\n' \
-        "$run" "${backup:-unavailable}" "$release_dir" >"$failure_bundle/summary.txt" || return 1
-      chown 0:0 -- "$failure_bundle/summary.txt" &&
-        chmod 0600 -- "$failure_bundle/summary.txt" || return 1
-      [[ $(stat -c '%u:%g:%a' -- "$failure_bundle") == 0:0:700 ]] || return 1
-      return 0
-    }
-
-    cleanup_restore_drill() {
-      local original_status=$? had_errexit=false credential_recovery_failed=false
-      local cleanup_failed=false diagnostics_failed=false fixture_remaining marker_status
-      local credential_restart_log
-      [[ $- == *e* ]] && had_errexit=true
-      trap - EXIT
+    archive_day=$(date -u +%F)
+    archive_observations="$archive_dir/datasets/observations"
+    archive_day_root="$archive_observations/date=$archive_day"
+    archive_canary="$archive_day_root/profile=restore_$run"
+    safety=''
+    cleanup_new_restore_drill() {
       set +e
-      if $credentials_mutated; then
-        if ! $private_originals_ready; then
-          credential_recovery_failed=true
-        else
-          restore_private_original "$secret_original" "$secret_canary" "$secret_restore_stage" ||
-            credential_recovery_failed=true
-          restore_private_original "$tls_original" "$tls_canary" "$tls_restore_stage" ||
-            credential_recovery_failed=true
-        fi
-      fi
-      rm -f -- "$secret_restore_stage" "$tls_restore_stage" 2>/dev/null
-      if [[ -e $secret_restore_stage || -L $secret_restore_stage ||
-            -e $tls_restore_stage || -L $tls_restore_stage ]]; then
-        credential_recovery_failed=true
-      fi
-      if $credentials_mutated && ! $credential_recovery_failed; then
-        if $credential_files_replaced; then
-          credential_restart_log=$restore_work/credential-recovery-force-recreate.log
-          if ! compose up --detach --force-recreate --no-deps --no-build --pull never \
-              --wait --wait-timeout 240 oscar gateway >"$credential_restart_log" 2>&1; then
-            emit_command_diagnostics 'OSCAR credential-recovery force recreation' \
-              "$credential_restart_log"
-            credential_recovery_failed=true
-          fi
-        elif ! oscar_services_healthy; then
-          credential_restart_log=$restore_work/credential-recovery-restart.log
-          if ! sudo bash oscar.sh restart >"$credential_restart_log" 2>&1; then
-            emit_command_diagnostics 'OSCAR credential-recovery restart' "$credential_restart_log"
-            credential_recovery_failed=true
-          fi
-        fi
-        if ! $credential_recovery_failed; then
-          for _ in {1..30}; do
-            oscar_services_healthy && break
-            sleep 2
-          done
-        fi
-        oscar_services_healthy || credential_recovery_failed=true
-      fi
-      if compose ps --status running --services 2>/dev/null | grep -Fxq postgres; then
-        if ! psql_admin --command "DELETE FROM oscar_regression_fixture WHERE run_id='$run';" \
-            >/dev/null 2>&1 ||
-           ! fixture_remaining=$(scalar \
-             "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';" 2>/dev/null) ||
-           [[ $fixture_remaining != 0 ]]; then
-          cleanup_failed=true
-        fi
-      else
-        cleanup_failed=true
-      fi
-      if compose ps --status running --services 2>/dev/null | grep -Fxq oscar; then
-        if ! compose exec -T oscar sh -eu -c \
-             'rm -f -- "/var/lib/oscar/$1"; test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"; rmdir /var/lib/oscar/files/.restore-regression 2>/dev/null || true' \
-             cleanup "$state_relative" >/dev/null 2>&1; then
-          cleanup_failed=true
-        fi
-      else
-        cleanup_failed=true
-      fi
-      rmdir -- "$archive_canary" 2>/dev/null || true
-      [[ ! -e $archive_canary && ! -L $archive_canary ]] || cleanup_failed=true
-      rmdir -- "$archive_canary_parent" "$archive_dir/datasets/observations" \
+      psql_admin --command "DROP TABLE IF EXISTS oscar_restore_regression_$run;" >/dev/null 2>&1
+      compose exec -T oscar sh -c 'rm -f -- "/var/lib/oscar/$1"; rmdir -- /var/lib/oscar/files/.restore-regression 2>/dev/null || true' cleanup "$state_relative" >/dev/null 2>&1
+      rmdir -- "$archive_canary" "$archive_day_root" "$archive_observations" \
         "$archive_dir/datasets" 2>/dev/null || true
-      if ! sed -i "/^# OSCAR_RESTORE_DRILL_CANARY=$run:/d" .env 2>/dev/null; then
-        cleanup_failed=true
-      else
-        marker_status=0
-        grep -Eq "^# OSCAR_RESTORE_DRILL_CANARY=$run:" .env 2>/dev/null || marker_status=$?
-        [[ $marker_status == 1 ]] || cleanup_failed=true
-      fi
-      if ! $credential_recovery_failed; then
-        rm -f -- "$secret_original" "$tls_original" 2>/dev/null
-        if [[ -e $secret_original || -L $secret_original ||
-              -e $tls_original || -L $tls_original ]]; then
-          credential_recovery_failed=true
-        fi
-      fi
-      if $credential_recovery_failed; then
-        chown -R 0:0 -- "$restore_work" 2>/dev/null || true
-        chmod 0700 -- "$restore_work" 2>/dev/null || true
-        printf 'Restore-drill credential recovery failed; private originals retained at %s\n' \
-          "$restore_work" >&2
-      elif ((original_status != 0)) || ! $restore_drill_verified || $cleanup_failed; then
-        if preserve_restore_diagnostics; then
-          rm -rf -- "$restore_work"
-          if [[ -e $restore_work || -L $restore_work ]]; then
-            diagnostics_failed=true
-            printf 'Restore-drill workspace deletion failed after preserving diagnostics: %s\n' \
-              "$restore_work" >&2
-          else
-            printf 'Restore-drill failure diagnostics retained at %s\n' "$failure_bundle" >&2
-          fi
-        else
-          diagnostics_failed=true
-          chown -R 0:0 -- "$restore_work" 2>/dev/null || true
-          chmod 0700 -- "$restore_work" 2>/dev/null || true
-          printf 'Restore-drill diagnostics preservation failed; bounded source workspace retained at %s\n' \
-            "$restore_work" >&2
-        fi
-      else
-        rm -rf -- "$restore_work"
-        if [[ -e $restore_work || -L $restore_work ]]; then
-          cleanup_failed=true
-          printf 'Restore-drill workspace cleanup failed: %s\n' "$restore_work" >&2
-        fi
-      fi
-      $had_errexit && set -e
-      if ((original_status != 0)); then return "$original_status"; fi
-      if $credential_recovery_failed || $cleanup_failed || $diagnostics_failed; then return 1; fi
-      return 0
+      set -e
     }
-
-    trap cleanup_restore_drill EXIT
-    chmod 0700 -- "$restore_work"
-    : >"$wal_baseline"
-    [[ -f $secret_canary && ! -L $secret_canary && -s $secret_canary &&
-       -f $tls_canary && ! -L $tls_canary && -s $tls_canary ]] ||
-      fail 'Restore drill requires the existing approved admin-password and server-certificate files.'
-    cp --preserve=mode,ownership,timestamps -- "$secret_canary" "$secret_original"
-    cp --preserve=mode,ownership,timestamps -- "$tls_canary" "$tls_original"
-    secret_original_sha=$(sha256_file "$secret_original")
-    tls_original_sha=$(sha256_file "$tls_original")
-    secret_original_metadata=$(stat -c '%u:%g:%a' -- "$secret_canary")
-    tls_original_metadata=$(stat -c '%u:%g:%a' -- "$tls_canary")
-    [[ $secret_original_sha =~ ^[0-9a-f]{64}$ && $tls_original_sha =~ ^[0-9a-f]{64}$ &&
-       $secret_original_metadata =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ &&
-       $tls_original_metadata =~ ^[0-9]+:[0-9]+:[0-7]{3,4}$ ]] ||
-      fail 'Restore drill could not snapshot the approved credential canaries.'
-    private_originals_ready=true
-    compose exec -T oscar sh -eu -c 'test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"' \
-      canary "$state_relative" || fail 'An application-state restore-drill canary already exists.'
-    [[ ! -e $archive_canary && ! -L $archive_canary ]] ||
-      fail 'A restore-drill canary already exists; investigate a prior interrupted run.'
-    [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';") == 0 ]] ||
-      fail 'Restore-drill run ID already exists in the fixture registry.'
-    grep -Fq 'OSCAR_RESTORE_DRILL_CANARY=' .env &&
-      fail 'The deployment .env contains an unresolved restore-drill canary.'
-    # A registered database row plus canaries in each replaceable storage plane
-    # prove that restore replaces, rather than merely restarts, PostgreSQL,
-    # application state, archive, and deployment credentials. WAL is append-only;
-    # real switched segments below prove both backup-era and post-backup preservation.
-    canary_hex=$(printf '%s' "$run" | sha256sum | cut -c1-14)
-    canary_id=$((16#$canary_hex))
-    ((canary_id > 0)) || fail 'Could not derive a unique restore-drill database canary.'
-    psql_admin --command "INSERT INTO oscar_regression_fixture(run_id,cold_id,hot_id,datastream_id,cold_time,hot_time)
-      VALUES('$run',-$canary_id,-$((canary_id + 1)),1,now(),now());" >/dev/null
-    psql_admin --command "ALTER TABLE oscar_regression_fixture ADD COLUMN IF NOT EXISTS restore_marker text;
-      UPDATE oscar_regression_fixture SET restore_marker='$marker' WHERE run_id='$run';" >/dev/null
-    compose exec -T oscar sh -eu -c 'mkdir -p /var/lib/oscar/files/.restore-regression; printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$marker"
-    ensure_restore_archive_canary_hierarchy 10001 10001 \
-      "$archive_dir/datasets" \
-      "$archive_dir/datasets/observations" \
-      "$archive_canary_parent" \
-      "$archive_canary"
-    printf '%s\n' "$env_canary" >>.env
-
-    # Force and retain at least one source-timeline WAL object, then fingerprint every
-    # source-timeline segment that the coordinated backup must capture. Restore must
-    # preserve these immutable objects while archiving onto a newly promoted timeline.
-    source_timeline=$(scalar "SELECT timeline_id FROM pg_control_checkpoint();")
-    [[ $source_timeline =~ ^[1-9][0-9]{0,9}$ ]] || fail 'Could not determine the source PostgreSQL timeline.'
-    source_prefix=$(printf '%08X' "$source_timeline")
-    source_segment=$(scalar 'SELECT pg_walfile_name(pg_switch_wal());')
-    [[ $source_segment =~ ^${source_prefix}[0-9A-F]{16}$ ]] ||
-      fail 'PostgreSQL returned a WAL segment outside the source timeline.'
-    source_archiver_failures=$(scalar 'SELECT failed_count FROM pg_stat_archiver;')
-    for _ in {1..30}; do
-      [[ -f $wal_dir/$source_segment && ! -L $wal_dir/$source_segment ]] && break
-      [[ $(scalar 'SELECT failed_count FROM pg_stat_archiver;') == "$source_archiver_failures" ]] ||
-        fail 'PostgreSQL WAL archival failed while establishing the restore baseline.'
-      sleep 1
+    trap cleanup_new_restore_drill EXIT
+    psql_admin --command "CREATE TABLE oscar_restore_regression_$run (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO oscar_restore_regression_$run VALUES (1,'$marker');" >/dev/null
+    compose exec -T oscar sh -eu -c 'path=/var/lib/oscar/$1; mkdir -p -- "${path%/*}"; printf "%s\n" "$2" >"$path"' restore-state "$state_relative" "$marker"
+    for directory in "$archive_dir/datasets" "$archive_observations" "$archive_day_root" "$archive_canary"; do
+      if [[ ! -e $directory && ! -L $directory ]]; then
+        install -d -o 10001 -g 10001 -m 0750 -- "$directory"
+      fi
+      [[ -d $directory && ! -L $directory && $(stat -c '%u:%g' -- "$directory") == 10001:10001 ]] ||
+        fail 'Restore archive canary hierarchy is unsafe.'
     done
-    [[ -f $wal_dir/$source_segment && ! -L $wal_dir/$source_segment ]] ||
-      fail 'Source-timeline WAL was not archived before the coordinated backup.'
-    : >"$wal_baseline"
-    while IFS= read -r -d '' source_wal; do
-      source_name=${source_wal##*/}
-      [[ $source_name =~ ^${source_prefix}[0-9A-F]{16}$ ]] || continue
-      printf '%s  %s\n' "$(sha256_file "$source_wal")" "$source_name" >>"$wal_baseline"
-    done < <(find "$wal_dir" -mindepth 1 -maxdepth 1 -type f -print0)
-    sort -o "$wal_baseline" "$wal_baseline"
-    [[ -s $wal_baseline ]] || fail 'No source-timeline WAL objects were available for restore preservation proof.'
-
-    backup_output=$(sudo bash oscar.sh backup)
-    backup=$(printf '%s' "$backup_output" | sed -n 's#^Backup created: .*/##p' | tail -n1)
-    [[ $backup =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]] || fail 'Restore drill could not create a backup.'
-    backup_root=$backup_dir/$backup
-    backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
+    source_timeline=$(scalar 'SELECT timeline_id FROM pg_control_checkpoint();')
+    output=$(sudo bash oscar.sh backup)
+    backup=$(printf '%s' "$output" | sed -n 's#^Backup created: .*/##p' | tail -n1)
+    [[ $backup =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$ ]] ||
+      fail 'Restore drill backup did not return a canonical ID.'
+    root="$backup_dir/$backup"
+    [[ $(sed -n '3p' "$backup_dir/CURRENT") == "backup_id=$backup" &&
+       $(awk -F'[: ,]+' '/"version"/ {print $3; exit}' "$root/epoch.json") == 2 &&
+       ! -e $root/wal-archive.tar.gz && ! -L $root/wal-archive.tar.gz ]] ||
+      fail 'Restore drill did not create the authenticated schema-v2 CURRENT snapshot.'
+    sudo bash oscar.sh backup-verify "$backup" >/dev/null
+    psql_admin --command "UPDATE oscar_restore_regression_$run SET marker='$mutated' WHERE id=1;" >/dev/null
+    compose exec -T oscar sh -eu -c 'printf "%s\n" "$2" >"/var/lib/oscar/$1"' mutate-state "$state_relative" "$mutated"
+    rmdir -- "$archive_canary" || fail 'Could not mutate the pre-backup archive canary.'
+    restore_log=$(mktemp /tmp/oscar-regression-restore.XXXXXXXX)
+    if ! sudo bash oscar.sh restore --backup "$backup" --confirm "$backup" >"$restore_log" 2>&1; then
+      emit_command_diagnostics 'OSCAR self-contained restore' "$restore_log"
+      rm -f -- "$restore_log"
+      fail 'Supported self-contained restore failed.'
+    fi
+    safety=$(sed -n 's#^Restore complete. Pre-restore deployment credentials were preserved at ##p' "$restore_log" | tail -n1)
+    rm -f -- "$restore_log"
+    [[ $safety == "$release_dir/pre-restore-$backup" && -d $safety && ! -L $safety &&
+       $(stat -c '%u:%g:%a' -- "$safety") == 0:0:700 &&
+       -f $safety/.env && ! -L $safety/.env &&
+       -d $safety/secrets && ! -L $safety/secrets && -d $safety/tls && ! -L $safety/tls &&
+       -z $(find "$safety/.env" "$safety/secrets" "$safety/tls" -type l -print -quit) ]] ||
+      fail 'Restore did not preserve its pre-restore credential safety copy.'
+    pre_restore_safety_copy_verified=true
+    database_restored=false
+    [[ $(scalar "SELECT marker FROM oscar_restore_regression_$run WHERE id=1;") == "$marker" ]] && database_restored=true
+    state_restored=false
+    [[ $(compose exec -T oscar sh -c 'cat "/var/lib/oscar/$1"' read-state "$state_relative" | tr -d '\r\n') == "$marker" ]] && state_restored=true
+    archive_restored=false
+    [[ -d $archive_canary && ! -L $archive_canary ]] && archive_restored=true
+    restored_timeline=$(scalar 'SELECT timeline_id FROM pg_control_checkpoint();')
+    fresh_timeline=false
+    [[ $source_timeline =~ ^[1-9][0-9]*$ && $restored_timeline =~ ^[1-9][0-9]*$ &&
+       $restored_timeline -gt $source_timeline ]] && fresh_timeline=true
+    recovery_settings_cleared=false
+    if [[ $(scalar 'SELECT NOT pg_is_in_recovery();') == t ]] &&
+       compose exec -T postgres sh -c 'test ! -e /var/lib/postgresql/data/recovery.signal && test ! -e /var/lib/postgresql/data/standby.signal'; then
+      recovery_settings_cleared=true
+    fi
+    psql_admin --command "INSERT INTO oscar_restore_regression_$run VALUES (2,'$durable'); CHECKPOINT;" >/dev/null
+    compose restart postgres >/dev/null
+    compose up --detach --no-deps --no-build --pull never --wait --wait-timeout 300 postgres >/dev/null
+    post_promotion_write_durable=false
+    [[ $(scalar "SELECT marker FROM oscar_restore_regression_$run WHERE id=2;") == "$durable" ]] &&
+      post_promotion_write_durable=true
+    services_healthy=true
+    for service in gateway oscar postgres; do
+      container=$(compose ps -q "$service")
+      [[ $container =~ ^[0-9a-f]{12,64}$ &&
+         $(docker inspect "$container" --format '{{.State.Status}}') == running &&
+         $(docker inspect "$container" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}') == healthy ]] ||
+        services_healthy=false
+    done
+    credentials_restored=false
+    if $services_healthy && [[ -s $release_dir/.env && ! -L $release_dir/.env &&
+         -d $release_dir/secrets && ! -L $release_dir/secrets &&
+         -d $release_dir/tls && ! -L $release_dir/tls ]]; then
+      credentials_restored=true
+    fi
+    archive_verified=false
+    sudo bash oscar.sh archive verify >/dev/null 2>&1 && archive_verified=true
+    sudo bash oscar.sh backup-verify "$backup" >/dev/null
     app_image=''
     while IFS= read -r candidate_image; do
       case $candidate_image in
         oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$candidate_image ;;
       esac
     done < <(compose config --images)
+    backup_key_file=$(absolute_path "$(env_value OSCAR_BACKUP_KEY_FILE ./secrets/backup-key.txt)")
+    current="$backup_dir/CURRENT"
     [[ -n $app_image && -f $backup_key_file && ! -L $backup_key_file &&
-       $(verify_backup_core_authentication "$backup_root" "$backup_key_file" "$app_image") == verified ]] ||
-      fail 'Restore drill backup failed independent core authentication.'
-    authenticated_backup_reverified=true
-    restore_backup_verify_log=$restore_work/backup-verify.log
-    if ! sudo bash oscar.sh backup-verify "$backup" >"$restore_backup_verify_log" 2>&1; then
-      emit_command_diagnostics 'OSCAR restore-drill backup verification' "$restore_backup_verify_log"
-      fail 'Restore drill refused a backup that failed supported verification.'
-    fi
-
-    psql_admin --command "UPDATE oscar_regression_fixture SET restore_marker='$mutated' WHERE run_id='$run';" >/dev/null
-    future_segment=$(scalar 'SELECT pg_walfile_name(pg_switch_wal());')
-    [[ $future_segment =~ ^${source_prefix}[0-9A-F]{16}$ ]] ||
-      fail 'Post-backup mutation did not produce source-timeline WAL.'
-    future_archiver_failures=$(scalar 'SELECT failed_count FROM pg_stat_archiver;')
-    for _ in {1..30}; do
-      [[ -f $wal_dir/$future_segment && ! -L $wal_dir/$future_segment ]] && break
-      [[ $(scalar 'SELECT failed_count FROM pg_stat_archiver;') == "$future_archiver_failures" ]] ||
-        fail 'PostgreSQL WAL archival failed while establishing the post-backup preservation canary.'
-      sleep 1
-    done
-    [[ -f $wal_dir/$future_segment && ! -L $wal_dir/$future_segment ]] ||
-      fail 'Post-backup source-timeline WAL was not archived before restore.'
-    future_segment_sha=$(sha256_file "$wal_dir/$future_segment")
-    compose exec -T oscar sh -eu -c 'printf "%s\n" "$2" >"/var/lib/oscar/$1"' canary "$state_relative" "$mutated"
-    rmdir -- "$archive_canary" || fail 'Could not remove the empty post-backup archive directory canary.'
-    [[ -f $secret_canary && ! -L $secret_canary && -f $tls_canary && ! -L $tls_canary ]] ||
-      fail 'Approved credential canaries became unsafe before post-backup mutation.'
-    credentials_mutated=true
-    printf '%s\n' "$mutated" >"$secret_canary"
-    printf '%s\n' "$mutated" >"$tls_canary"
-    sed -i "s|^# OSCAR_RESTORE_DRILL_CANARY=$marker$|$env_mutated|" .env
-    grep -Fqx "$env_mutated" .env || fail 'Could not mutate the restore-drill deployment canary.'
-    expected_safety_inventory=$restore_work/pre-restore-expected.tsv
-    credential_tree_inventory "$release_dir" "$expected_safety_inventory" ||
-      fail 'Could not capture the exact mutated credential tree before restore.'
-
-    restore_log=$restore_work/restore.log
-    if ! sudo bash oscar.sh restore --backup "$backup" --confirm "$backup" >"$restore_log" 2>&1; then
-      emit_command_diagnostics 'OSCAR destructive restore' "$restore_log"
-      fail 'OSCAR restore command failed.'
-    fi
-    database_restored=false
-    [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run' AND restore_marker='$marker';") == 1 ]] && database_restored=true
-    state_restored=false
-    [[ $(compose exec -T oscar sh -c "cat -- '/var/lib/oscar/$state_relative'" 2>/dev/null || true) == "$marker" ]] && state_restored=true
-    archive_restored=false; [[ -d $archive_canary && ! -L $archive_canary ]] && archive_restored=true
-    credentials_restored=false
-    if [[ -f $secret_canary && ! -L $secret_canary && -f $tls_canary && ! -L $tls_canary &&
-          $(sha256_file "$secret_canary") == "$secret_original_sha" &&
-          $(sha256_file "$tls_canary") == "$tls_original_sha" &&
-          $(stat -c '%u:%g:%a' -- "$secret_canary") == "$secret_original_metadata" &&
-          $(stat -c '%u:%g:%a' -- "$tls_canary") == "$tls_original_metadata" ]] &&
-       cmp -s -- "$secret_original" "$secret_canary" &&
-       cmp -s -- "$tls_original" "$tls_canary" &&
-       [[ $(grep -Fxc "$env_canary" .env) == 1 ]]; then credentials_restored=true; fi
-    services_healthy=true
-    for service in gateway oscar postgres; do
-      container=$(compose ps -q "$service")
-      [[ -n $container && $(docker inspect "$container" --format '{{.State.Status}}') == running &&
-            $(docker inspect "$container" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}') == healthy ]] ||
-        services_healthy=false
-    done
-    archive_verified=false
-    restore_archive_verify_log=$restore_work/archive-verify.log
-    if sudo bash oscar.sh archive verify >"$restore_archive_verify_log" 2>&1; then
-      archive_verified=true
-    else
-      emit_command_diagnostics 'Post-restore archive verification' "$restore_archive_verify_log"
-    fi
-    restored_timeline=$(scalar "SELECT timeline_id FROM pg_control_checkpoint();")
-    fresh_timeline=false
-    restored_prefix=''
-    if [[ $restored_timeline =~ ^[1-9][0-9]{0,9}$ && $restored_timeline -gt $source_timeline ]]; then
-      fresh_timeline=true
-      restored_prefix=$(printf '%08X' "$restored_timeline")
-    fi
-    timeline_history_archived=false
-    if [[ -n $restored_prefix && -f $wal_dir/$restored_prefix.history &&
-          ! -L $wal_dir/$restored_prefix.history ]]; then
-      timeline_history_archived=true
-    fi
-    new_timeline_wal_archived=false
-    while IFS= read -r -d '' restored_wal; do
-      restored_name=${restored_wal##*/}
-      if [[ -n $restored_prefix && $restored_name =~ ^${restored_prefix}[0-9A-F]{16}$ ]]; then
-        new_timeline_wal_archived=true
-        break
-      fi
-    done < <(find "$wal_dir" -mindepth 1 -maxdepth 1 -type f -print0)
-    prior_wal_preserved=true
-    while read -r expected_sha prior_name; do
-      [[ $expected_sha =~ ^[0-9a-f]{64}$ && $prior_name =~ ^${source_prefix}[0-9A-F]{16}$ &&
-            -f $wal_dir/$prior_name && ! -L $wal_dir/$prior_name &&
-            $(sha256_file "$wal_dir/$prior_name") == "$expected_sha" ]] || {
-        prior_wal_preserved=false
-        break
-      }
-    done <"$wal_baseline"
-    post_backup_wal_preserved=false
-    if [[ $future_segment_sha =~ ^[0-9a-f]{64}$ && -f $wal_dir/$future_segment &&
-          ! -L $wal_dir/$future_segment &&
-          $(sha256_file "$wal_dir/$future_segment") == "$future_segment_sha" ]]; then
-      post_backup_wal_preserved=true
-    fi
-    wal_restored=false
-    if $prior_wal_preserved && $post_backup_wal_preserved; then wal_restored=true; fi
-    archiver_failure_free=false
-    [[ $(scalar "SELECT coalesce((last_failed_time >= pg_postmaster_start_time())::text,'f') FROM pg_stat_archiver;") == f ]] &&
-      archiver_failure_free=true
-    recovery_settings_cleared=false
-    recovery_defaults=$(scalar "SELECT CASE WHEN current_setting('restore_command')='' AND current_setting('recovery_target')='' AND current_setting('recovery_target_timeline')='latest' AND current_setting('recovery_target_action')='pause' THEN '1' ELSE '0' END;")
-    recovery_pending=$(scalar "SELECT count(*) FROM pg_settings WHERE name IN ('restore_command','recovery_target','recovery_target_timeline','recovery_target_action') AND pending_restart;")
-    if [[ $recovery_defaults == 1 && $recovery_pending == 0 ]] &&
-       compose exec -T postgres sh -eu -c '
-         test -f "$PGDATA/postgresql.auto.conf" && test ! -L "$PGDATA/postgresql.auto.conf"
-         ! grep -Eq "^[[:space:]]*(restore_command|recovery_target(_[a-z_]+)?|primary_conninfo|primary_slot_name|promote_trigger_file)[[:space:]]*=" "$PGDATA/postgresql.auto.conf"
-         test ! -e "$PGDATA/recovery.signal" && test ! -L "$PGDATA/recovery.signal"
-         test ! -e "$PGDATA/standby.signal" && test ! -L "$PGDATA/standby.signal"
-       '; then
-      recovery_settings_cleared=true
-    fi
-    epoch_id=$(awk -F'"' '/"backupEpochId"/ {print $4; exit}' "$backup_dir/$backup/epoch.json")
-    epoch_lsn=$(awk -F'"' '/"postgresLsn"/ {print $4; exit}' "$backup_dir/$backup/epoch.json")
-    epoch_sha=$(sha256_file "$backup_dir/$backup/epoch.json")
-    restored_generation_inventory=$backup_dir/$backup/archive-generation-ids.txt
-    [[ -f $restored_generation_inventory && ! -L $restored_generation_inventory ]] ||
-      fail 'Restored backup archive-generation inventory is missing or unsafe.'
-    restored_generation_bytes=$(stat -c %s -- "$restored_generation_inventory")
-    [[ $restored_generation_bytes =~ ^[0-9]+$ && $restored_generation_bytes -le 37000000 ]] ||
-      fail 'Restored archive-generation inventory exceeds its byte bound.'
-    if [[ $restored_generation_bytes -gt 0 ]]; then
-      [[ $(tail -c 1 "$restored_generation_inventory" | od -An -t x1 | tr -d '[:space:]') == 0a ]] ||
-        fail 'Restored archive-generation inventory is not LF terminated.'
-    fi
-    restored_generation_count=0
-    restored_generation_previous=''
-    while IFS= read -r restored_generation_id || [[ -n $restored_generation_id ]]; do
-      restored_generation_count=$((restored_generation_count+1))
-      [[ $restored_generation_count -le 1000000 &&
-         $restored_generation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
-        fail 'Restored archive-generation inventory is noncanonical or exceeds its entry bound.'
-      [[ -z $restored_generation_previous || $restored_generation_id > $restored_generation_previous ]] ||
-        fail 'Restored archive-generation inventory is unsorted or contains duplicates.'
-      restored_generation_previous=$restored_generation_id
-    done <"$restored_generation_inventory"
-    [[ $restored_generation_bytes == $((restored_generation_count * 37)) ]] ||
-      fail 'Restored archive-generation inventory has noncanonical fixed-width LF framing.'
-    restored_generation_sha=$(sha256_file "$restored_generation_inventory")
-    [[ $restored_generation_sha =~ ^[0-9a-f]{64}$ ]] ||
-      fail 'Restored archive-generation inventory SHA-256 is invalid.'
-    valid_uuid "$epoch_id" && [[ $epoch_lsn =~ ^[0-9A-F]+/[0-9A-F]+$ && $epoch_sha =~ ^[0-9a-f]{64}$ ]] ||
-      fail 'Restored backup has invalid authenticated epoch fields.'
+       -f $current && ! -L $current && $(stat -c %u -- "$current") == 0 &&
+       $(stat -c %a -- "$current") == 600 &&
+       $(wc -l <"$current" | tr -d '[:space:]') == 4 &&
+       $(sed -n '1p' "$current") == format=oscar-current-backup &&
+       $(sed -n '2p' "$current") == version=1 &&
+       $(sed -n '3p' "$current") == "backup_id=$backup" &&
+       $(sed -n '4p' "$current") =~ ^hmac_sha256=[A-Za-z0-9+/]{43}=$ ]] ||
+      fail 'Restored CURRENT pointer is missing, unsafe, or malformed.'
+    current_expected=$(sed -n 's/^hmac_sha256=//p' "$current")
+    current_actual=$(sudo docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --user 0 --entrypoint sh \
+      --volume "$current:/current:ro" --volume "$backup_key_file:/backup-key.txt:ro" \
+      "$app_image" -eu -c '
+        key=$(cat /backup-key.txt)
+        head -n 3 /current | openssl dgst -sha256 -hmac "$key" -binary | openssl base64 -A
+      ' | tr -d '\r\n')
+    current_reverified=false
+    [[ $current_actual == "$current_expected" ]] && current_reverified=true
+    epoch_id=$(awk -F'"' '/"backupEpochId"/ {print $4; exit}' "$root/epoch.json")
+    valid_uuid "$epoch_id" || fail 'Restored backup epoch UUID is invalid.'
     verified_epoch_restored=false
-    [[ $(scalar "SELECT count(*) FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND postgres_lsn='$epoch_lsn' AND archive_generation_count=$restored_generation_count AND archive_generation_inventory_sha256='$restored_generation_sha' AND archive_generation_inventory_bytes=$restored_generation_bytes AND manifest_path='$backup/epoch.json' AND sha256='$epoch_sha' AND verified_at IS NOT NULL;") == 1 ]] &&
+    [[ $(scalar "SELECT count(*) FROM oscar_backup_epoch WHERE id='$epoch_id' AND state='VERIFIED' AND manifest_path='$backup/epoch.json' AND verified_at IS NOT NULL;") == 1 ]] &&
       verified_epoch_restored=true
-    safety="$release_dir/pre-restore-$backup"
-    [[ -d $safety && ! -L $safety && $(stat -c '%u:%g:%a' -- "$safety") == 0:0:700 &&
-          -f $safety/.env && ! -L $safety/.env &&
-          -d $safety/secrets && ! -L $safety/secrets &&
-          -d $safety/tls && ! -L $safety/tls ]] ||
-      fail 'Restore did not preserve a private, complete pre-restore credential safety directory.'
-    actual_safety_inventory=$restore_work/pre-restore-actual.tsv
-    pre_restore_safety_copy_verified=false
-    if credential_tree_inventory "$safety" "$actual_safety_inventory" &&
-       cmp -s "$expected_safety_inventory" "$actual_safety_inventory" &&
-       [[ $(cat -- "$safety/secrets/oscar-admin-password.txt") == "$mutated" &&
-          $(cat -- "$safety/tls/server.crt") == "$mutated" &&
-          $(grep -Fxc "$env_mutated" "$safety/.env") == 1 ]]; then
-      pre_restore_safety_copy_verified=true
-    fi
-    all_restored=false
-    if $database_restored && $state_restored && $archive_restored && $wal_restored &&
-       $credentials_restored && $services_healthy && $archive_verified && $fresh_timeline &&
-       $timeline_history_archived && $new_timeline_wal_archived && $prior_wal_preserved &&
-       $post_backup_wal_preserved &&
-       $archiver_failure_free && $recovery_settings_cleared && $verified_epoch_restored &&
-       $pre_restore_safety_copy_verified; then all_restored=true; fi
-    restore_drill_verified=$all_restored
-    printf '{"backupId":"%s","authenticatedBackupReverified":%s,"databaseRestored":%s,"applicationStateRestored":%s,"archiveRestored":%s,"walRestored":%s,"credentialsRestored":%s,"servicesHealthy":%s,"archiveVerified":%s,"freshTimeline":%s,"sourceTimeline":%s,"restoredTimeline":%s,"timelineHistoryArchived":%s,"newTimelineWalArchived":%s,"priorWalPreserved":%s,"postBackupWalPreserved":%s,"archiverFailureFree":%s,"recoverySettingsCleared":%s,"verifiedEpochRestored":%s,"allCanariesRestored":%s,"preRestoreSafetyCopyVerified":%s,"preRestoreSafetyDirectory":"%s"}\n' \
-      "$backup" "$authenticated_backup_reverified" "$database_restored" "$state_restored" "$archive_restored" "$wal_restored" \
-      "$credentials_restored" "$services_healthy" "$archive_verified" "$fresh_timeline" \
-      "$source_timeline" "$restored_timeline" "$timeline_history_archived" "$new_timeline_wal_archived" \
-      "$prior_wal_preserved" "$post_backup_wal_preserved" "$archiver_failure_free" "$recovery_settings_cleared" \
-      "$verified_epoch_restored" "$all_restored" "$pre_restore_safety_copy_verified" "$safety"
-    cleanup_restore_drill
+    cleanup_new_restore_drill
     trap - EXIT
+    printf '{"backupId":"%s","schemaVersion":2,"databaseRestored":%s,"applicationStateRestored":%s,"archiveRestored":%s,"credentialsRestored":%s,"servicesHealthy":%s,"archiveVerified":%s,"freshTimeline":%s,"recoverySettingsCleared":%s,"verifiedEpochRestored":%s,"allCanariesRestored":%s,"authenticatedBackupReverified":%s,"currentAuthenticated":%s,"noExternalWalDependency":true,"walArchiveTarAbsent":true,"postPromotionWriteDurable":%s,"preRestoreSafetyCopyVerified":%s,"preRestoreSafetyDirectory":"%s"}\n' \
+      "$backup" "$database_restored" "$state_restored" "$archive_restored" "$credentials_restored" "$services_healthy" \
+      "$archive_verified" "$fresh_timeline" "$recovery_settings_cleared" "$verified_epoch_restored" \
+      "$($database_restored && $state_restored && $archive_restored && echo true || echo false)" \
+      "$current_reverified" "$current_reverified" "$post_promotion_write_durable" \
+      "$pre_restore_safety_copy_verified" "$safety"
     ;;
 
   fixture-cleanup)

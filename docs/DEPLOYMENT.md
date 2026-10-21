@@ -121,10 +121,11 @@ STORAGE_WORKFLOW=required ./scripts/run-regression.sh smoke --scenario storage-h
 STORAGE_WORKFLOW=required ./scripts/run-regression.sh full --scenario storage-lifecycle
 # Destructive isolated restore qualification. Set every documented storage and
 # restore path/acknowledgement first; never place these values on a normal runner.
-STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required \
+OSCAR_BACKUP_MODE=single STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required \
   ./scripts/run-regression.sh restore-drill
-# Final unfiltered candidate gate. Point OSCAR_3_9_2_RESTORE_EVIDENCE_DIR at
-# the complete matching restore-drill PASS and set all five workflows required.
+# Final unfiltered candidate gate. Disabled (the default) needs no restore
+# evidence; single mode requires OSCAR_3_9_2_RESTORE_EVIDENCE_DIR to identify
+# the complete matching restore-drill PASS. Set all five workflows required.
 ./scripts/run-regression.sh 3.9.2-release
 ```
 

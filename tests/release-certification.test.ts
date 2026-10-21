@@ -30,8 +30,9 @@ function evidenceBundle(overrides: Record<string, unknown> = {}): string {
       storageExpectedRelease: "3.9.2",
       storageWorkflow: "required",
       storageBackupWorkflow: "required",
+      storageBackupMode: "single",
       restoreDrillCertification: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         backupId: "20261018T120000Z-0123abcd",
         authenticatedBackupReverified: true,
         allCanariesRestored: true,
@@ -70,8 +71,9 @@ test("release certification rejects filtered, skipped, or incomplete restore evi
       storageExpectedRelease: "3.9.2",
       storageWorkflow: "required",
       storageBackupWorkflow: "required",
+      storageBackupMode: "single",
       restoreDrillCertification: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         backupId: "20261018T120000Z-0123abcd",
         authenticatedBackupReverified: true,
         allCanariesRestored: true,
