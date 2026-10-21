@@ -1578,7 +1578,9 @@ case $action in
       bash -c "$command" >"$log" 2>&1
       status=$?
       set -e
-      if [[ $status -eq 0 || $(grep -Fxc "$expected_message" "$log") -ne 1 ]]; then
+      plain_message_count=$(grep -Fxc "$expected_message" "$log" || true)
+      launcher_message_count=$(grep -Fxc "ERROR: $expected_message" "$log" || true)
+      if [[ $status -eq 0 || $((plain_message_count + launcher_message_count)) -ne 1 ]]; then
         commands_rejected=false
       fi
     done <<'COMMANDS'
