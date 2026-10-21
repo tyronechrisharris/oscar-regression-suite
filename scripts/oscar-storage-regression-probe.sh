@@ -1863,16 +1863,17 @@ COMMANDS
         SELECT convert_from(decode('$journal_metadata','base64'),'UTF8') AS text),
       doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source)
       SELECT (jsonb_typeof(value)='object'
-        AND (SELECT count(*) FROM json_object_keys(raw))=2
-        AND value ?& ARRAY['schemaVersion','zoneId']
+        AND (SELECT count(*) FROM json_object_keys(raw))=3
+        AND value ?& ARRAY['schemaVersion','zoneId','lifecycleIndexVersion']
         AND value->'schemaVersion'='1'::jsonb
+        AND value->'lifecycleIndexVersion'='1'::jsonb
         AND jsonb_typeof(value->'zoneId')='string'
         AND length(value->>'zoneId') BETWEEN 1 AND 128)::text
         ||'|'||coalesce(value->>'zoneId','') FROM doc;")
     IFS='|' read -r journal_metadata_valid journal_zone <<<"$journal_metadata_result"
     [[ $journal_metadata_valid == true &&
        $journal_zone =~ ^[A-Za-z0-9._+/-]{1,128}$ ]] ||
-      fail 'Daily-file journal metadata is not the exact schema-1 configured-zone contract.'
+      fail 'Daily-file journal metadata is not the exact schema-1 configured-zone lifecycle-index contract.'
     journal_today=$(scalar "SELECT to_char(current_timestamp AT TIME ZONE '$journal_zone','YYYY-MM-DD');")
     [[ $journal_today =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
       fail 'Could not resolve the current daily-file date in the configured journal zone.'

@@ -475,8 +475,10 @@ test("journal status validates exact bounded v1 manifests and direct lane state"
     "openSegments", "sealedSegments", "unsafeEntries", "journal-metadata.v1.json",
     "eligiblePriorDayDirectories", "currentDayDirectories", "currentDayOpenSegments",
     "currentDaySealedSegments", "currentDayBytes", "journalIntegrityFailures",
-    "444a4e4c00000001", "journal_zone", "journal_today",
+    "444a4e4c00000001", "journal_zone", "journal_today", "lifecycleIndexVersion",
   ]) assert.ok(block.includes(required), `missing direct-journal validation contract: ${required}`);
+  assert.match(block, /json_object_keys\(raw\)\)=3/);
+  assert.match(block, /value->'lifecycleIndexVersion'='1'::jsonb/);
   assert.ok(block.includes(
     "^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}",
   ));
