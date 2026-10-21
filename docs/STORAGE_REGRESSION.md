@@ -411,6 +411,11 @@ before and after sealing its three-row cold fixture. It requires exactly one
 guarded `id=ANY(...)` delete to remove all three rows and zero calls to the
 retired singleton path. Across the complete lifecycle it also fails if more
 than 512 MiB (65,536 standard 8-KiB blocks) of temporary query work is added.
+The deliberately authenticated single-observation API delete after releasing
+the `HOT_EXACT` hold is bracketed by its own counter snapshots and must account
+for exactly one singleton SQL call. The final lifecycle gate subtracts only
+that proven call and fails on every unaccounted singleton delete; this does not
+relax the independent zero-singleton archive-purge assertion.
 The corresponding batch/singleton call, row, rows-per-call, and
 statement-temp-block counters remain in the CSV for trend analysis.
 The backup check then creates a coordinated backup and invokes the supported

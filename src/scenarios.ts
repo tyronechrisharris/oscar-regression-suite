@@ -4025,6 +4025,7 @@ export class RegressionScenarios {
     let apiPage: Page | undefined;
     let directJournalLaneUid: string | undefined;
     let directJournalAfterAppend: DirectJournalLaneState | undefined;
+    let expectedAuthorizedHotDeleteSingletonCalls = 0;
     try {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
@@ -4406,11 +4407,16 @@ export class RegressionScenarios {
         );
         if (!release.released) throw new Error("Disposable HOT_EXACT hold was not released");
       }
+      const authorizedHotDeleteBefore = storageMetricFromProbe(
+        "storage-lifecycle-before-authorized-hot-delete",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(authorizedHotDeleteBefore);
       await this.check({
         scenario: "storage-lifecycle", category: "retention",
         action: "delete hot observation after hold release",
         target: hotPublicId,
-        expected: "the same authenticated delete succeeds only after release and the observation is no longer queryable",
+        expected: "the same authenticated delete succeeds only after release, becomes unqueryable, and accounts for exactly one singleton SQL delete",
       }, async () => {
         const deletion = await request.delete(
           this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
@@ -4423,9 +4429,27 @@ export class RegressionScenarios {
         );
         const queryStatus = missing.status();
         await missing.dispose();
+        expectedAuthorizedHotDeleteSingletonCalls = deleted && queryStatus === 404 ? 1 : 0;
+        const authorizedHotDeleteAfter = storageMetricFromProbe(
+          "storage-lifecycle-after-authorized-hot-delete",
+          await probe.runJson("snapshot"),
+        );
+        this.reporter.storageMetric(authorizedHotDeleteAfter);
+        const beforeSingletonCalls = authorizedHotDeleteBefore.legacySingletonObservationDeleteCalls;
+        const afterSingletonCalls = authorizedHotDeleteAfter.legacySingletonObservationDeleteCalls;
+        const authorizedHotDeleteSingletonCalls =
+          typeof beforeSingletonCalls === "number" && typeof afterSingletonCalls === "number"
+            ? afterSingletonCalls - beforeSingletonCalls
+            : null;
         return {
-          passed: deleted && queryStatus === 404,
-          observed: `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
+          passed: expectedAuthorizedHotDeleteSingletonCalls === 1 &&
+            authorizedHotDeleteSingletonCalls === expectedAuthorizedHotDeleteSingletonCalls,
+          observed: JSON.stringify({
+            deleteStatus: deletionStatus,
+            followUpGetStatus: queryStatus,
+            expectedAuthorizedHotDeleteSingletonCalls,
+            authorizedHotDeleteSingletonCalls,
+          }),
         };
       });
       const purgeDisruptionPhase = "storage-lifecycle-purge-disruption";
@@ -4604,7 +4628,7 @@ export class RegressionScenarios {
         category: "performance",
         action: "verify bounded database work amplification",
         target: "PostgreSQL observation lifecycle",
-        expected: "the lifecycle adds no singleton observation deletes and writes at most 512 MiB of PostgreSQL temporary data",
+        expected: "the lifecycle adds only its exactly measured authorized hot-row API delete, no unaccounted singleton deletes, and at most 512 MiB of PostgreSQL temporary data",
       }, async () => {
         const delta = (field: keyof typeof lifecycleBefore): number | null => {
           const before = lifecycleBefore[field];
@@ -4614,13 +4638,22 @@ export class RegressionScenarios {
         const tempBytes = delta("tempBytes");
         const tempBlocks = delta("statementTempBlocksWritten");
         const singletonDeletes = delta("legacySingletonObservationDeleteCalls");
-        const countersMonotonic = [tempBytes, tempBlocks, singletonDeletes]
+        const unaccountedSingletonDeletes = singletonDeletes === null
+          ? null
+          : singletonDeletes - expectedAuthorizedHotDeleteSingletonCalls;
+        const countersMonotonic = [tempBytes, tempBlocks, singletonDeletes,
+          unaccountedSingletonDeletes]
           .every(value => value !== null && value >= 0);
         const passed = countersMonotonic && tempBytes! <= 512 * 1024 * 1024 &&
-          tempBlocks! <= 65_536 && singletonDeletes === 0;
+          tempBlocks! <= 65_536 &&
+          expectedAuthorizedHotDeleteSingletonCalls === 1 &&
+          singletonDeletes === expectedAuthorizedHotDeleteSingletonCalls &&
+          unaccountedSingletonDeletes === 0;
         return {passed, observed: JSON.stringify({
           tempBytes, statementTempBlocksWritten: tempBlocks,
           legacySingletonObservationDeleteCalls: singletonDeletes,
+          expectedAuthorizedHotDeleteSingletonCalls,
+          unaccountedSingletonDeletes,
         })};
       });
     } finally {

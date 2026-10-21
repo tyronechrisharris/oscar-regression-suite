@@ -1017,14 +1017,27 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "retainedMediaExactMembersVerified", "expectedProcessedIndexes", "expectedDeletionIndexes",
     "verify one guarded multi-row PostgreSQL purge", "batchCalls === 1",
     "batchRows === fixture.coldRowCount", "fixture.coldRowCount === 3",
+    "storage-lifecycle-before-authorized-hot-delete",
+    "storage-lifecycle-after-authorized-hot-delete",
+    "authorizedHotDeleteSingletonCalls === expectedAuthorizedHotDeleteSingletonCalls",
     "verify bounded database work amplification", "legacySingletonObservationDeleteCalls",
+    "singletonDeletes === expectedAuthorizedHotDeleteSingletonCalls",
+    "unaccountedSingletonDeletes === 0",
     "512 * 1024 * 1024", "65_536",
   ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
   const holdCreate = block.indexOf('"fixture-hot-hold-create"');
   const heldDelete = block.indexOf("request.delete(", holdCreate);
   const holdRelease = block.indexOf('"fixture-hot-hold-release"', heldDelete);
+  const authorizedDeleteBefore = block.indexOf(
+    '"storage-lifecycle-before-authorized-hot-delete"', holdRelease,
+  );
   const releasedDelete = block.indexOf("request.delete(", holdRelease);
-  assert.ok(holdCreate > 0 && heldDelete > holdCreate && holdRelease > heldDelete && releasedDelete > holdRelease);
+  const authorizedDeleteAfter = block.indexOf(
+    '"storage-lifecycle-after-authorized-hot-delete"', releasedDelete,
+  );
+  assert.ok(holdCreate > 0 && heldDelete > holdCreate && holdRelease > heldDelete &&
+    authorizedDeleteBefore > holdRelease && releasedDelete > authorizedDeleteBefore &&
+    authorizedDeleteAfter > releasedDelete);
   assert.match(block, /lane\.bytes >= directJournalAfterAppend!\.bytes/);
 });
 
