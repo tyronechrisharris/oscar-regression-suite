@@ -769,6 +769,7 @@ test("disabled backup mode rejects every backup-family command before mutation",
   const block = probe.slice(start, end);
   for (const required of [
     "OSCAR backups are disabled.",
+    "--backup-dir <safe-absolute-backup-path>",
     "bash oscar.sh backup",
     "bash oscar.sh backup-verify",
     "bash oscar.sh backup-prune",
@@ -780,6 +781,8 @@ test("disabled backup mode rejects every backup-family command before mutation",
     "backupEpochsUnchanged",
     "legacyWalTreeUnchanged",
   ]) assert.ok(block.includes(required), `missing disabled backup oracle: ${required}`);
+  assert.ok(!block.includes("absolute-secondary-drive-path"),
+    "disabled backup oracle must not require a separate physical drive");
 });
 
 test("privileged command diagnostics use private workspaces, not fixed root logs", () => {

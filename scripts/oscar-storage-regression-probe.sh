@@ -1675,7 +1675,7 @@ case $action in
     work=$(mktemp -d /tmp/oscar-regression-disabled-backup.XXXXXXXX)
     cleanup_disabled_backup_check() { rm -rf -- "$work"; }
     trap cleanup_disabled_backup_check EXIT
-    expected_message='OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+    expected_message='OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <safe-absolute-backup-path> before using backup, verification, pruning, or restore.'
     commands_rejected=true
     index=0
     while IFS= read -r command; do
