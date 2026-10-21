@@ -292,9 +292,10 @@ remote lease is held. The full `storage-lifecycle` scenario uses a separately ac
 plus one current control), and refuses any
 cold purge whose plan includes data outside its unique fixture generation. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
-that disposable test deployment; the packaged production profile instead makes
-media eligible after one day, converts it to five JPEGs, and preserves the original source MP4 for the
-following 24-hour rollback grace. It does not restore a backup. Daily-file publication verification requires an
+that disposable test deployment. The packaged production profile uses the same
+immediate asynchronous eligibility with a bounded five-minute query cadence,
+converts each source to five verified JPEGs, and preserves the original MP4 for
+the following 24-hour rollback grace. It does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture. `STORAGE_BACKUP_WORKFLOW=required` validates the
 selected product mode: disabled proves fail-closed non-mutation, while single
 proves one authenticated self-contained snapshot. See
