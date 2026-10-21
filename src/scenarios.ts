@@ -16,6 +16,7 @@ import {
 } from "./alarm-media-oracles.js";
 import {
   assessDashboardConnectionResolution,
+  assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
@@ -30,12 +31,13 @@ import {
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
   importedAlarmChartsRendered,
+  liveLaneTelemetryChartsRendered,
   operationalViewScopePair,
   scopedUuidOperationalViewChecksEnabled,
   type AlarmChartCanvasSnapshot,
   type AlarmChartSeries,
 } from "./coverage-oracles.js";
-import {RpmEmulatorClient} from "./emulator.js";
+import {assessKnownClearTamperBaseline, RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {navigateWithBoundedRetry} from "./navigation.js";
@@ -402,6 +404,47 @@ export class RegressionScenarios {
 
   private async screenshotOnFailure(page: Page, name: string): Promise<string> {
     try { return await this.browser.screenshot(page, name); } catch { return ""; }
+  }
+
+  private chartCanvasSnapshot(canvas: Locator): Promise<AlarmChartCanvasSnapshot> {
+    return canvas.evaluate((element): AlarmChartCanvasSnapshot => {
+      const chart = element as HTMLCanvasElement;
+      const context = chart.getContext("2d");
+      let gammaPlotPixels = 0;
+      let neutronPlotPixels = 0;
+      if (context && chart.width > 0 && chart.height > 0) {
+        const pixels = context.getImageData(0, 0, chart.width, chart.height).data;
+        // Exclude the title and bottom legend so a colored legend swatch cannot
+        // make an empty dataset look live. The remaining band is Chart.js's plot.
+        const firstPlotRow = Math.floor(chart.height * 0.15);
+        const lastPlotRow = Math.ceil(chart.height * 0.82);
+        const firstPlotColumn = Math.floor(chart.width * 0.05);
+        const lastPlotColumn = Math.ceil(chart.width * 0.95);
+        for (let y = firstPlotRow; y < lastPlotRow; y++) {
+          for (let x = firstPlotColumn; x < lastPlotColumn; x++) {
+            const index = (y * chart.width + x) * 4;
+            const red = pixels[index] ?? 0;
+            const green = pixels[index + 1] ?? 0;
+            const blue = pixels[index + 2] ?? 0;
+            const alpha = pixels[index + 3] ?? 0;
+            if (alpha === 0) continue;
+            if (Math.abs(red - 244) <= 24 && Math.abs(green - 67) <= 24 &&
+              Math.abs(blue - 54) <= 24) gammaPlotPixels++;
+            if (Math.abs(red - 41) <= 24 && Math.abs(green - 182) <= 24 &&
+              Math.abs(blue - 246) <= 24) neutronPlotPixels++;
+          }
+        }
+      }
+      const bounds = chart.getBoundingClientRect();
+      return {
+        width: chart.width,
+        height: chart.height,
+        clientWidth: bounds.width,
+        clientHeight: bounds.height,
+        gammaPlotPixels,
+        neutronPlotPixels,
+      };
+    });
   }
 
   async runReadOnly(): Promise<void> {
@@ -933,6 +976,27 @@ export class RegressionScenarios {
     });
 
     try {
+      await this.check({
+        scenario: "dashboard-health",
+        category: "dashboard-health",
+        action: "validate explicit known-clear Tamper source state",
+        target: "RPM emulator inventory",
+        expected: `${this.config.expectedLaneCount} running, OSCAR-connected RPMs explicitly report tamper_fault=false`,
+      }, async () => {
+        const entries = await this.emulator.tamperBaseline();
+        const assessment = assessKnownClearTamperBaseline(entries, this.config.expectedLaneCount);
+        return {
+          passed: assessment.passed,
+          observed: `RPMs=${assessment.rpmCount}/${assessment.expectedCount}; ` +
+            `explicit clear=${assessment.clearCount}; ` +
+            `stopped=${assessment.stoppedIds.join("|") || "none"}; ` +
+            `disconnected=${assessment.disconnectedIds.join("|") || "none"}; ` +
+            `active=${assessment.activeIds.join("|") || "none"}; ` +
+            `unknown=${assessment.unknownIds.join("|") || "none"}; ` +
+            `duplicate IDs=${assessment.duplicateIds.join("|") || "none"}`,
+        };
+      });
+
       const card = await this.openDashboard(page);
       await this.check({
         scenario: "dashboard-health", category: "dashboard-health", action: "enumerate compact lane health indicators",
@@ -1026,6 +1090,56 @@ export class RegressionScenarios {
         return {
           passed: assessment.passed,
           observed: `${values.length} unique batches; sizes=${values.map((batch) => batch.streamIds.length).join("|")}; peak in flight=${peakHealthRequests}; lane count=${this.config.expectedLaneCount}`,
+        };
+      });
+
+      await this.check({
+        scenario: "dashboard-health",
+        category: "dashboard-health",
+        action: "resolve every lane from the Rapiscan connection baseline",
+        target: "Dashboard Lane Status",
+        expected: `${this.config.expectedLaneCount} lane cards resolve Tamper clear with no Unknown or Active Tamper indicator`,
+      }, async () => {
+        const cards = page.locator('[data-testid^="lane-health-card-"]');
+        const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-tamper"]');
+        const readState = async () => {
+          const laneIds = await cards.evaluateAll((nodes) => nodes.map((node) =>
+            (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+          ));
+          const tamperIndicators = await indicators.evaluateAll((nodes) => nodes.map((node) => {
+            const cardNode = node.closest('[data-testid^="lane-health-card-"]');
+            return {
+              laneId: (cardNode?.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+              state: node.getAttribute("data-state"),
+              label: node.getAttribute("aria-label") ?? "",
+            };
+          }));
+          return assessDashboardKnownClearTamper(
+            laneIds,
+            tamperIndicators,
+            this.config.expectedLaneCount,
+          );
+        };
+        const assessment = await poll(
+          readState,
+          (value) => value.passed,
+          {
+            timeoutMs: 45_000,
+            intervalMs: 1_000,
+            description: "every Dashboard lane to resolve the Rapiscan connection Tamper baseline",
+          },
+        ).catch(readState);
+        const evidence = assessment.passed
+          ? ""
+          : await this.screenshotOnFailure(page, "dashboard-health-tamper-baseline");
+        return {
+          passed: assessment.passed,
+          observed: `lanes=${assessment.laneCount}/${this.config.expectedLaneCount}; ` +
+            `unique=${assessment.uniqueLaneCount}; explicit clear=${assessment.clearCount}; ` +
+            `Unknown=${assessment.unknownLaneIds.join("|") || "none"}; ` +
+            `Active=${assessment.activeLaneIds.join("|") || "none"}; ` +
+            `invalid=${assessment.invalidLaneIds.join("|") || "none"}`,
+          evidence,
         };
       });
 
@@ -1218,7 +1332,7 @@ export class RegressionScenarios {
       await laneLabel.click();
       await page.waitForURL(/\/lane-view/);
       await this.check({
-        scenario: "lane-video", category: "video", action: "render lane detail telemetry",
+        scenario: "lane-video", category: "telemetry", action: "render lane detail telemetry",
         target: this.config.testLaneLabel, expected: "lane heading, gamma chart, neutron chart, and event table visible",
       }, async () => {
         const heading = await page.getByText(`Lane ID: ${this.config.testLaneLabel}`, {exact: true})
@@ -1229,6 +1343,45 @@ export class RegressionScenarios {
         const passed = heading && gamma && neutron && table;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "lane-detail-components");
         return {passed, observed: `heading=${heading}; gamma=${gamma}; neutron=${neutron}; table=${table}`, evidence};
+      });
+      await this.check({
+        scenario: "lane-video",
+        category: "telemetry",
+        action: "paint live gamma and neutron datasets after Dashboard navigation",
+        target: this.config.testLaneLabel,
+        expected: "the Gamma dataset paints red plot pixels and the Neutron dataset paints blue plot pixels, excluding legends",
+      }, async () => {
+        const gammaCanvas = page.locator("#chart-view-gamma canvas").first();
+        const neutronCanvas = page.locator("#chart-view-neutron canvas").first();
+        await Promise.all([
+          gammaCanvas.waitFor({state: "visible", timeout: this.config.uiTimeoutMs}),
+          neutronCanvas.waitFor({state: "visible", timeout: this.config.uiTimeoutMs}),
+        ]);
+        const readCharts = async () => ({
+          gamma: await this.chartCanvasSnapshot(gammaCanvas),
+          neutron: await this.chartCanvasSnapshot(neutronCanvas),
+        });
+        const snapshots = await poll(
+          readCharts,
+          ({gamma, neutron}) => liveLaneTelemetryChartsRendered(gamma, neutron),
+          {
+            timeoutMs: 45_000,
+            intervalMs: 500,
+            description: "live Gamma and Neutron Lane Details datasets to paint",
+          },
+        ).catch(() => readCharts());
+        const passed = liveLaneTelemetryChartsRendered(snapshots.gamma, snapshots.neutron);
+        const evidence = passed
+          ? ""
+          : await this.screenshotOnFailure(page, "lane-detail-live-telemetry");
+        return {
+          passed,
+          observed: `gamma canvas=${snapshots.gamma.width}x${snapshots.gamma.height}; ` +
+            `gamma plot pixels=${snapshots.gamma.gammaPlotPixels}; ` +
+            `neutron canvas=${snapshots.neutron.width}x${snapshots.neutron.height}; ` +
+            `neutron plot pixels=${snapshots.neutron.neutronPlotPixels}`,
+          evidence,
+        };
       });
       await this.check({
         scenario: "lane-video", category: "video", action: "play live camera video",
@@ -2003,14 +2156,17 @@ export class RegressionScenarios {
     }
   }
 
-  private async waitHealthText(page: Page, text: string, timeoutMs = 45_000): Promise<string> {
+  private async waitHealthText(page: Page, expected: string | RegExp, timeoutMs = 45_000): Promise<string> {
     await this.goto(page, "/health");
     const row = this.healthRow(page);
     await row.waitFor({timeout: timeoutMs});
+    const description = typeof expected === "string" ? expected : expected.toString();
     await poll(
       () => row.innerText(),
-      (value) => value.toLowerCase().includes(text.toLowerCase()),
-      {timeoutMs, intervalMs: 1_000, description: `${this.config.testLaneLabel} health to include ${text}`},
+      (value) => typeof expected === "string"
+        ? value.toLowerCase().includes(expected.toLowerCase())
+        : expected.test(value),
+      {timeoutMs, intervalMs: 1_000, description: `${this.config.testLaneLabel} health to match ${description}`},
     );
     return row.innerText();
   }
@@ -2019,15 +2175,18 @@ export class RegressionScenarios {
     page: Page,
     state: "online" | "offline",
     timeoutMs = 45_000,
+    requireTamperClear = false,
   ): Promise<string> {
     await this.goto(page, "/health");
     const row = this.healthRow(page);
     await row.waitFor({timeout: timeoutMs});
     await poll(
       () => row.innerText(),
-      (value) => healthRowHasRpmConnectionState(value, state),
+      (value) => healthRowHasRpmConnectionState(value, state) &&
+        (!requireTamperClear || /Tamper:\s*Clear/i.test(value)),
       {timeoutMs, intervalMs: 1_000,
-        description: `${this.config.testLaneLabel} RPM health to become ${state}`},
+        description: `${this.config.testLaneLabel} RPM health to become ${state}` +
+          (requireTamperClear ? " with Tamper clear" : "")},
     );
     return row.innerText();
   }
@@ -2068,10 +2227,14 @@ export class RegressionScenarios {
     }
     await this.check({
       scenario: "rpm-connection", category: "health", action: "detect RPM reconnection",
-      target: this.config.testLaneLabel, expected: "Status of Health returns the reserved RPM to Online",
+      target: this.config.testLaneLabel,
+      expected: "Status of Health returns the reserved RPM to Online with an explicit Tamper: Clear baseline",
     }, async () => {
-      const text = await this.waitHealthRpmConnection(page, "online", 60_000);
-      return {passed: healthRowHasRpmConnectionState(text, "online"), observed: text};
+      const text = await this.waitHealthRpmConnection(page, "online", 60_000, true);
+      return {
+        passed: healthRowHasRpmConnectionState(text, "online") && /Tamper:\s*Clear/i.test(text),
+        observed: text,
+      };
     });
     await this.check({
       scenario: "rpm-connection", category: "dashboard-health", action: "show reconnected RPM on dashboard",
@@ -3678,12 +3841,14 @@ export class RegressionScenarios {
       const platform = await this.check({
         scenario: "storage-health", category: "storage-platform", action: "verify PostgreSQL and storage controls",
         target: this.config.targetHost,
-        expected: "the running images, deployment/root identities, stable lock, exact WAL command, packaged helpers, backup-root isolation, split noexec/data and executable/native temp mounts, forced JVM temp and JavaCPP cache properties, and complete 3.9.2 storage profile match",
+        expected: "the running images, mode-aware deployment/root identities, stable lock, inactive PostgreSQL archiving with no external WAL bind, packaged helpers, backup-root isolation, split noexec/data and executable/native temp mounts, forced JVM temp and JavaCPP cache properties, and complete 3.9.2 storage profile match",
       }, async () => {
         const value = assessStoragePlatform(await probe.runJson("platform"));
         const release = this.config.storageExpectedRelease;
         const resources = value.archiveResources;
-        const passed = storagePlatformHasExactReleaseIdentity(value, release) && value.dataChecksums === "on" &&
+        const passed = storagePlatformHasExactReleaseIdentity(
+          value, release, this.config.storageBackupMode,
+        ) && value.dataChecksums === "on" &&
           value.pgStatStatementsInstalled && value.pgStatStatementsPreloaded &&
           value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
           value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM && value.batchRewriteConfigured &&
@@ -3700,10 +3865,26 @@ export class RegressionScenarios {
         return {passed, value, observed: JSON.stringify(value)};
       });
 
+      if (this.config.storageBackupWorkflow !== "disabled" &&
+          this.config.storageBackupMode === "disabled") {
+        await this.check({
+          scenario: "storage-health", category: "backup", action: "verify disabled backup policy",
+          target: this.config.targetHost,
+          expected: "backup, verification, prune, and restore refuse before mutation; PostgreSQL has no active external WAL archive and a forced WAL switch grows no host archive",
+        }, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("backup-mode-check");
+          const passed = value.mode === "disabled" && value.commandsRejected === true &&
+            value.backupTreeUnchanged === true && value.legacyWalTreeUnchanged === true &&
+            Number(value.legacyWalBytesAfter) === Number(value.legacyWalBytesBefore) &&
+            value.servicesUnchanged === true && value.backupEpochsUnchanged === true;
+          return {passed, observed: JSON.stringify(value)};
+        });
+      }
+
       await this.check({
         scenario: "storage-health", category: "cold-archive", action: "verify archive catalog and object checksums",
         target: this.config.targetHost,
-        expected: "archive catalog has no failed jobs, parity failures, incomplete objects, checksum errors, or archive/WAL partial artifacts",
+        expected: "archive catalog has no failed jobs, parity failures, incomplete objects, checksum errors, or archive partial artifacts",
       }, async () => {
         const value = assessArchiveHealth(await probe.runJson("archive-health"));
         return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
@@ -3819,7 +4000,9 @@ export class RegressionScenarios {
         expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, one-day archive profile, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
         const media = platform.videoRetention;
         const resources = platform.archiveResources;
-        const passed = storagePlatformHasExactReleaseIdentity(platform, this.config.storageExpectedRelease) &&
+        const passed = storagePlatformHasExactReleaseIdentity(
+          platform, this.config.storageExpectedRelease, this.config.storageBackupMode,
+        ) &&
             platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
             platform.archiveIntervalMinutes === 1 &&
             platform.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
@@ -3851,6 +4034,21 @@ export class RegressionScenarios {
         throw new Error(
           "Storage lifecycle mutation refused because the exact accelerated 3.9.2 archive/media test profile failed",
         );
+      }
+
+      if (this.config.storageBackupWorkflow !== "disabled" &&
+          this.config.storageBackupMode === "disabled") {
+        await this.check({
+          scenario: "storage-lifecycle", category: "backup", action: "prove disabled mode refuses safely",
+          target: this.config.targetHost,
+          expected: "all backup-family commands reject without changing services, backup state, or any legacy host WAL path",
+        }, async () => {
+          const value = await probe.runJson<Record<string, unknown>>("backup-mode-check");
+          const passed = value.mode === "disabled" && value.commandsRejected === true &&
+            value.backupTreeUnchanged === true && value.legacyWalTreeUnchanged === true &&
+            value.servicesUnchanged === true && value.backupEpochsUnchanged === true;
+          return {passed, observed: JSON.stringify(value)};
+        });
       }
 
       const retentionRuntimeAccepted = await this.check({
@@ -4046,15 +4244,6 @@ export class RegressionScenarios {
           .every(field => value[field] === true);
         return {passed, observed: JSON.stringify(value)};
       });
-      await this.check({scenario: "storage-lifecycle", category: "wal-archive",
-        action: "exercise deployed WAL publication helper", target: this.config.targetHost,
-        expected: "a synthetic disposable history file publishes durably, retries idempotently, rejects different bytes, leaves no partial, and is removed"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("wal-helper-check", [fixtureRun]);
-        const passed = ["published", "idempotentRetry", "mismatchRejected", "originalPreserved", "fixtureRemoved"]
-          .every(field => value[field] === true) && value.partialArtifacts === 0;
-        return {passed, observed: JSON.stringify(value)};
-      });
-
       apiPage = await this.browser.oscarPage();
       const request = apiPage.context().request;
       const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
@@ -4243,10 +4432,11 @@ export class RegressionScenarios {
       } finally {
         this.metrics.setPhase("storage-lifecycle-post-restart");
       }
-      if (this.config.storageBackupWorkflow !== "disabled") {
+      if (this.config.storageBackupWorkflow !== "disabled" &&
+          this.config.storageBackupMode === "single") {
         await this.check({scenario: "storage-lifecycle", category: "backup", action: "create and automatically verify backup",
           target: this.config.targetHost,
-        expected: "backup has regular authenticated markers, a matching 3.9.2 epoch, supported re-verification, an exact daily-journal confirmation outcome, and bounded retention without restore"}, async () => {
+        expected: "single mode publishes one authenticated CURRENT schema-v2 snapshot with streamed WAL, no cumulative WAL archive, exact media/journal inventory, and crash-safe atomic replacement without restore"}, async () => {
           // Startup reclamation may briefly remove expired processed-index buckets before the
           // first scheduled overlap scan republishes current observations. Cross one complete
           // configured scan interval before freezing the exact backup inventory.
@@ -4301,6 +4491,11 @@ export class RegressionScenarios {
             Number.isSafeInteger(expectedDeletion) && expectedDeletion >= 0 &&
             Number(value.deletionIndexesIncluded) === expectedDeletion;
           return {passed: value.automaticVerification === true && value.supportedVerification === true &&
+            value.backupMode === "single" && Number(value.schemaVersion) === 2 &&
+            value.currentAuthenticated === true && Number(value.currentSnapshotCount) === 1 &&
+            value.walArchiveTarAbsent === true && value.streamedWalPresent === true &&
+            Number(value.stagingArtifacts) === 0 && value.atomicStateMachineExact === true &&
+            value.pruneRetired === true &&
             value.independentCoreAuthentication === true &&
             value.authenticatedManifest === true && value.journalConfirmationAuthenticated === true &&
             value.regularMarkers === true && value.epochValid === true &&
@@ -4312,7 +4507,7 @@ export class RegressionScenarios {
             Number.isSafeInteger(Number(value.journalReceiptSegmentsVerified)) &&
             Number(value.journalReceiptSegmentsVerified) >= Number(value.journalReceipts) &&
             value.journalReceiptReferencesValid === true &&
-            value.retentionRespected === true && value.duckDbScratchExcluded === true &&
+            value.duckDbScratchExcluded === true &&
             metadataIncluded && deletionMetadataIncluded && value.restoreAttempted === false,
           observed: JSON.stringify({backup: value, mediaBeforeBackup})};
         });
@@ -4343,7 +4538,9 @@ export class RegressionScenarios {
         expected: "the isolated target is running exact OSCAR/PostGIS 3.9.2 images and the pinned gateway",
       }, async () => {
         const release = this.config.storageExpectedRelease;
-        const passed = storagePlatformHasExactReleaseIdentity(before, release);
+        const passed = storagePlatformHasExactReleaseIdentity(
+          before, release, this.config.storageBackupMode,
+        );
         return {passed, value: passed, observed: JSON.stringify(before)};
       });
       if (!identityAccepted) throw new Error("Destructive restore refused because exact 3.9.2 identity failed");
@@ -4358,7 +4555,7 @@ export class RegressionScenarios {
           category: "restore",
           action: "restore authenticated backup over isolated deployment",
           target: this.config.targetHost,
-          expected: "all pre-backup canaries return, PostgreSQL promotes to a fresh failure-free archive timeline, the exact VERIFIED epoch is reconstructed, and one-time recovery state is cleared",
+          expected: "the authenticated schema-v2 CURRENT snapshot restores every canary without external WAL, promotes to a fresh timeline, clears recovery state, and retains a durable post-promotion write",
         }, async () => {
           const value = await probe.runJson<Record<string, unknown>>(
             "restore-drill",
@@ -4366,18 +4563,17 @@ export class RegressionScenarios {
               fixtureRun,
               `${fixtureRun}:DESTRUCTIVE-RESTORE`,
               this.config.restoreArchiveDirectory ?? "missing",
-              this.config.restoreWalArchiveDirectory ?? "missing",
               this.config.restoreBackupDirectory ?? "missing",
             ],
           );
           const passed = [
-            "databaseRestored", "applicationStateRestored", "archiveRestored", "walRestored",
+            "databaseRestored", "applicationStateRestored", "archiveRestored",
             "credentialsRestored", "servicesHealthy", "archiveVerified", "freshTimeline",
-            "timelineHistoryArchived", "newTimelineWalArchived", "priorWalPreserved",
-            "postBackupWalPreserved",
-            "archiverFailureFree", "recoverySettingsCleared", "verifiedEpochRestored",
+            "recoverySettingsCleared", "verifiedEpochRestored", "currentAuthenticated",
+            "noExternalWalDependency", "walArchiveTarAbsent", "postPromotionWriteDurable",
             "allCanariesRestored", "authenticatedBackupReverified", "preRestoreSafetyCopyVerified",
           ].every(field => value[field] === true) &&
+            Number(value.schemaVersion) === 2 &&
             typeof value.backupId === "string" &&
             /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/.test(value.backupId) &&
             typeof value.preRestoreSafetyDirectory === "string";
@@ -4396,8 +4592,7 @@ export class RegressionScenarios {
         expected: "restore restarts the exact same immutable application, PostGIS, and gateway image IDs",
       }, async () => {
         const passed = storagePlatformHasExactReleaseIdentity(
-          after,
-          this.config.storageExpectedRelease,
+          after, this.config.storageExpectedRelease, this.config.storageBackupMode,
         ) && after.appImage.containerImageId === before.appImage.containerImageId &&
           after.postgisImage.containerImageId === before.postgisImage.containerImageId &&
           after.gatewayImage.containerImageId === before.gatewayImage.containerImageId;
@@ -4417,7 +4612,7 @@ export class RegressionScenarios {
       if (restoreResult && immutableImageIdentityPreserved === true) {
         this.reporter.addMetadata({
           restoreDrillCertification: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             backupId: String(restoreResult.backupId),
             authenticatedBackupReverified: true,
             allCanariesRestored: true,

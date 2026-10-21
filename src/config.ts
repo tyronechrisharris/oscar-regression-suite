@@ -2,7 +2,21 @@ import {mkdirSync, readFileSync} from "node:fs";
 import {isAbsolute, posix, resolve} from "node:path";
 import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane-config.js";
 import {publicObservationId} from "./public-observation-id.js";
-import type {CapabilityMode, Profile, SuiteConfig} from "./types.js";
+import type {BackupMode, CapabilityMode, Profile, SuiteConfig} from "./types.js";
+
+// A newly restarted emulator can enter OCCUPIED before OSCAR's prior socket
+// reaches its heartbeat timeout and reconnects.  The Viewer deliberately uses
+// the first occupancy sample OSCAR actually observes as its start time, and its
+// default fault threshold is strictly greater than 60 seconds.  Budget the
+// emulator's complete 60-second reconnect allowance plus a 30-second window in
+// which both Health and Dashboard can observe the post-threshold state.
+export const EXTENDED_OCCUPANCY_THRESHOLD_SECONDS = 60;
+export const EXTENDED_OCCUPANCY_RECONNECT_ALLOWANCE_SECONDS = 60;
+export const EXTENDED_OCCUPANCY_OBSERVATION_WINDOW_SECONDS = 30;
+export const MIN_EXTENDED_OCCUPANCY_SECONDS =
+  EXTENDED_OCCUPANCY_THRESHOLD_SECONDS +
+  EXTENDED_OCCUPANCY_RECONNECT_ALLOWANCE_SECONDS +
+  EXTENDED_OCCUPANCY_OBSERVATION_WINDOW_SECONDS;
 
 function loadDotEnv(path = resolve(".env")): void {
   try {
@@ -87,6 +101,13 @@ function capabilityMode(name: string, fallback: CapabilityMode): CapabilityMode 
     return raw as CapabilityMode;
   }
   throw new Error(`${name} must be auto, required, or disabled`);
+}
+
+function backupMode(name: string, fallback: BackupMode): BackupMode {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  if (raw === "disabled" || raw === "single") return raw;
+  throw new Error(`${name} must be the literal lowercase value disabled or single`);
 }
 
 function remoteAbsolutePath(name: string): string | undefined {
@@ -211,12 +232,12 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   }
   const oscarReleaseDirectory = canonicalReleasePath("OSCAR_RELEASE_DIR");
   const restoreArchiveDirectory = canonicalRestorePath("OSCAR_RESTORE_ARCHIVE_DIR");
-  const restoreWalArchiveDirectory = canonicalRestorePath("OSCAR_RESTORE_WAL_ARCHIVE_DIR");
   const restoreBackupDirectory = canonicalRestorePath("OSCAR_RESTORE_BACKUP_DIR");
   const eventUuidWorkflow = capabilityMode("EVENT_UUID_WORKFLOW", "auto");
   const alarmTransferCameraWorkflow = capabilityMode("ALARM_TRANSFER_CAMERA_WORKFLOW", "auto");
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
+  const storageBackupMode = backupMode("OSCAR_BACKUP_MODE", "disabled");
   const oscarBuildLabel = process.env.OSCAR_BUILD_LABEL?.trim();
   const releaseRestoreEvidenceDirectory = process.env.OSCAR_3_9_2_RESTORE_EVIDENCE_DIR?.trim();
   if (releaseRestoreEvidenceDirectory &&
@@ -232,7 +253,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
       );
     }
     if (!oscarBuildLabel) throw new Error("3.9.2-release requires OSCAR_BUILD_LABEL");
-    if (!releaseRestoreEvidenceDirectory) {
+    if (storageBackupMode === "single" && !releaseRestoreEvidenceDirectory) {
       throw new Error("3.9.2-release requires OSCAR_3_9_2_RESTORE_EVIDENCE_DIR");
     }
   }
@@ -273,19 +294,23 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     metricsIntervalMs: integer("METRICS_INTERVAL_MS", 5_000, 1_000),
     uiTimeoutMs: integer("UI_TIMEOUT_MS", 30_000, 1_000),
     eventTimeoutMs: integer("EVENT_TIMEOUT_MS", 90_000, 10_000),
-    extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
+    extendedOccupancySeconds: integer(
+      "EXTENDED_OCCUPANCY_SECONDS",
+      MIN_EXTENDED_OCCUPANCY_SECONDS,
+      MIN_EXTENDED_OCCUPANCY_SECONDS,
+    ),
     eventUuidWorkflow,
     alarmTransferCameraWorkflow,
     storageWorkflow,
     storageExpectedRelease: "3.9.2",
     storageBackupWorkflow,
+    storageBackupMode,
     storageTargetAcknowledgement: process.env.OSCAR_STORAGE_TARGET_ACK?.trim() || "",
     restoreTargetAcknowledgement: process.env.OSCAR_RESTORE_TARGET_ACK?.trim() || "",
     restoreDisposableAcknowledgement: process.env.OSCAR_RESTORE_DISPOSABLE_ACK?.trim() || "",
     restoreDataLossAcknowledgement: process.env.OSCAR_RESTORE_DATA_LOSS_ACK?.trim() || "",
     restorePathsAcknowledgement: process.env.OSCAR_RESTORE_PATHS_ACK?.trim() || "",
     ...(restoreArchiveDirectory ? {restoreArchiveDirectory} : {}),
-    ...(restoreWalArchiveDirectory ? {restoreWalArchiveDirectory} : {}),
     ...(restoreBackupDirectory ? {restoreBackupDirectory} : {}),
     ...(oscarReleaseDirectory ? {oscarReleaseDirectory} : {}),
     ...(releaseRestoreEvidenceDirectory ? {releaseRestoreEvidenceDirectory} : {}),
@@ -322,21 +347,23 @@ export function assertMutationAllowed(config: SuiteConfig): void {
     if (config.storageBackupWorkflow !== "required") {
       throw new Error("Restore drill refused: STORAGE_BACKUP_WORKFLOW must be required");
     }
+    if (config.storageBackupMode !== "single") {
+      throw new Error("Restore drill refused: OSCAR_BACKUP_MODE must be single");
+    }
     if (!config.oscarSshTarget || !config.oscarReleaseDirectory) {
       throw new Error("Restore drill refused: OSCAR_SSH_TARGET and OSCAR_RELEASE_DIR are required");
     }
-    if (!config.restoreArchiveDirectory || !config.restoreWalArchiveDirectory || !config.restoreBackupDirectory) {
+    if (!config.restoreArchiveDirectory || !config.restoreBackupDirectory) {
       throw new Error(
-        "Restore drill refused: OSCAR_RESTORE_ARCHIVE_DIR, OSCAR_RESTORE_WAL_ARCHIVE_DIR, and OSCAR_RESTORE_BACKUP_DIR are required",
+        "Restore drill refused: OSCAR_RESTORE_ARCHIVE_DIR and OSCAR_RESTORE_BACKUP_DIR are required",
       );
     }
     const restorePaths = [
       config.restoreArchiveDirectory,
-      config.restoreWalArchiveDirectory,
       config.restoreBackupDirectory,
     ];
     if (restorePaths.some((path, index) => restorePaths.slice(index + 1).some(other => pathsOverlap(path, other)))) {
-      throw new Error("Restore drill refused: archive, WAL archive, and backup directories must be distinct, non-overlapping planes");
+      throw new Error("Restore drill refused: archive and backup directories must be distinct, non-overlapping planes");
     }
     const storageAcknowledgement =
       `${config.targetHost}|${config.oscarSshTarget}|${config.oscarReleaseDirectory}|DISPOSABLE-STORAGE`;
@@ -364,7 +391,7 @@ export function assertMutationAllowed(config: SuiteConfig): void {
       );
     }
     const pathsAcknowledgement =
-      `${config.restoreArchiveDirectory}|${config.restoreWalArchiveDirectory}|${config.restoreBackupDirectory}|DEDICATED-RESTORE-PATHS`;
+      `${config.restoreArchiveDirectory}|${config.restoreBackupDirectory}|DEDICATED-RESTORE-PATHS`;
     if (config.restorePathsAcknowledgement !== pathsAcknowledgement) {
       throw new Error(
         `Restore drill refused: OSCAR_RESTORE_PATHS_ACK must exactly equal ${pathsAcknowledgement}`,

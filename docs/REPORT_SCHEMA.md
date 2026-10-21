@@ -127,9 +127,10 @@ reappearance of per-event legacy metadata visible; an empty cell means
 unavailable.
 
 `run.json` schema version 2 records `storageWorkflow`,
-`storageBackupWorkflow`, release-directory identity, and retained/legacy media
-fixture identities. A `3.9.2-release` run also records the validated restore
-evidence directory, restore run ID, and backup ID. A successful restore drill
+`storageBackupWorkflow`, the exact expected `storageBackupMode`, release-directory
+identity, and retained/legacy media fixture identities. A single-mode
+`3.9.2-release` run also records the validated restore evidence directory,
+restore run ID, and backup ID; disabled mode has no restore evidence. A successful restore drill
 records its structured backup/canary/image/safety-copy certification, which the
 release profile must match to the current suite commit, build label, Viewer URL,
 and release directory. It never records the storage acknowledgement or secrets.

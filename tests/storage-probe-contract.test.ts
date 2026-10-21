@@ -280,21 +280,19 @@ test("platform probe binds roots, the stable lock, and exact helper provenance a
   const block = probe.slice(probe.indexOf("  platform)"), probe.indexOf("  snapshot)"));
   for (const required of [
     "OSCAR_DEPLOYMENT_ID",
+    "OSCAR_BACKUP_MODE",
     "archive_identity",
     "backup_identity",
-    "wal_identity",
     "/run/lock/oscar-storage",
     "$deployment_id.lock",
     "Another OSCAR storage administration command is already running.",
-    "/usr/local/bin/oscar-archive-wal",
     "/usr/local/bin/oscar-archive-object",
     "/usr/local/bin/oscar-prepare-restore",
-    "/usr/local/bin/oscar-merge-wal-restore",
     "/usr/local/bin/oscar-atomic-publish",
     "/usr/local/share/oscar-atomic-publish.source.sha256",
-    "archive_command_exact",
-    "wal_publication_contract",
-    "publicationContractExact",
+    "archive_command_inactive",
+    "external_wal_mount_absent",
+    "legacyWalArchive",
     "packagedSha256",
     "deployedSha256",
     "archive_export_helper_wired",
@@ -314,9 +312,6 @@ test("platform probe binds roots, the stable lock, and exact helper provenance a
   assert.match(block, /archive_object_helper copy "\\\$relative" "\\\$expected_sha" ro "\\\$partial"/);
   assert.match(block,
     /archive_object_helper delete "\\\$relative" "\\\$expected_sha" rw <\/dev\/null/);
-  assert.match(block, /if ln -- "\$partial" "\$destination"/);
-  assert.match(block, /sync -d "\$partial"/);
-  assert.match(block, /sync -f "\$archive_root"/);
   assert.match(block, /oscar-atomic-publish "\$root" source published/);
   assert.match(block, /oscar-atomic-publish "\$root" challenger published/);
   assert.match(block, /test "\$status" -ne 0/);
@@ -328,7 +323,8 @@ test("platform probe binds roots, the stable lock, and exact helper provenance a
     "root_kind=$expected_kind"]) {
     assert.ok(probe.includes(required), `missing root-marker contract: ${required}`);
   }
-  assert.match(block, /expected_archive_command='\/usr\/local\/bin\/oscar-archive-wal "%p" "%f" \/var\/lib\/postgresql\/wal-archive'/);
+  assert.match(block, /archive_mode=\$\(scalar 'SHOW archive_mode;'\)/);
+  assert.match(block, /archive_timeout=\$\(scalar 'SHOW archive_timeout;'\)/);
 });
 
 test("platform probe verifies the live split native and untrusted-data temp contract", () => {
@@ -680,6 +676,12 @@ test("backup check authenticates markers, epoch, verification, and exact journal
     "deletionIndexesIncluded",
     "retainedMediaManifestsIncluded",
     "retainedMediaJpegsIncluded",
+    "currentAuthenticated",
+    "currentSnapshotCount",
+    "walArchiveTarAbsent",
+    "streamedWalPresent",
+    "atomicStateMachineExact",
+    "pruneRetired",
   ]) assert.ok(block.includes(required), `missing backup contract: ${required}`);
   assert.match(block, /-f \$root\/\$required && ! -L \$root\/\$required/);
   assert.match(block, /-f \$root\/archive-generation-ids\.txt && ! -L \$root\/archive-generation-ids\.txt/);
@@ -732,11 +734,30 @@ test("backup check authenticates markers, epoch, verification, and exact journal
   assert.doesNotMatch(block, /grep -Fq "\\"backupReference/);
 });
 
+test("disabled backup mode rejects every backup-family command before mutation", () => {
+  const start = probe.indexOf("  backup-mode-check)");
+  const end = probe.indexOf("  snapshot)", start);
+  const block = probe.slice(start, end);
+  for (const required of [
+    "OSCAR backups are disabled.",
+    "bash oscar.sh backup",
+    "bash oscar.sh backup-verify",
+    "bash oscar.sh backup-prune",
+    "bash oscar.sh restore",
+    "launcher_message_count",
+    "tree_fingerprint",
+    "running_services_fingerprint",
+    "SELECT pg_switch_wal()",
+    "backupEpochsUnchanged",
+    "legacyWalTreeUnchanged",
+  ]) assert.ok(block.includes(required), `missing disabled backup oracle: ${required}`);
+});
+
 test("privileged command diagnostics use private workspaces, not fixed root logs", () => {
   assert.match(probe, /^umask 077$/m);
   for (const prefix of [
     "oscar-regression-archive-verify", "oscar-regression-activation-",
-    "oscar-regression-backup-check", "oscar-regression-restore-",
+    "oscar-regression-backup-check",
   ]) assert.ok(probe.includes(`mktemp -d \"/tmp/${prefix}`) || probe.includes(`mktemp -d /tmp/${prefix}`));
   for (const fixed of [
     "/tmp/oscar-regression-archive-verify.log",
@@ -749,184 +770,34 @@ test("privileged command diagnostics use private workspaces, not fixed root logs
   assert.match(probe, /emit_command_diagnostics/);
 });
 
-test("restore drill is a separate exact-confirmation action with multi-plane canaries", () => {
-  const block = probe.slice(probe.indexOf("  restore-drill)"), probe.indexOf("  fixture-cleanup)"));
-  assert.match(block, /\$run:DESTRUCTIVE-RESTORE/);
-  assert.match(block, /oscar\.sh restore --backup "\$backup" --confirm "\$backup"/);
-  assert.match(block, /canonical_directory/);
-  assert.match(block, /expected_archive/);
-  assert.match(block, /paths_overlap/);
-  assert.match(block, /test ! -e "\/var\/lib\/oscar\/\$1" && test ! -L/);
-  assert.match(block, /restored_generation_bytes == \$\(\(restored_generation_count \* 37\)\)/);
-  assert.match(block, /archive_generation_count=\$restored_generation_count/);
-  assert.match(block, /archive_generation_inventory_sha256='\$restored_generation_sha'/);
-  assert.match(block, /archive_generation_inventory_bytes=\$restored_generation_bytes/);
-  for (const field of [
-    "databaseRestored",
-    "applicationStateRestored",
-    "archiveRestored",
-    "walRestored",
-    "credentialsRestored",
-    "servicesHealthy",
-    "archiveVerified",
-    "freshTimeline",
-    "timelineHistoryArchived",
-    "newTimelineWalArchived",
-    "priorWalPreserved",
-    "postBackupWalPreserved",
-    "archiverFailureFree",
-    "recoverySettingsCleared",
-    "verifiedEpochRestored",
-  ]) assert.ok(block.includes(field), `missing restore canary: ${field}`);
-  assert.match(block, /SELECT pg_walfile_name\(pg_switch_wal\(\)\)/);
-  assert.match(block, /SELECT timeline_id FROM pg_control_checkpoint\(\)/);
-  assert.match(block, /restored_timeline -gt \$source_timeline/);
-  assert.match(block, /future_segment_sha/);
-  assert.match(block,
-    /recovery_defaults=\$\(scalar "SELECT CASE WHEN[\s\S]*THEN '1' ELSE '0' END;"\)/,
-    "recovery defaults must use a canonical scalar instead of PostgreSQL boolean-to-text output");
-  assert.match(block, /\[\[ \$recovery_defaults == 1 && \$recovery_pending == 0 \]\]/);
-  assert.doesNotMatch(block, /recovery_defaults == t/,
-    "PostgreSQL boolean::text renders true/false, not t/f");
-  assert.doesNotMatch(block, /wal_canary/);
-  assert.match(block, /state='VERIFIED'/);
-  assert.match(block, /archive_canary_profile="restore_\$run"/);
-  assert.match(block,
-    /archive_canary="\$archive_canary_parent\/profile=\$archive_canary_profile"/);
-  assert.match(block, /ensure_restore_archive_canary_hierarchy 10001 10001/);
-  for (const component of [
-    '"$archive_dir/datasets"',
-    '"$archive_dir/datasets/observations"',
-    '"$archive_canary_parent"',
-    '"$archive_canary"',
-  ]) assert.ok(block.includes(component), `missing canonical archive-canary component: ${component}`);
-  assert.doesNotMatch(block, /install -d -o 10001 -g 10001 -m 0750 -- "\$archive_canary"/,
-    "one-shot install must not leave intermediate archive-canary parents owned by root");
-  assert.match(block, /rmdir -- "\$archive_canary" \|\| fail/);
-  assert.match(block, /archive_restored=false; \[\[ -d \$archive_canary && ! -L \$archive_canary \]\]/);
-  assert.doesNotMatch(block, /archive_dir\/[.]restore-regression-/,
-    "archive restore canaries must stay inside the production-approved datasets layout");
-  assert.match(block,
-    /secret_canary="\$release_dir\/secrets\/oscar-admin-password[.]txt"/);
-  assert.match(block, /tls_canary="\$release_dir\/tls\/server[.]crt"/);
-  assert.doesNotMatch(block, /secrets\/[.]restore-regression-/,
-    "restore must not add a file outside the production deployment-secrets allowlist");
-  assert.doesNotMatch(block, /tls\/[.]restore-regression-/,
-    "restore must not add a file outside the production deployment-secrets allowlist");
+test("restore drill qualifies the self-contained single snapshot without an external WAL plane", () => {
+  const start = probe.indexOf("  restore-drill)");
+  const end = probe.indexOf("  fixture-cleanup)", start);
+  const block = probe.slice(start, end);
   for (const required of [
-    'secret_original=$restore_work/oscar-admin-password.original',
-    'tls_original=$restore_work/server.crt.original',
-    'cp --preserve=mode,ownership,timestamps -- "$secret_canary" "$secret_original"',
-    'cp --preserve=mode,ownership,timestamps -- "$tls_canary" "$tls_original"',
-    'cmp -s -- "$secret_original" "$secret_canary"',
-    'cmp -s -- "$tls_original" "$tls_canary"',
-    '$(stat -c \'%u:%g:%a\' -- "$secret_canary") == "$secret_original_metadata"',
-    '$(stat -c \'%u:%g:%a\' -- "$tls_canary") == "$tls_original_metadata"',
-    '$(cat -- "$safety/secrets/oscar-admin-password.txt") == "$mutated"',
-    '$(cat -- "$safety/tls/server.crt") == "$mutated"',
-    'secret_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-admin-password"',
-    'tls_restore_stage="$release_dir/.oscar-regression-restore-stage-$run-server-cert"',
-    '-name \'.oscar-regression-restore-stage-*\' -print -quit',
-    'A stale root-level restore staging entry exists',
-    'install -o 0 -g 0 -m 0600 -- "$source" "$temporary"',
-    'mv -fT -- "$temporary" "$target"',
-    'credential_files_replaced=true',
-    'if $credential_files_replaced; then',
-    'compose up --detach --force-recreate --no-deps --no-build --pull never',
-    '--wait --wait-timeout 240 oscar gateway',
-    'credential-recovery-force-recreate.log',
-    'elif ! oscar_services_healthy; then',
-    'sudo bash oscar.sh restart >"$credential_restart_log" 2>&1',
-    'oscar_services_healthy || credential_recovery_failed=true',
-    '"$restore_work/credential-recovery-restart.log"',
-    'failure_bundle="/var/tmp/oscar-regression-restore-failure-$run"',
-    'mkdir -m 0700 -- "$failure_bundle"',
-    'Restore-drill failure diagnostics retained at %s',
-    'Restore-drill credential recovery failed; private originals retained at %s',
-    'SELECT count(*) FROM oscar_regression_fixture WHERE run_id=\'$run\';',
-    'test ! -e "/var/lib/oscar/$1" && test ! -L "/var/lib/oscar/$1"',
-    '[[ ! -e $archive_canary && ! -L $archive_canary ]] || cleanup_failed=true',
-    '[[ $marker_status == 1 ]] || cleanup_failed=true',
-    '[[ -e $restore_work || -L $restore_work ]]',
-    'restore_drill_verified=false',
-    'elif ((original_status != 0)) || ! $restore_drill_verified || $cleanup_failed; then',
-  ]) assert.ok(block.includes(required), `missing allowlist-safe credential proof: ${required}`);
-  assert.doesNotMatch(block, /temporary="\$target/,
-    "credential recovery staging must not live inside secrets or tls");
-  assert.match(block,
-    /if \[\[ -f \$target && ! -L \$target \]\] &&[\s\S]*cmp -s -- "\$source" "\$target"[\s\S]*return 0/,
-    "already exact credentials must avoid host replacement and unnecessary restart");
-  const cleanupTrap = block.indexOf("trap cleanup_restore_drill EXIT");
-  const firstPrivateCopy = block.indexOf(
-    'cp --preserve=mode,ownership,timestamps -- "$secret_canary" "$secret_original"',
-  );
-  const firstPrivateHash = block.indexOf('secret_original_sha=$(sha256_file "$secret_original")');
-  assert.ok(cleanupTrap > 0 && cleanupTrap < firstPrivateCopy && cleanupTrap < firstPrivateHash,
-    "EXIT recovery must be installed before private credential snapshots and hashes");
-  const removePrivateOriginals = block.indexOf('rm -f -- "$secret_original" "$tls_original"');
-  const preserveDiagnostics = block.indexOf("preserve_restore_diagnostics");
-  assert.ok(removePrivateOriginals > 0 && preserveDiagnostics > 0 &&
-    removePrivateOriginals < block.lastIndexOf("preserve_restore_diagnostics"),
-  "private originals must be removed before failure diagnostics are published");
-  const restoreCredential = block.indexOf(
-    'restore_private_original "$secret_original" "$secret_canary" "$secret_restore_stage"',
-  );
-  const supportedRecovery = block.indexOf(
-    "compose up --detach --force-recreate --no-deps --no-build --pull never", restoreCredential,
-  );
-  const fixtureDelete = block.indexOf(
-    'DELETE FROM oscar_regression_fixture WHERE run_id=\'$run\';', supportedRecovery,
-  );
-  assert.ok(restoreCredential > 0 && supportedRecovery > restoreCredential && fixtureDelete > supportedRecovery,
-    "credential recovery and force recreation must precede database/application canary cleanup");
-  const verifiedAssignment = block.indexOf("restore_drill_verified=$all_restored");
-  const resultJson = block.indexOf('printf \'{"backupId"', verifiedAssignment);
-  const explicitCleanup = block.lastIndexOf("cleanup_restore_drill");
-  assert.ok(verifiedAssignment > 0 && resultJson > verifiedAssignment && explicitCleanup > resultJson,
-    "restore acceptance must bind all_restored before JSON and explicit cleanup");
-  const backupCreated = block.indexOf("backup_output=$(sudo bash oscar.sh backup)");
-  const secretMutated = block.indexOf("printf '%s\\n' \"$mutated\" >\"$secret_canary\"");
-  const tlsMutated = block.indexOf("printf '%s\\n' \"$mutated\" >\"$tls_canary\"");
-  assert.ok(backupCreated > 0 && secretMutated > backupCreated && tlsMutated > backupCreated,
-    "approved credential files may be mutated only after the backup captures their originals");
-  const archiveCanaryRelative =
-    "datasets/observations/date=2026-10-18/profile=restore_2026_10_18t17_43_32_227z_nimo_mme3l";
-  assert.match(archiveCanaryRelative,
-    /^datasets\/observations\/date=[0-9]{4}-[0-9]{2}-[0-9]{2}\/profile=[A-Za-z0-9_-]+$/u);
-});
-
-test("restore archive canary creates every hierarchy component with removable app ownership", () => {
-  const helper = probe.match(/^ensure_restore_archive_canary_hierarchy\(\) \{\n[\s\S]*?^\}/mu)?.[0];
-  assert.ok(helper, "missing restore archive-canary hierarchy helper");
-  assert.match(helper, /install -d -o "\$expected_uid" -g "\$expected_gid" -m 0750 -- "\$component"/);
-  assert.match(helper, /stat -c '%u:%g' -- "\$component"/);
-  assert.match(helper, /\(8#\$component_mode & 0700\) == 0700/);
-  if (process.platform !== "linux") return;
-  const support = `fail() { printf 'ERROR: %s\\n' "$*" >&2; exit 1; }\n${helper}`;
-  execFileSync("bash", ["-c", `set -Eeuo pipefail
-${support}
-root=$(mktemp -d)
-trap 'rm -rf -- "$root"' EXIT
-uid=$(id -u); gid=$(id -g)
-components=("$root/datasets" "$root/datasets/observations" \
-  "$root/datasets/observations/date=2026-10-18" \
-  "$root/datasets/observations/date=2026-10-18/profile=restore_test")
-ensure_restore_archive_canary_hierarchy "$uid" "$gid" "\${components[@]}"
-for component in "\${components[@]}"; do
-  test -d "$component" && test ! -L "$component"
-  test "$(stat -c '%u:%g' -- "$component")" = "$uid:$gid"
-  mode=$(stat -c %a -- "$component")
-  (( (8#$mode & 0700) == 0700 ))
-done`], {stdio: ["ignore", "pipe", "pipe"]});
-
-  assert.throws(() => execFileSync("bash", ["-c", `set -Eeuo pipefail
-${support}
-root=$(mktemp -d)
-trap 'rm -rf -- "$root"' EXIT
-mkdir "$root/datasets"
-chmod 0500 "$root/datasets"
-ensure_restore_archive_canary_hierarchy "$(id -u)" "$(id -g)" \
-  "$root/datasets" "$root/datasets/observations"`], {stdio: ["ignore", "pipe", "pipe"]}));
+    'confirmation == "$run:DESTRUCTIVE-RESTORE"',
+    "OSCAR_BACKUP_MODE disabled) == single",
+    "expected_archive=${3:-}; expected_backup=${4:-}",
+    "archive and backup directories must be distinct",
+    "grep -Fqx /var/lib/postgresql/wal-archive",
+    "SHOW archive_mode",
+    "SHOW archive_timeout",
+    "backup_dir/CURRENT",
+    "! -e $root/wal-archive.tar.gz",
+    'oscar.sh backup-verify "$backup"',
+    'oscar.sh restore --backup "$backup" --confirm "$backup"',
+    "SELECT timeline_id FROM pg_control_checkpoint()",
+    "restored_timeline -gt $source_timeline",
+    "SELECT NOT pg_is_in_recovery()",
+    "post_promotion_write_durable",
+    "current_actual",
+    "openssl dgst -sha256 -hmac",
+    "preRestoreSafetyCopyVerified",
+    "noExternalWalDependency",
+    "schemaVersion\":2",
+  ]) assert.ok(block.includes(required), `missing self-contained restore contract: ${required}`);
+  assert.doesNotMatch(block, /OSCAR_RESTORE_WAL_ARCHIVE_DIR|expected_wal|wal_dir=|walRestored|timelineHistoryArchived|newTimelineWalArchived/);
+  assert.doesNotMatch(probe, /restore-drill-legacy-unused/);
 });
 
 test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
@@ -1010,18 +881,13 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
   assert.match(cleanup, /DELETE FROM obs o USING f WHERE o\.id IN \(f\.cold_id,f\.hot_id\)/);
   assert.doesNotMatch(cleanup, /DELETE FROM obs(?:\s+WHERE|;)/);
 
-  const archiveHelper = probe.slice(probe.indexOf("  archive-helper-check)"), probe.indexOf("  wal-helper-check)"));
+  const archiveHelper = probe.slice(probe.indexOf("  archive-helper-check)"), probe.indexOf("  fixture-hot-hold-create)"));
   assert.match(archiveHelper, /oscar-archive-object verify/);
   assert.match(archiveHelper, /oscar-archive-object copy/);
   assert.match(archiveHelper, /mismatchRejected/);
   assert.match(archiveHelper, /traversalRejected/);
 
-  const walHelper = probe.slice(probe.indexOf("  wal-helper-check)"), probe.indexOf("  fixture-controls)"));
-  assert.match(walHelper, /oscar-archive-wal/);
-  assert.match(walHelper, /idempotentRetry/);
-  assert.match(walHelper, /mismatchRejected/);
-  assert.match(walHelper, /partialArtifacts/);
-  assert.match(walHelper, /fixtureRemoved/);
+  assert.doesNotMatch(probe, /^  wal-helper-check\)/m);
 });
 
 test("retained-media scenario browser-decodes every assessed frame", () => {

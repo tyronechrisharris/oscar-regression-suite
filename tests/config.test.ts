@@ -3,7 +3,12 @@ import {mkdtempSync, readFileSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join, resolve} from "node:path";
 import test from "node:test";
-import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "../src/config.js";
+import {
+  assertMutationAllowed,
+  loadConfig,
+  MIN_EXTENDED_OCCUPANCY_SECONDS,
+  requiresRemoteSuiteLease,
+} from "../src/config.js";
 
 const baseEnvironment = {
   OSCAR_BASE_URL: "https://192.0.2.10",
@@ -162,17 +167,18 @@ test("3.9.2 release certification is unfiltered and requires every release gate"
     ALARM_TRANSFER_CAMERA_WORKFLOW: "required",
     STORAGE_WORKFLOW: "required",
     STORAGE_BACKUP_WORKFLOW: "required",
+    OSCAR_BACKUP_MODE: "disabled",
     OSCAR_SSH_TARGET: "tester@192.0.2.10",
     OSCAR_RELEASE_DIR: "/opt/oscar-test",
     OSCAR_STORAGE_TARGET_ACK:
       "192.0.2.10|tester@192.0.2.10|/opt/oscar-test|DISPOSABLE-STORAGE",
     OSCAR_BUILD_LABEL: "oscar-3.9.2-candidate-abc123",
-    OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: "/tmp/oscar-restore-evidence",
   };
   withEnvironment(releaseEnvironment, () => {
     const config = loadConfig(["--profile", "3.9.2-release"]);
     assert.equal(config.profile, "3.9.2-release");
-    assert.equal(config.releaseRestoreEvidenceDirectory, "/tmp/oscar-restore-evidence");
+    assert.equal(config.storageBackupMode, "disabled");
+    assert.equal(config.releaseRestoreEvidenceDirectory, undefined);
     assert.equal(requiresRemoteSuiteLease(config), true);
     assert.doesNotThrow(() => assertMutationAllowed(config));
     assert.throws(
@@ -194,8 +200,13 @@ test("3.9.2 release certification is unfiltered and requires every release gate"
   withEnvironment({...releaseEnvironment, OSCAR_BUILD_LABEL: ""}, () => {
     assert.throws(() => loadConfig(["--profile", "3.9.2-release"]), /OSCAR_BUILD_LABEL/);
   });
-  withEnvironment({...releaseEnvironment, OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: ""}, () => {
+  withEnvironment({...releaseEnvironment, OSCAR_BACKUP_MODE: "single",
+    OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: ""}, () => {
     assert.throws(() => loadConfig(["--profile", "3.9.2-release"]), /RESTORE_EVIDENCE_DIR/);
+  });
+  withEnvironment({...releaseEnvironment, OSCAR_BACKUP_MODE: "single",
+    OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: "/tmp/oscar-restore-evidence"}, () => {
+    assert.equal(loadConfig(["--profile", "3.9.2-release"]).storageBackupMode, "single");
   });
 });
 
@@ -242,6 +253,7 @@ test("restore drill is isolated from ordinary profiles and requires exact target
     ...baseEnvironment,
     STORAGE_WORKFLOW: "required",
     STORAGE_BACKUP_WORKFLOW: "required",
+    OSCAR_BACKUP_MODE: "single",
     OSCAR_SSH_TARGET: "tester@192.0.2.10",
     OSCAR_RELEASE_DIR: "/opt/oscar-restore-test",
     OSCAR_STORAGE_TARGET_ACK:
@@ -250,9 +262,8 @@ test("restore drill is isolated from ordinary profiles and requires exact target
     OSCAR_RESTORE_DISPOSABLE_ACK: "192.0.2.10:DISPOSABLE-NO-PRODUCTION-DATA",
     OSCAR_RESTORE_DATA_LOSS_ACK: "I-ACCEPT-DESTRUCTIVE-RESTORE",
     OSCAR_RESTORE_ARCHIVE_DIR: "/srv/oscar-restore/archive",
-    OSCAR_RESTORE_WAL_ARCHIVE_DIR: "/srv/oscar-restore/wal-archive",
     OSCAR_RESTORE_BACKUP_DIR: "/srv/oscar-restore/backups",
-    OSCAR_RESTORE_PATHS_ACK: "/srv/oscar-restore/archive|/srv/oscar-restore/wal-archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS",
+    OSCAR_RESTORE_PATHS_ACK: "/srv/oscar-restore/archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS",
   };
   withEnvironment(restoreEnvironment, () => {
     const config = loadConfig(["--profile", "restore-drill"]);
@@ -274,10 +285,9 @@ test("restore drill is isolated from ordinary profiles and requires exact target
       () => loadConfig(["--profile", "full", "--scenario", "storage-restore-drill"]),
       /requires --profile restore-drill/,
     );
-    assert.throws(
-      () => assertMutationAllowed({...config, restoreWalArchiveDirectory: config.restoreArchiveDirectory!}),
-      /distinct, non-overlapping planes/,
-    );
+    assert.throws(() => assertMutationAllowed({
+      ...config, restoreBackupDirectory: config.restoreArchiveDirectory!,
+    }), /distinct, non-overlapping planes/);
     assert.throws(
       () => assertMutationAllowed({...config, storageBackupWorkflow: "auto"}),
       /STORAGE_BACKUP_WORKFLOW must be required/,
@@ -300,6 +310,12 @@ test("storage paths, modes, and numeric bounds fail closed", () => {
   });
   withEnvironment({...baseEnvironment, STORAGE_WORKFLOW: "maybe"}, () => {
     assert.throws(() => loadConfig([]), /STORAGE_WORKFLOW must be auto, required, or disabled/);
+  });
+  withEnvironment({...baseEnvironment, OSCAR_BACKUP_MODE: "DISABLED"}, () => {
+    assert.throws(() => loadConfig([]), /literal lowercase value disabled or single/);
+  });
+  withEnvironment(baseEnvironment, () => {
+    assert.equal(loadConfig([]).storageBackupMode, "disabled");
   });
   withEnvironment({...baseEnvironment, OSCAR_RELEASE_DIR: "/opt/oscar/./release"}, () => {
     assert.throws(() => loadConfig(["--scenario", "storage-health"]), /canonical, non-root/);
@@ -326,6 +342,22 @@ test("storage paths, modes, and numeric bounds fail closed", () => {
       () => loadConfig([]),
       /STORAGE_RESTORE_PROBE_TIMEOUT_MS must be an integer between 600000 and 28800000/,
     );
+  });
+});
+
+test("extended occupancy reserves reconnect and post-threshold observation time", () => {
+  withEnvironment(baseEnvironment, () => {
+    assert.equal(MIN_EXTENDED_OCCUPANCY_SECONDS, 150);
+    assert.equal(loadConfig([]).extendedOccupancySeconds, 150);
+  });
+  withEnvironment({...baseEnvironment, EXTENDED_OCCUPANCY_SECONDS: "149"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /EXTENDED_OCCUPANCY_SECONDS must be an integer >= 150/,
+    );
+  });
+  withEnvironment({...baseEnvironment, EXTENDED_OCCUPANCY_SECONDS: "180"}, () => {
+    assert.equal(loadConfig([]).extendedOccupancySeconds, 180);
   });
 });
 

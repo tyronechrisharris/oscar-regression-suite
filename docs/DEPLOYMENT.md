@@ -43,6 +43,13 @@ Saved** notification. Perform one supported OSCAR restart and require all 50
 Lane, RPM, and camera modules to return before starting regression. Clicking
 Save without confirming Yes must fail provisioning.
 
+OSCAR's Rapiscan driver must publish an initial Tamper-clear observation every
+time an RPM connection is established, before processing later device `TT`/`TC`
+messages. Deploy or restart OSCAR normally so all 50 test RPM connections pass
+through that initialization path. The suite independently verifies the
+emulator's modeled boolean and the resulting Dashboard state; the harness will
+not infer clear from an Online icon or toggle Tamper across the site.
+
 The retained-media worker reads its profile at OSCAR startup. On a newly initialized
 disposable 3.9.2 target, save the accelerated profile and perform a supported restart
 before importing the lane fixture or permitting emulator traffic. Require
@@ -114,10 +121,11 @@ STORAGE_WORKFLOW=required ./scripts/run-regression.sh smoke --scenario storage-h
 STORAGE_WORKFLOW=required ./scripts/run-regression.sh full --scenario storage-lifecycle
 # Destructive isolated restore qualification. Set every documented storage and
 # restore path/acknowledgement first; never place these values on a normal runner.
-STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required \
+OSCAR_BACKUP_MODE=single STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required \
   ./scripts/run-regression.sh restore-drill
-# Final unfiltered candidate gate. Point OSCAR_3_9_2_RESTORE_EVIDENCE_DIR at
-# the complete matching restore-drill PASS and set all five workflows required.
+# Final unfiltered candidate gate. Disabled (the default) needs no restore
+# evidence; single mode requires OSCAR_3_9_2_RESTORE_EVIDENCE_DIR to identify
+# the complete matching restore-drill PASS. Set all five workflows required.
 ./scripts/run-regression.sh 3.9.2-release
 ```
 

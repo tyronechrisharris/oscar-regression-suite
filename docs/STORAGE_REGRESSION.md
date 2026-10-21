@@ -3,7 +3,8 @@
 This suite validates the durable-storage redesign introduced for OSCAR 3.9.2.
 It is not a production maintenance utility. Run mutation coverage only against
 an emulator-backed deployment with a fresh/disposable PostgreSQL database and
-external archive/WAL/backup paths dedicated to that deployment.
+an external archive path and, only in optional single-backup mode, a dedicated
+secondary-drive backup path.
 
 ## Profiles and interlocks
 
@@ -31,18 +32,18 @@ storage-profile label; and verifies both `.env` and `.env.example` say `3.9.2`.
 It also requires the checksum marker to be a regular file containing exactly the
 four v1 fields (`format`, `version`, `data_checksums`, and `initialized_at`) with
 the 3.9.2 values. The probe binds the lowercase `OSCAR_DEPLOYMENT_ID` to all
-three administrator-owned `.oscar-storage-root` v1 markers, requires exactly
-the eight identity/adoption fields and the correct `archive`, `wal-archive`, or
-`backup` kind, and checks the settled root/marker owners and modes.
+the administrator-owned `.oscar-storage-root` v1 marker for `archive` and, in
+`single` mode, `backup`. Disabled mode must not require or create a backup-root
+identity.
 
 The same preflight requires the OS-default stable lock
 (`/run/lock/oscar-storage/<deployment-id>.lock` on Linux), private root ownership,
 and a nonblocking concurrency rejection while the probe holds that lock. It
-hash-compares the packaged and running `/usr/local/bin/oscar-archive-wal`,
-`/usr/local/bin/oscar-archive-object`, `/usr/local/bin/oscar-prepare-restore`,
-and `/usr/local/bin/oscar-merge-wal-restore` regular executables, requires
-`archive_mode=on`, and compares PostgreSQL's setting to the exact command
-`/usr/local/bin/oscar-archive-wal "%p" "%f" /var/lib/postgresql/wal-archive`.
+hash-compares the packaged and running `/usr/local/bin/oscar-archive-object` and
+`/usr/local/bin/oscar-prepare-restore` regular executables. PostgreSQL must report
+`archive_mode=off`, `archive_timeout=0`, and an empty or `(disabled)`
+`archive_command`; the Postgres container must not bind
+`/var/lib/postgresql/wal-archive`.
 The compiled `/usr/local/bin/oscar-atomic-publish` has a different binary hash
 from its C source, so the image carries a root-owned regular source-provenance
 stamp instead. The gate compares that stamp with the packaged
@@ -53,9 +54,6 @@ The platform gate also inspects both running containers and refuses a full backu
 either `/var/lib/oscar/backups` or `/var/lib/postgresql/backups`. It requires the packaged backup
 flow to use the running database's network namespace while mounting only the fresh `postgres/`
 staging directory and exact bootstrap-password file into the one-shot base-backup client.
-The packaged WAL helper must byte-compare an existing name and publish a
-flushed temporary inode through an atomic, no-replace hard link, followed by
-file and directory durability barriers.
 It also requires the packaged storage CLI to route portable-export copies and
 purge deletions through the archive-object helper; the acknowledged lifecycle
 then exercises both CLI paths against its registered generation.
@@ -230,13 +228,10 @@ evidence.
 
 While the generation is active, the lifecycle invokes the deployed application
 archive-object helper against a cataloged object: verified copy must preserve
-the catalog hash, while a wrong hash and traversal path must fail. It also uses
-a run-derived, collision-checked synthetic PostgreSQL history filename to prove
-the deployed WAL helper's first publication, byte-identical retry, and
-different-byte rejection. The exact synthetic final/temporary files are removed
-in the action's trap. These mutations run only inside the separately acknowledged
-disposable lifecycle; `storage-health` never publishes synthetic WAL or changes
-archive rows.
+the catalog hash, while a wrong hash and traversal path must fail. WAL-helper
+publication is intentionally not exercised because 3.9.2 keeps PostgreSQL WAL
+archiving disabled. These mutations run only inside the separately acknowledged
+disposable lifecycle; `storage-health` never changes archive rows.
 
 ## Daily files and retained media
 
@@ -291,10 +286,10 @@ its exact prefix afterward.
 The smoke check requires either eligible published CSV/manifest pairs or the
 strict durable-current-day state described above, and no partial artifacts;
 archive health also rejects `*.partial`, `*.partial.*`, `*.tmp`, and `*.tmp.*`
-artifacts anywhere below the external archive or WAL roots. The full run uses the
+artifacts anywhere below the external archive root. The full run uses the
 supported launcher to restart gateway, OSCAR, and PostgreSQL in dependency order
 and rejects shutdown/recovery errors or partial publications, then repeats the
-archive/WAL partial scan after helper, export, and purge coverage.
+archive partial scan after helper, export, and purge coverage.
 Do not fabricate or rename production daily files for this test.
 
 For smoke/non-lifecycle validation, provide `STORAGE_RETAINED_EVENT_ID` for an alarm
@@ -397,13 +392,13 @@ unlisted, duplicate, linked, or special payloads. It requires regular, non-symli
 inventory because it is published only after verification. Instead, its exact
 five-line v2 payload has a separate HMAC that binds the backup ID and exact
 authenticated OSCAR-state checksum. The check requires both HMACs to verify;
-an exact backup ID, UUID, `oscar-backup-epoch` v1/`CREATED` identity and 3.9.2
+an exact backup ID, UUID, `oscar-backup-epoch` v2/`CREATED` identity and 3.9.2
 release; a bounded, canonically sorted, duplicate-free backup-time archive-generation
 UUID inventory covered exactly once by the authenticated manifest; the matching
 live VERIFIED catalog epoch with exact generation count, lowercase SHA-256, and
 byte-count receipt for that inventory (without loading or embedding its UUIDs in
-SQL), plus exact equality with the captured active/sealed catalog inventory; and
-count retention. It extracts the confirmation set and referenced receipts from
+SQL), plus exact equality with the captured active/sealed catalog inventory. It
+extracts the confirmation set and referenced receipts from
 the authenticated state tar, not the mutable live tree, and
 requires at least one daily-journal confirmation receipt bound to the new backup
 ID and authenticated `oscar-state.tar.gz` SHA-256, with a non-empty sealed-segment
@@ -424,29 +419,35 @@ pass; missing, duplicate, linked, wrong-type, wrong-size, or changed members are
 rejected.
 Those retained-media files are therefore included in the authenticated
 application-state backup rather than treated as disposable cache. The lifecycle
-check explicitly does not restore. Set
-`STORAGE_BACKUP_WORKFLOW=disabled` only when backup duration/capacity is outside
-the current run; do not call that a complete 3.9.2 storage release gate.
+check explicitly does not restore. `STORAGE_BACKUP_WORKFLOW=required` validates
+the configured `OSCAR_BACKUP_MODE`. The default `disabled` mode is fully valid:
+the suite proves all backup-family commands refuse before mutation and that a
+forced WAL switch does not grow any legacy host WAL path. Optional `single`
+mode requires one HMAC-authenticated `CURRENT` schema-v2 snapshot, exactly one
+committed schema-v2 directory, no staging/deleting residue or
+`wal-archive.tar.gz`, streamed files under `postgres/pg_wal`, successful
+verification, and the packaged crash-reconciliation/atomic-publication contract.
+Legacy schema-v1 recovery points may remain readable but are not current.
 
 ## Isolated destructive restore drill
 
 Restore coverage is never part of `smoke`, `full`, `storage-health`, or
 `storage-lifecycle`. Use a separate disposable deployment with no production
-data, review its absolute release/archive/WAL/backup paths, and set all existing
+data, review its absolute release/archive/backup paths, and set all existing
 target/storage acknowledgements plus these exact restore-specific values. The
-three paths must be the canonical paths resolved from the target `.env`; they
+two paths must be the canonical paths resolved from the target `.env`; they
 must be distinct and must not contain one another:
 
 ```text
 STORAGE_WORKFLOW=required
 STORAGE_BACKUP_WORKFLOW=required
+OSCAR_BACKUP_MODE=single
 OSCAR_RESTORE_TARGET_ACK=<viewer-host>|<user@ssh-host>|<release-dir>|ISOLATED-RESTORE
 OSCAR_RESTORE_DISPOSABLE_ACK=<host>:DISPOSABLE-NO-PRODUCTION-DATA
 OSCAR_RESTORE_DATA_LOSS_ACK=I-ACCEPT-DESTRUCTIVE-RESTORE
 OSCAR_RESTORE_ARCHIVE_DIR=<canonical-archive-directory>
-OSCAR_RESTORE_WAL_ARCHIVE_DIR=<canonical-wal-archive-directory>
 OSCAR_RESTORE_BACKUP_DIR=<canonical-backup-directory>
-OSCAR_RESTORE_PATHS_ACK=<archive>|<wal-archive>|<backup>|DEDICATED-RESTORE-PATHS
+OSCAR_RESTORE_PATHS_ACK=<archive>|<backup>|DEDICATED-RESTORE-PATHS
 STORAGE_RESTORE_PROBE_TIMEOUT_MS=7200000
 ```
 
@@ -458,38 +459,27 @@ image/marker gate, and an available committed clean suite checkout with a
 canonical 40-hex HEAD. The later `3.9.2-release` run requires that same exact
 suite commit; tracked and untracked changes are refused, while Git-ignored
 `.env` and `results/` are allowed. The target-side helper creates
-unique pre-backup canaries in PostgreSQL, OSCAR application state, the external
-cold archive, `.env`, secrets, and TLS, plus real switched WAL fingerprints before
-and after the backup; creates and re-verifies a
+unique pre-backup canaries in PostgreSQL, OSCAR application state, and the external
+cold archive; creates and re-verifies a
 coordinated backup; mutates every canary; and calls only the supported
-`oscar.sh restore --backup ID --confirm ID` interface. The cold-archive canary is an empty canonical
-`datasets/observations/date=.../profile=...` hierarchy. Every hierarchy component
-is created or validated with OSCAR's UID/GID 10001 and owner read/write/search
-permission so the non-root restore helper can replace it; a root-owned
-intermediate directory is rejected before backup.
-Acceptance requires all
-pre-backup values, promotion onto a timeline newer than the base backup, an archived
-timeline-history file and new-timeline WAL segment, byte-identical preservation of
-the fingerprinted backup-era and divergent post-backup source-timeline WAL, no
-post-start archiver failure, cleanup of the
-one-time recovery settings/signals, exact reconstruction of the authenticated
-`VERIFIED` epoch receipt, healthy app/PostGIS/gateway containers, archive verification,
-and unchanged immutable running image IDs after restore. Scoped canaries are
-removed after verification. The verified drill backup and OSCAR's root-owned
-mode-0700 `pre-restore-ID` safety directory remain intentionally. Its `.env`,
-`secrets/`, and `tls/` tree must preserve every exact mutated relative name,
-content/size/hash, owner, group, and mode with no link or special entry. It contains
-plaintext pre-restore `.env`, secrets, and TLS material; record and restrict it,
-then remove it under the disposable site's approved retention policy.
-Cleanup does not add canary files beneath the production credential directories.
-If recovery must atomically replace either approved credential leaf, it
-force-recreates the Compose services so file-backed secret mounts and the
-gateway's in-memory TLS state cannot retain the old inode, then requires all
-three services healthy before deleting the database/application canaries.
+`oscar.sh restore --backup ID --confirm ID` interface. The archive canary is an
+empty, runtime-owned `datasets/observations/date=.../profile=...` hierarchy so it
+does not introduce an invalid archive object. Acceptance requires all
+pre-backup values, promotion onto a timeline newer than the base backup, no
+external WAL mount or payload, cleanup of one-time recovery settings/signals,
+exact reconstruction and reverification of the authenticated schema-v2 CURRENT
+snapshot, a post-promotion write that survives checkpoint/restart, healthy
+app/PostGIS/gateway containers, archive verification, and unchanged immutable
+running image IDs. Scoped canaries are removed after verification. The verified
+drill backup and OSCAR's root-owned mode-0700 `pre-restore-ID` safety directory
+remain intentionally; the suite verifies that `.env`, `secrets/`, and `tls/`
+exist there as safe real entries. It contains plaintext pre-restore deployment
+material; record and restrict it, then remove it under the disposable site's
+approved retention policy.
 
 The restore-only probe deadline defaults to two hours and is bounded between
 600,000 and 28,800,000 milliseconds. It covers the fresh coordinated backup,
-independent validation, WAL merge, restore, promotion, and post-restore proofs;
+independent validation, self-contained streamed-WAL restore, promotion, and post-restore proofs;
 ordinary probes continue to use `STORAGE_PROBE_TIMEOUT_MS`. Reaching the local
 deadline is a failed run, but it does not release the disruption phase: the
 deadline bounds only the primary SSH wait, and fail-closed quiescence may extend
@@ -514,17 +504,18 @@ snapshot cannot satisfy disruption coverage.
 
 ## Strict 3.9.2 release certification
 
-Preserve the complete PASS directory from an unfiltered destructive drill. For
-the same candidate, set all operational-view, event-UUID, Alarm Transfer camera,
-storage, and backup workflows to `required`; set the exact `OSCAR_BUILD_LABEL`;
-set `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` to that directory; and run
-`npm run test:3.9.2-release` without `--scenario`.
+Set all operational-view, event-UUID, Alarm Transfer camera, storage, and backup
+workflows to `required`; set the expected `OSCAR_BACKUP_MODE` and exact
+`OSCAR_BUILD_LABEL`; then run `npm run test:3.9.2-release` without `--scenario`.
+Disabled mode is certified live without restore evidence. For single mode,
+preserve the complete PASS directory from a matching unfiltered destructive
+drill and set `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` to it.
 
 This profile refuses filters and requires the full suite. The evidence must be a
 schema-2 restore-drill PASS with zero incorrect/skipped checks, matching suite
 commit, build label, Viewer URL, and release directory, and a complete
 attestation for independent backup reverification, all canaries, unchanged
-immutable images, and the exact pre-restore safety copy. Missing or mismatched
+immutable images, and the private pre-restore safety copy. Missing or mismatched
 evidence fails before mutation.
 
 The Linux SSH/Docker path described above is the automated 3.9.2 gate in this
@@ -560,8 +551,9 @@ confirming that both volumes belong to this deployment, rerun with
 absent from a pre-3.9.2 `.env`; a custom value, duplicate key, or missing key in
 a current-release environment must still fail strict validation. Require the
 canonical binding exactly once after success, then verify that the normalized
-external archive/WAL/backup paths are absolute and resolve outside the versioned
-release directory.
+external archive path and optional single-mode backup path are absolute and
+resolve outside the versioned release directory. A legacy WAL path may be
+retained as compatibility metadata but must not be mounted or grow.
 
 Acceptance also requires a mode-restricted `.oscar-volume-adoption` receipt
 bound to both recorded volume creation identities. Copy that receipt along with

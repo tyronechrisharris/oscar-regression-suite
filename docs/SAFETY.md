@@ -64,8 +64,8 @@ before lifecycle mutation begins.
 
 The only restore coverage is the separately selected `restore-drill` profile.
 It is rejected unless `STORAGE_WORKFLOW=required` and
-`STORAGE_BACKUP_WORKFLOW=required`, the ordinary target and
-disposable-storage acknowledgements pass, all three storage-plane directories
+`STORAGE_BACKUP_WORKFLOW=required`, `OSCAR_BACKUP_MODE=single`, the ordinary target and
+disposable-storage acknowledgements pass, both storage-plane directories
 are canonical, dedicated, and non-overlapping, and all additional values match:
 
 ```text
@@ -73,14 +73,14 @@ OSCAR_RESTORE_TARGET_ACK=test-host|tester@test-host|/absolute/disposable/release
 OSCAR_RESTORE_DISPOSABLE_ACK=test-host:DISPOSABLE-NO-PRODUCTION-DATA
 OSCAR_RESTORE_DATA_LOSS_ACK=I-ACCEPT-DESTRUCTIVE-RESTORE
 OSCAR_RESTORE_ARCHIVE_DIR=/srv/oscar-restore/archive
-OSCAR_RESTORE_WAL_ARCHIVE_DIR=/srv/oscar-restore/wal-archive
 OSCAR_RESTORE_BACKUP_DIR=/srv/oscar-restore/backups
-OSCAR_RESTORE_PATHS_ACK=/srv/oscar-restore/archive|/srv/oscar-restore/wal-archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS
+OSCAR_RESTORE_PATHS_ACK=/srv/oscar-restore/archive|/srv/oscar-restore/backups|DEDICATED-RESTORE-PATHS
 ```
 
 These are interlocks, not permission to use real data. The drill deliberately
-overwrites the current PostgreSQL cluster, OSCAR state, cold archive, WAL
-archive, `.env`, secrets, and TLS with a newly created backup. It uses scoped
+overwrites the current PostgreSQL cluster, OSCAR state, cold archive, `.env`,
+secrets, and TLS with one self-contained schema-v2 backup. No external WAL
+archive is used. It uses scoped
 canaries to prove each plane returned, cleans those canaries after success, and
 leaves the verified backup plus a mode-0700 `pre-restore-ID` safety directory
 containing plaintext pre-restore deployment credentials for manual review.
@@ -96,9 +96,9 @@ services healthy.
 Never place those acknowledgements in a normal runner `.env`.
 Never run the profile against a target whose loss would matter.
 
-Both `restore-drill` and the matching `3.9.2-release` require the same
-available, committed, clean canonical 40-hex suite HEAD. Any tracked or
-untracked file fails closed; ignored `.env` and `results/` are permitted. The
+`restore-drill` and a single-mode `3.9.2-release` that consumes its evidence
+require the same available, committed, clean canonical 40-hex suite HEAD. Any
+tracked or untracked file fails closed; ignored `.env` and `results/` are permitted. The
 supported restore's exact disruption phase retains raw metrics but is excluded
 from steady-state service checks only for this profile. Host coverage, healthy
 pre/post samples, restart/OOM checks, and immutable image identity remain
@@ -152,6 +152,14 @@ records for each generated alarm.
 
 Event and adjudication history is intentionally not deleted. It is audit data and
 is the expected permanent footprint of a full run.
+
+The smoke Dashboard baseline does not toggle faults. It reads the modeled
+`tamper_fault` boolean from every emulator RPM and fails closed if any RPM is
+stopped, disconnected, active, or lacks an explicit value. The separate Viewer
+assertion then proves OSCAR's Rapiscan driver published its required initial
+Tamper-clear observation for the established connections. That driver baseline
+is emitted before later `TT`/`TC` messages are processed. Never replace the two
+independent checks with a harness assumption based only on an Online icon.
 
 ## Automatic restoration
 

@@ -27,11 +27,13 @@ source review before the suite can certify that version.
 - every configured lane and camera on Status of Health
 - compact Dashboard health indicators for every lane, with independent RPM and
   per-camera connectivity; gamma-high/low, neutron-high, tamper, and extended-
-  occupancy states; operational-view membership; keyboard navigation; and
-  bounded shared health requests
+  occupancy states; an explicit known-clear Tamper baseline for every emulated
+  RPM/lane; operational-view membership; keyboard navigation; and bounded
+  shared health requests
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
   extended-occupancy detection and recovery
-- live HLS camera playback, decoded dimensions, and advancing playback time
+- live Gamma and Neutron plot data after Dashboard-to-Lane Details navigation,
+  plus HLS camera playback, decoded dimensions, and advancing playback time
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
@@ -68,10 +70,10 @@ source review before the suite can certify that version.
   tokenized purge, and authenticated coordinated-backup controls, retained-media
   inclusion, scratch exclusion, and daily-journal receipts;
   exact application/PostGIS/gateway tags, immutable running image IDs,
-  available repository digests, OCI labels, checksum and all three deployment-bound
-  storage-root markers, stable lock rejection, exact WAL command, atomic no-replace
-  hard-link publication, packaged helper hashes/behavior, and compiled archive/backup
-  publisher source provenance plus first-publish/collision-preservation behavior, no archive/WAL
+  available repository digests, OCI labels, checksum, the archive root marker and
+  optional single-mode backup marker, stable lock rejection, inactive PostgreSQL
+  WAL archiving with no external bind, packaged helper hashes/behavior, and compiled archive/backup
+  publisher source provenance plus first-publish/collision-preservation behavior, no archive
   partial artifacts, no full-backup-root mount in either long-running service,
   isolated one-shot base-backup wiring, exact-row activation under a
   controlled source-change race, PostgreSQL checksums, `pg_stat_statements`, and
@@ -81,15 +83,22 @@ See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.
 
 The smoke profile requires live Online observations for every configured RPM
-and camera. Its deterministic camera Offline and Unknown checks intercept only
-browser responses and do not disconnect live cameras. The full profile performs
-the real reserved-RPM disconnect/reconnect and supported fault transitions.
+and camera. It also reads every emulator RPM's modeled `tamper_fault` value and
+requires an explicit `false` value plus a corresponding known-clear Dashboard
+state for every lane. The harness never treats an Online icon alone as proof that
+Tamper is clear and never toggles Tamper to manufacture a passing baseline. On
+each newly established RPM connection, OSCAR's Rapiscan driver must publish its
+initial Tamper-clear observation before processing subsequent device `TT`/`TC`
+messages. Deterministic camera Offline and Unknown checks intercept only browser
+responses and do not disconnect live cameras. The full profile performs the real
+reserved-RPM disconnect/reconnect and supported fault transitions.
 
 ## Safety model
 
 `smoke` is non-fault-injecting, but it authenticates, posts a national-statistics
 command, creates report bucket files, and behavior-tests the storage atomic publisher
-when `storage-health` is selected. `full` also changes emulator state and creates permanent,
+when `storage-health` is selected. It also reads each emulator RPM's explicit
+Tamper model state without changing it. `full` also changes emulator state and creates permanent,
 clearly marked adjudication audit records. Full runs are refused unless
 `OSCAR_TEST_TARGET_ACK` exactly matches the host in `OSCAR_BASE_URL`.
 It also requires exact emulator-host and RPM-to-lane acknowledgements. Every
@@ -140,13 +149,13 @@ npm run test:full
 ```
 
 The destructive restore drill is deliberately not part of either command. It
-has its own profile, target lock, storage acknowledgement, three explicit
+has its own profile, target lock, storage acknowledgement, two explicit
 canonical storage-plane paths, and four additional exact acknowledgements. Run
 it only after reviewing
 [docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md):
 
 ```bash
-STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required npm run test:restore-drill
+OSCAR_BACKUP_MODE=single STORAGE_WORKFLOW=required STORAGE_BACKUP_WORKFLOW=required npm run test:restore-drill
 ```
 
 `STORAGE_RESTORE_PROBE_TIMEOUT_MS` is a restore-only deadline (default
@@ -163,19 +172,23 @@ product restore; inspect the preserved failure evidence instead. A malformed,
 linked, or incorrectly permissioned control file is deliberately nonterminal
 and retains the remote lease for operator investigation.
 
-For final 3.9.2 certification, first preserve the complete PASS directory from
-an unfiltered `restore-drill`. Then set every workflow to `required`, set an exact
-`OSCAR_BUILD_LABEL`, point `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching
-directory, and run the unfiltered release profile:
+For final 3.9.2 certification, set every workflow to `required`, set the target's
+exact `OSCAR_BACKUP_MODE`, and set an exact `OSCAR_BUILD_LABEL`. The default
+`disabled` mode is a complete valid release configuration and needs no restore
+evidence. For optional `single` mode, first preserve the complete PASS directory
+from an unfiltered `restore-drill` and point
+`OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at it. Then run the unfiltered release profile:
 
 ```bash
 npm run test:3.9.2-release
 ```
 
-This mode rejects scenario filters, missing/skipped gates, mismatched build or
-target identity, and restore evidence without the complete authenticated-backup,
-canary, immutable-image, and pre-restore-safety-copy attestation. Both commands
-also require the same available, committed, clean 40-hex suite HEAD. Tracked and
+This mode rejects scenario filters, missing/skipped gates, a live backup mode
+different from the configured expectation, and mismatched build or target
+identity. Single mode additionally rejects restore evidence without the complete
+authenticated-backup, canary, immutable-image, and pre-restore-safety-copy
+attestation. For single-mode certification, the drill and release commands also
+require the same available, committed, clean 40-hex suite HEAD. Tracked and
 untracked changes are refused; Git-ignored `.env` and `results/` remain allowed.
 
 Run one or more named scenarios with a comma-separated filter:
@@ -204,10 +217,13 @@ Start from [.env.example](.env.example). Required values are:
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
 | `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
 | `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.9.2 storage profile |
+| `OSCAR_BACKUP_MODE` | exact product policy to certify: `disabled` (default) or optional `single` |
+| `STORAGE_BACKUP_WORKFLOW` | `required` validates the selected mode, `auto` follows configured coverage, and `disabled` skips its mode-specific gate |
 | `OSCAR_RELEASE_DIR` | absolute release path on the disposable OSCAR SSH target |
 | `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>|<ssh-target>|<canonical-release-dir>|DISPOSABLE-STORAGE` interlock for every storage probe, including smoke |
 | `OSCAR_BUILD_LABEL` | exact artifact/component identity; mandatory for `3.9.2-release` |
-| `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` | complete PASS directory from the matching unfiltered restore drill; mandatory for `3.9.2-release` |
+| `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` | complete PASS directory from the matching unfiltered restore drill; mandatory only for single-mode `3.9.2-release` certification |
+| `EXTENDED_OCCUPANCY_SECONDS` | deterministic emulator occupancy duration; default/minimum 150 seconds reserves OSCAR's 60-second reconnect allowance and a 30-second Health/Dashboard observation window beyond the strict one-minute threshold |
 
 Before any storage command or probe upload, the runner resolves
 `OSCAR_RELEASE_DIR` on the SSH target and requires it to be an existing,
@@ -240,6 +256,16 @@ when the camera controls are absent; `disabled` always skips this workflow. This
 is browser-level scanner coverage, not a physical camera or native
 operating-system permission-dialog test.
 
+Keep `EXTENDED_OCCUPANCY_SECONDS` at 150 or longer. Replacing the reserved RPM
+configuration restarts its TCP server, and the emulator can begin the forced
+occupancy before OSCAR detects the closed prior socket and reconnects. OSCAR and
+the Viewer correctly time extended occupancy from the first start sample they
+actually observe, not from the runner's configuration request. The 150-second
+minimum covers the full 60-second reconnect allowance, the Viewer's strict
+`duration > 60 seconds` default, and 30 seconds for the Status of Health and
+Dashboard assertions to see the active state. A 70-second occupancy has only a
+ten-second theoretical margin and is therefore not a valid release oracle.
+
 The canonical future-build fixture is
 [`fixtures/oscar-50-lane-config.csv`](fixtures/oscar-50-lane-config.csv). It uses
 the current 20-column schema and assigns ten lanes apiece to `east-gate`,
@@ -267,8 +293,9 @@ cold purge whose plan includes data outside its unique fixture generation. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
 that disposable test deployment; the packaged and production age default stays
 seven days. It does not restore a backup. Daily-file publication verification requires an
-overnight/rotation-soak fixture; backup verification can be disabled separately
-with `STORAGE_BACKUP_WORKFLOW=disabled`. See
+overnight/rotation-soak fixture. `STORAGE_BACKUP_WORKFLOW=required` validates the
+selected product mode: disabled proves fail-closed non-mutation, while single
+proves one authenticated self-contained snapshot. See
 [docs/STORAGE_REGRESSION.md](docs/STORAGE_REGRESSION.md).
 
 The automated storage probe is a Linux SSH/Docker gate. Native Windows Docker
@@ -280,14 +307,14 @@ Windows pass.
 smoke/full scenario filter. In addition to the ordinary target and storage
 acknowledgements, it requires exact `OSCAR_RESTORE_TARGET_ACK`,
 `OSCAR_RESTORE_DISPOSABLE_ACK`, `OSCAR_RESTORE_DATA_LOSS_ACK`, and
-`OSCAR_RESTORE_PATHS_ACK` values. The last binds three supplied canonical,
-non-overlapping archive, WAL, and backup directories to the authorization. It
+`OSCAR_RESTORE_PATHS_ACK` values. The last binds two supplied canonical,
+non-overlapping archive and backup directories to the authorization. The drill
+requires `OSCAR_BACKUP_MODE=single`. It
 creates an authenticated 3.9.2 backup, mutates isolated canaries across the
-database, application state, archive, `.env`, secrets, and TLS, fingerprints real
-WAL segments before and after that backup, invokes the
-supported restore command, and requires every canary plus a fresh promoted PostgreSQL
-timeline, preserved backup-era and divergent post-backup WAL, archived timeline history/new WAL without an archiver
-failure, a reconstructed exact VERIFIED epoch receipt, cleared one-time recovery state,
+database, application state, and archive, invokes the supported restore command,
+and requires every canary plus a fresh promoted PostgreSQL timeline, a schema-v2
+authenticated CURRENT recovery point, streamed in-snapshot WAL with no cumulative
+`wal-archive.tar.gz`, a durable post-promotion write after restart, cleared one-time recovery state,
 all service health, archive verification, and immutable image identities to return. The test backup
 and `pre-restore-<backup-id>` safety directory are preserved for operator review.
 All raw pre/restore/post resource samples remain in the report. Only the exact

@@ -31,16 +31,15 @@
   non-canonical, or symlinked release and rechecks the binding before each action
 - OSCAR 3.9.2 release identity resolves exactly `oscar:3.9.2`,
   `oscar-postgis:3.9.2`, and the pinned gateway; running IDs match local image
-  IDs; application/PostGIS OCI labels, checksum marker, and the archive,
-  WAL-archive, and backup root v1 identities match the lowercase deployment ID
-- stable deployment lock and packaged/running WAL/archive helper checks pass;
+  IDs; application/PostGIS OCI labels, checksum marker, archive root identity,
+  and optional single-mode backup identity match the lowercase deployment ID
+- stable deployment lock and packaged/running archive/restore helper checks pass;
   the compiled atomic publisher matches its packaged-source provenance stamp
   and preserves both source and destination when a publication collides;
 - neither long-running service mounts the full backup root; the packaged flow
   wires a one-shot base-backup client to only fresh staging and exact credentials;
-  PostgreSQL uses the exact helper-backed `archive_command` and the WAL helper's
-  flushed-temp atomic no-replace hard-link contract; archive and WAL roots
-  contain no partial artifacts
+  PostgreSQL has archive mode off, timeout zero, an inactive archive command,
+  and no external WAL bind; the archive root contains no partial artifacts
 - schema version is exactly 5 with checksum
   `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`;
   DuckDB is fixed at 256 MiB/two threads/4,096 MiB spill/two concurrent sessions/
@@ -107,8 +106,8 @@
   other media settings are preserved and the packaged production default remains
   seven days
 - the disposable lifecycle's controlled stale-activation race, exact-row retry,
-  packaged CLI export/purge archive-helper wiring and invocation, and synthetic WAL helper
-  idempotency/mismatch checks all completed and cleaned their temporary state
+  packaged CLI export/purge archive-helper wiring and invocation all completed
+  and cleaned their temporary state
 - `GENERATION_EXACT` and `COLD_RANGE_CONSERVATIVE` holds were created, listed,
   excluded the fixture generation from dry-run plans, and released; `HOT_EXACT`
   rejected authenticated deletion until release; no active fixture hold remains
@@ -146,31 +145,34 @@
 
 - no smoke/full command contains the restore scenario
 - the deployment is isolated, disposable, and contains no production data
-- target/release/archive/WAL/backup paths were manually reviewed
+- target/release/archive/backup paths were manually reviewed
 - exact `OSCAR_STORAGE_TARGET_ACK`, `OSCAR_RESTORE_TARGET_ACK`,
   `OSCAR_RESTORE_DISPOSABLE_ACK`, `OSCAR_RESTORE_DATA_LOSS_ACK`, and
   `OSCAR_RESTORE_PATHS_ACK` values are set
-- canonical archive, WAL, and backup directories resolve exactly to the three
+- `OSCAR_BACKUP_MODE=single` is explicit and canonical archive and backup
+  directories resolve exactly to the two
   acknowledged, dedicated, non-overlapping storage planes
 - capacity exists for a new backup and OSCAR's `pre-restore-ID` safety directory
-- operator accepts replacement of PostgreSQL, OSCAR state, archive, WAL,
+- operator accepts replacement of PostgreSQL, OSCAR state, archive,
   `.env`, secrets, and TLS and knows how to recover if services remain stopped
 - after the drill, PostgreSQL is out of recovery on a timeline newer than the base
-  backup; fingerprinted backup-era and divergent post-backup source-timeline WAL
-  are both byte-identical and were never deleted; the new timeline's
-  history and a new WAL segment are archived without a post-start archiver failure;
+  backup; the snapshot is schema v2, authenticated by CURRENT, contains streamed
+  `pg_wal`, has no cumulative WAL tar or external WAL dependency, and a
+  post-promotion write survives checkpoint/restart;
   the exact authenticated `VERIFIED` epoch receipt exists; one-time recovery settings
   and signals are absent; every canary, service health, archive verification, and
-  image identity check passed; the root-owned mode-0700 safety copy exactly
-  preserves every mutated `.env`/secrets/TLS name, content, owner, group, and mode
-  without links; the preserved backup/safety directory was recorded
+  image identity check passed; the root-owned mode-0700 safety copy contains
+  safe, non-linked `.env`, `secrets/`, and `tls/` entries; the preserved
+  backup/safety directory was recorded
 
 ## Strict 3.9.2 certification
 
 - the release run is unfiltered and all operational-view, UUID, Alarm Transfer
   camera, storage, and backup workflows are `required`
-- `OSCAR_BUILD_LABEL` identifies the exact candidate and
-  `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` names the complete matching unfiltered
-  restore-drill PASS directory
-- restore evidence has zero incorrect/skipped checks, matching suite/build/URL/
-  release identity, and complete backup/canary/image/safety-copy attestation
+- `OSCAR_BUILD_LABEL` identifies the exact candidate and the live target exactly
+  matches `OSCAR_BACKUP_MODE`; disabled is a complete valid live certification
+- for single mode only, `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` names the complete
+  matching unfiltered restore-drill PASS directory
+- when single-mode restore evidence is required, it has zero incorrect/skipped
+  checks, matching suite/build/URL/release identity, and complete
+  backup/canary/image/safety-copy attestation

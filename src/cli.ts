@@ -61,7 +61,8 @@ async function main(): Promise<number> {
   const config = loadConfig();
   assertMutationAllowed(config);
   const suiteGitCommit = resolveSuiteGitCommit(config.profile);
-  const restoreEvidence = config.profile === "3.9.2-release"
+  const restoreEvidence = config.profile === "3.9.2-release" &&
+      config.storageBackupMode === "single"
     ? validateRestoreEvidenceBundle(config.releaseRestoreEvidenceDirectory ?? "", {
       suiteGitCommit,
       oscarBuildLabel: config.oscarBuildLabel ?? "",
@@ -102,6 +103,7 @@ async function main(): Promise<number> {
     storageWorkflow: config.storageWorkflow,
     storageExpectedRelease: config.storageExpectedRelease,
     storageBackupWorkflow: config.storageBackupWorkflow,
+    storageBackupMode: config.storageBackupMode,
     storageProbeTimeoutMs: config.storageProbeTimeoutMs,
     storageRestoreProbeTimeoutMs: config.storageRestoreProbeTimeoutMs,
     ...(config.oscarReleaseDirectory

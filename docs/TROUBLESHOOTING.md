@@ -46,6 +46,27 @@ checks use browser-only response fixtures; they do not disconnect cameras or
 modify SensorHub data. Preserve the evidence screenshot and do not weaken the
 batch or accessibility assertions to accommodate a failing build.
 
+If the failure reports `Tamper: Unknown`, compare both baseline rows. The
+emulator-source row must show every RPM running, OSCAR-connected, and explicitly
+`tamper_fault=false`; the Dashboard row must then show all lanes clear with no
+Unknown indicator. A source-row failure is an emulator inventory/state problem.
+A passing source row plus a failing Dashboard row means OSCAR's Rapiscan driver
+did not publish or retain its required initial Tamper-clear observation when the
+RPM connection was established. Inspect or upgrade OSCAR's driver and reconnect
+the authorized test RPMs so that initialization path runs before later `TT`/`TC`
+messages are processed. Do not infer clear from an Online icon and do not bulk
+toggle Tamper just to seed observations.
+
+## Lane Details shows only Threshold or empty measurement charts
+
+The `lane-video` scenario navigates from Dashboard to Lane Details and requires
+actual red Gamma and blue Neutron plot pixels, excluding title/legend regions.
+If this row fails while the canvases and video pass, preserve
+`lane-detail-live-telemetry.png` and inspect the Gamma/Neutron real-time
+datasource subscription lifecycle during the route transition. A visible chart
+container or a purple Threshold series is not evidence that measurement data is
+flowing.
+
 ## Viewer navigation reports `net::ERR_TOO_MANY_RETRIES`
 
 The suite treats this exact Chromium connection-pool error as a bounded
@@ -61,6 +82,23 @@ the OSCAR host/container samples; do not add broad or repeated retries.
 Stop further full runs and follow the manual recovery procedure in
 [SAFETY.md](SAFETY.md). The recovery JSON is in the failed run's `evidence/`
 directory.
+
+## Extended occupancy stays Clear or shows less than the configured duration
+
+Do not infer a product fault from the emulator's wall-clock occupancy alone.
+Replacing the reserved RPM configuration restarts its TCP server; the emulator
+may enter `OCCUPIED` before OSCAR's old connection reaches its heartbeat timeout
+and reconnects. The Viewer intentionally uses the canonical start time OSCAR
+actually observed and activates the default fault only when elapsed time is
+strictly greater than 60 seconds. Consequently, a former 70-second fixture
+could leave fewer than 60 observable seconds and legitimately remain Clear.
+
+Use the tracked default/minimum `EXTENDED_OCCUPANCY_SECONDS=150`. It budgets the
+complete 60-second reconnect allowance plus a 30-second post-threshold window
+for both UI assertions. If a 150-second run still fails, compare the emulator
+client/reconnect timestamps, the displayed occupancy duration, and the two UI
+rows. Do not weaken the strict threshold assertion or reinterpret a second
+automatic occupancy as proof of the first.
 
 ## Report generation times out
 
