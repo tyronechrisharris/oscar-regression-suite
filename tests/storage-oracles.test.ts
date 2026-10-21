@@ -274,7 +274,7 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     hotRetentionDays: 1, deleteHotAfterArchive: true, rollbackGraceDays: 1,
     packagedDefaults: {archiveEnabled: true, archiveIntervalMinutes: 60,
       hotRetentionDays: 2, rollbackGraceDays: 1,
-      deleteHotAfterArchive: true, videoRetentionDays: 1, videoQueryPeriodMinutes: 5,
+      deleteHotAfterArchive: true, videoRetentionDays: 0, videoQueryPeriodMinutes: 5,
       maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
       lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
       reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,

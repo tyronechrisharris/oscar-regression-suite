@@ -139,7 +139,8 @@ expectation matches. Never copy the one-day archive eligibility or one-minute
 scheduler interval into production. The platform gate separately reads
 `/opt/oscar/config.json` and requires the shipping policy: two-day archive
 eligibility, one-day rollback grace, verified hot-row deletion enabled, and
-one-day/five-JPEG media eligibility. The eligibility plus grace makes the
+immediate asynchronous five-JPEG media eligibility with a 24-hour source-video
+rollback grace. The archive eligibility plus grace makes the
 normal hot-row deletion boundary approximately 72 hours.
 
 The disposable configuration must also set these fields in the
@@ -170,10 +171,10 @@ run eligible on the next one-minute query, while 24 hours keeps each exact sourc
 MP4 available for the end-of-run ownership/decodability oracle. Preserve all
 other `videoRetentionConfig` fields. Full-profile preflight reads the persisted live
 config and requires the complete bounded scanner and media-retention profile before retained-media polling or cold-fixture
-creation, so a normal one-day deployment fails early instead of timing out.
-Do not copy the zero-day test value into production; the packaged default is
-`timeToRetention=1`, with a further 24-hour source rollback grace after the five
-JPEGs publish successfully.
+creation, so a deployment with stale media policy fails early instead of timing out.
+The zero-day eligibility is also the packaged production default: work remains
+asynchronous and bounded, five JPEGs must publish and verify successfully, and
+the source MP4 remains available for the following 24-hour rollback grace.
 Saving the form does not reconfigure an already running retained-media worker.
 On a newly initialized disposable site, save this profile and use the supported
 OSCAR restart before importing lanes or permitting emulator traffic. Require

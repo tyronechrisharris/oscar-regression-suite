@@ -211,7 +211,7 @@ const SHIPPING_STORAGE_POLICY = {
   hotRetentionDays: 2,
   rollbackGraceDays: 1,
   deleteHotAfterArchive: true,
-  videoRetentionDays: 1,
+  videoRetentionDays: 0,
   videoQueryPeriodMinutes: 5,
   maximumCatchUpHours: 6,
   lateArrivalOverlapHours: 24,
