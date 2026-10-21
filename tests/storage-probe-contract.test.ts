@@ -906,6 +906,8 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
   assert.match(status, /g\.min_id=\(SELECT min\(id\) FROM unnest\(f\.cold_ids\)/);
   assert.match(status, /o\.archivegenerationid=g\.id/);
   assert.match(status, /exactRowOwnership/);
+  assert.match(status, /o\.id=ANY\(\(SELECT cold_ids FROM f\)\)/);
+  assert.doesNotMatch(status, /count\(\*\)=cardinality\(f\.cold_ids\)\s+FROM obs o,f,g/);
 
   const cleanupStart = probe.indexOf("  fixture-cleanup)");
   const cleanup = probe.slice(cleanupStart, probe.indexOf("  *) fail", cleanupStart));
