@@ -168,10 +168,15 @@ content.
 
 The full target must be disposable and its persisted OSCAR service config must
 have `timeToRetention=0`, `videoQueryPeriod=1`,
+`maximumCatchUpHours=6`, `lateArrivalOverlapHours=24`,
+`lateArrivalScanPeriodMinutes=360`, `lateArrivalCatchUpHours=2`,
+`reconciliationCatchUpHours=24`, `reconciliationPeriodHours=24`, and
+`occupancyStreamRefreshMinutes=15`,
 `enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
-`sourceRollbackGraceHours=24`, with `metadataReclamationWorkLimit=200`.
+`sourceRollbackGraceHours=24`, with `maintenanceWorkLimit=200` and
+`metadataReclamationWorkLimit=200`.
 Lifecycle preflight reports the observed `videoRetention` object and refuses the
-test before polling if any value differs. Seven days is the correct production
+test before polling if any value differs. One day is the production eligibility
 default, but cannot retain a freshly generated alarm during this run.
 
 Also inspect the `verify accelerated retained-media worker is active` row. A

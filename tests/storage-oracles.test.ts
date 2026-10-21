@@ -269,8 +269,20 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     archiveMarker: {present: true, exact: true, format: "oscar-storage-profile", version: "3.9.2",
       dataChecksums: "on", initializedAt: "2026-10-17T12:00:00Z"},
     batchRewriteConfigured: true, batchRewriteObservedCalls: 2,
-    batchRewriteObservedRows: 100, dailyJournalConfigured: true, archiveIntervalMinutes: 1,
-    deleteHotAfterArchive: true, rollbackGraceDays: 1,
+    batchRewriteObservedRows: 100, dailyJournalConfigured: true, archiveEnabled: true,
+    archiveIntervalMinutes: 1,
+    hotRetentionDays: 1, deleteHotAfterArchive: true, rollbackGraceDays: 1,
+    packagedDefaults: {archiveEnabled: true, archiveIntervalMinutes: 60,
+      hotRetentionDays: 2, rollbackGraceDays: 1,
+      deleteHotAfterArchive: true, videoRetentionDays: 1, videoQueryPeriodMinutes: 5,
+      maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
+      lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
+      reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,
+      occupancyStreamRefreshMinutes: 15, retainedFrameCount: 5,
+      jpegQuality: 85, sourceRollbackGraceHours: 24,
+      metadataReclamationWorkLimit: 200, maintenanceWorkLimit: 200,
+      frameRetentionEnabled: true, sealedJournalRetentionDays: 30,
+      requireBackupBeforeSealedJournalDeletion: false},
     archiveResources: {memoryLimitMegabytes: 256, threads: 2,
       maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
       sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"},
@@ -280,18 +292,26 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
       publicationDirectory: "dailyfiles", zoneId: "UTC", observationMode: "LATEST",
       fsyncIntervalMillis: 1000, maxUnforcedRecords: 128, maxUnforcedBytes: 1048576,
       maxSegmentBytes: 67108864, maxSegmentAgeSeconds: 900, maxRecordBytes: 4194304,
-      sealedJournalRetentionDays: 30, observationLifecycleDelegated: true, purgeWorkLimit: 50},
+      sealedJournalRetentionDays: 30, requireBackupBeforeSealedJournalDeletion: false,
+      observationLifecycleDelegated: true, purgeWorkLimit: 50},
     videoRetention: {enabled: true, timeToRetentionDays: 0, queryPeriodMinutes: 1,
+      maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
+      lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
+      reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,
+      occupancyStreamRefreshMinutes: 15,
       frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
-      metadataReclamationWorkLimit: 200}});
+      metadataReclamationWorkLimit: 200, maintenanceWorkLimit: 200}});
   assert.equal(platform.schemaVersion, 5);
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
   assert.equal(platform.backupMode, "single");
   assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
   assert.deepEqual(platform.videoRetention, {enabled: true, timeToRetentionDays: 0,
-    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
-    metadataReclamationWorkLimit: 200});
+    queryPeriodMinutes: 1, maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
+    lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
+    reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,
+    occupancyStreamRefreshMinutes: 15, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
+    metadataReclamationWorkLimit: 200, maintenanceWorkLimit: 200});
   assert.deepEqual(platform.archiveResources, {memoryLimitMegabytes: 256, threads: 2,
     maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
     sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"});
@@ -327,6 +347,16 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     {...platform, dailyJournal: {...platform.dailyJournal, observationMode: "FULL"}},
     "3.9.2",
   ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, dailyJournal: {
+      ...platform.dailyJournal, requireBackupBeforeSealedJournalDeletion: true}},
+    "3.9.2",
+  ), false, "disabled-by-default backup must not leave private journals unbounded");
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, packagedDefaults: {
+      ...platform.packagedDefaults, requireBackupBeforeSealedJournalDeletion: true}},
+    "3.9.2",
+  ), false, "the packaged lifecycle must expose the no-backup journal policy");
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, archiveMarker: {...platform.archiveMarker, initializedAt: "not-an-instant"}},
     "3.9.2",
@@ -404,12 +434,14 @@ test("archive scratch and retained-media metadata contracts fail closed", () => 
   assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
     ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), true), false);
   const metadataHealth = assessMediaMetadataHealth({rootPresent: true, checkpointPresent: true,
-    checkpointValid: true, checkpointSchemaVersion: 2, processedIndexFiles: 1,
+    checkpointValid: true, checkpointSchemaVersion: 2,
+    totalEntries: 100_001, regularFiles: 90_001, directories: 10_000, processedIndexFiles: 1,
     processedIndexBytes: 52, deletionIndexFiles: 0, deletionIndexBytes: 0,
     retainedManifestFiles: 1, retainedJpegFiles: 5, legacyProcessedMarkerFiles: 0,
     legacyDeletionTombstones: 0, partialArtifacts: 0, unsafeEntries: 0,
     indexFormatFailures: 0});
   assert.equal(mediaMetadataHealthIsSafe(metadataHealth, true), true);
+  assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, totalEntries: 100_002}, true), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, indexFormatFailures: 1}, false), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointSchemaVersion: 1}, true), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointPresent: false,

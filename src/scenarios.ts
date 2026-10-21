@@ -180,10 +180,18 @@ const REGRESSION_MEDIA_RETENTION = {
   enabled: true,
   timeToRetentionDays: 0,
   queryPeriodMinutes: 1,
+  maximumCatchUpHours: 6,
+  lateArrivalOverlapHours: 24,
+  lateArrivalScanPeriodMinutes: 360,
+  lateArrivalCatchUpHours: 2,
+  reconciliationCatchUpHours: 24,
+  reconciliationPeriodHours: 24,
+  occupancyStreamRefreshMinutes: 15,
   frameCount: 5,
   jpegQuality: 85,
   sourceRollbackGraceHours: 24,
   metadataReclamationWorkLimit: 200,
+  maintenanceWorkLimit: 200,
 } as const;
 
 const REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS = 180;
@@ -195,6 +203,29 @@ const REGRESSION_ARCHIVE_RESOURCES = {
   maximumConcurrentSessions: 2,
   sessionAcquireTimeoutSeconds: 30,
   temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
+} as const;
+
+const SHIPPING_STORAGE_POLICY = {
+  archiveEnabled: true,
+  archiveIntervalMinutes: 60,
+  hotRetentionDays: 2,
+  rollbackGraceDays: 1,
+  deleteHotAfterArchive: true,
+  videoRetentionDays: 1,
+  videoQueryPeriodMinutes: 5,
+  maximumCatchUpHours: 6,
+  lateArrivalOverlapHours: 24,
+  lateArrivalScanPeriodMinutes: 360,
+  lateArrivalCatchUpHours: 2,
+  reconciliationCatchUpHours: 24,
+  reconciliationPeriodHours: 24,
+  occupancyStreamRefreshMinutes: 15,
+  retainedFrameCount: 5,
+  jpegQuality: 85,
+  sourceRollbackGraceHours: 24,
+  metadataReclamationWorkLimit: 200,
+  maintenanceWorkLimit: 200,
+  frameRetentionEnabled: true,
 } as const;
 
 function isVisible(locator: Locator): Promise<boolean> {
@@ -3852,7 +3883,13 @@ export class RegressionScenarios {
           value.pgStatStatementsInstalled && value.pgStatStatementsPreloaded &&
           value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
           value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM && value.batchRewriteConfigured &&
-          value.dailyJournalConfigured &&
+          value.archiveEnabled === true &&
+          value.dailyJournalConfigured && value.deleteHotAfterArchive === true &&
+          value.rollbackGraceDays === 1 &&
+          value.archiveIntervalMinutes === 1 &&
+          value.hotRetentionDays === this.config.storageHotRetentionDays &&
+          Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
+            value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
           resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
           resources.threads === REGRESSION_ARCHIVE_RESOURCES.threads &&
           resources.maximumTemporaryMegabytes ===
@@ -3977,11 +4014,6 @@ export class RegressionScenarios {
           });
         } finally { await page.close(); }
       }
-      if (platform?.deleteHotAfterArchive === true && this.config.profile === "smoke") {
-        this.reporter.error("storage-health", "configuration",
-          "deleteHotAfterArchive is enabled on a smoke-only target; require a successful lifecycle/restore qualification before production rollout",
-          "", "warning");
-      }
     } finally { await probe.cleanup(); }
   }
 
@@ -4003,7 +4035,9 @@ export class RegressionScenarios {
         const passed = storagePlatformHasExactReleaseIdentity(
           platform, this.config.storageExpectedRelease, this.config.storageBackupMode,
         ) &&
-            platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
+            platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
+            platform.rollbackGraceDays === 1 &&
+            platform.hotRetentionDays === this.config.storageHotRetentionDays &&
             platform.archiveIntervalMinutes === 1 &&
             platform.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
             platform.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
@@ -4019,11 +4053,23 @@ export class RegressionScenarios {
             media.enabled === REGRESSION_MEDIA_RETENTION.enabled &&
             media.timeToRetentionDays === REGRESSION_MEDIA_RETENTION.timeToRetentionDays &&
             media.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION.queryPeriodMinutes &&
+            media.maximumCatchUpHours === REGRESSION_MEDIA_RETENTION.maximumCatchUpHours &&
+            media.lateArrivalOverlapHours === REGRESSION_MEDIA_RETENTION.lateArrivalOverlapHours &&
+            media.lateArrivalScanPeriodMinutes ===
+              REGRESSION_MEDIA_RETENTION.lateArrivalScanPeriodMinutes &&
+            media.lateArrivalCatchUpHours === REGRESSION_MEDIA_RETENTION.lateArrivalCatchUpHours &&
+            media.reconciliationCatchUpHours ===
+              REGRESSION_MEDIA_RETENTION.reconciliationCatchUpHours &&
+            media.reconciliationPeriodHours ===
+              REGRESSION_MEDIA_RETENTION.reconciliationPeriodHours &&
+            media.occupancyStreamRefreshMinutes ===
+              REGRESSION_MEDIA_RETENTION.occupancyStreamRefreshMinutes &&
             media.frameCount === REGRESSION_MEDIA_RETENTION.frameCount &&
             media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality &&
             media.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION.sourceRollbackGraceHours &&
             media.metadataReclamationWorkLimit ===
-              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit;
+              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit &&
+            media.maintenanceWorkLimit === REGRESSION_MEDIA_RETENTION.maintenanceWorkLimit;
         return {
           passed,
           value: passed,
@@ -4188,9 +4234,13 @@ export class RegressionScenarios {
         const requirePopulated = this.generatedAlarmMedia.size > 0;
         return {passed: mediaMetadataHealthIsSafe(value, requirePopulated), observed: JSON.stringify(value)};
       });
-      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
+      const lifecycleBefore = storageMetricFromProbe(
+        "storage-lifecycle-before",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(lifecycleBefore);
       fixtureCreateAttempted = true;
-      const fixture = await probe.runJson<{coldId: string; hotId: string; datastreamId: number;
+      const fixture = await probe.runJson<{coldId: string; coldRowCount: number; hotId: string; datastreamId: number;
         coldTime: string; hotTime: string; activationBlocked: boolean; sourceMutated: boolean;
         staleActivationRejected: boolean; staleRowUnmarked: boolean}>(
           "fixture-create-race", [fixtureRun, String(this.config.storageHotRetentionDays)]);
@@ -4208,16 +4258,19 @@ export class RegressionScenarios {
           fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
           "fixture-status", [fixtureRun]),
         value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
-          value.parityVerified && value.generationRows === 1 && value.markedRows === 1 &&
+          value.parityVerified && value.generationRows === fixture.coldRowCount &&
+          value.markedRows === fixture.coldRowCount &&
           value.fixtureColdMarked && value.fixtureHotUnmarked && value.exactRowOwnership),
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "the retried exact source row to enter one parity-verified archive generation"},
+          description: "the retried exact source row set to enter one parity-verified archive generation"},
       );
       await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
         target: String(fixture.coldId),
-        expected: "only the exact exported cold row is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
+        expected: "only the exact exported three-row cold fixture is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
           passed: Boolean(archived.generationId && archived.parityVerified && archived.exactRowOwnership &&
-            archived.markedRows === 1 && archived.generationMinId === fixture.coldId &&
+            fixture.coldRowCount === 3 && archived.generationRows === fixture.coldRowCount &&
+            archived.markedRows === fixture.coldRowCount &&
+            archived.generationMinId === (BigInt(fixture.coldId) - 2n).toString() &&
             archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
         }));
       const exportDisruptionPhase = "storage-lifecycle-export-disruption";
@@ -4249,6 +4302,11 @@ export class RegressionScenarios {
       const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
       const hotPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.hotId));
       const streamPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.datastreamId));
+      const archiveDeleteBefore = storageMetricFromProbe(
+        "storage-lifecycle-before-multirow-hot-delete",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(archiveDeleteBefore);
       await probe.runJson("fixture-accelerate", [fixtureRun]);
       const sealed = await poll(
         () => probe.runJson<{generationState: string | null; coldHotPresent: boolean; hotPresent: boolean}>(
@@ -4257,6 +4315,28 @@ export class RegressionScenarios {
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
           description: "parity-verified fixture generation to seal and delete only its cold hot-store row"},
       );
+      const archiveDeleteAfter = storageMetricFromProbe(
+        "storage-lifecycle-after-multirow-hot-delete",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(archiveDeleteAfter);
+      await this.check({scenario: "storage-lifecycle", category: "performance",
+        action: "verify one guarded multi-row PostgreSQL purge",
+        target: archived.generationId ?? "fixture generation",
+        expected: "the exact three-row fixture is removed by one id=ANY guarded delete with no singleton delete"}, async () => {
+        const metricDelta = (field: keyof typeof archiveDeleteBefore): number | null => {
+          const before = archiveDeleteBefore[field];
+          const after = archiveDeleteAfter[field];
+          return typeof before === "number" && typeof after === "number" ? after - before : null;
+        };
+        const batchCalls = metricDelta("batchedObservationDeleteCalls");
+        const batchRows = metricDelta("batchedObservationDeleteRows");
+        const singletonCalls = metricDelta("legacySingletonObservationDeleteCalls");
+        const passed = fixture.coldRowCount === 3 && !sealed.coldHotPresent &&
+          batchCalls === 1 && batchRows === fixture.coldRowCount && singletonCalls === 0;
+        return {passed, observed: JSON.stringify({batchCalls, batchRows, singletonCalls,
+          coldRowCount: fixture.coldRowCount, coldHotPresent: sealed.coldHotPresent})};
+      });
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query cold event by ID",
         target: coldPublicId, expected: "the cold observation remains queryable after its PostgreSQL row is removed"}, async () => {
         const response = await request.get(this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(coldPublicId)}`));
@@ -4514,7 +4594,35 @@ export class RegressionScenarios {
       }
       await apiPage.close();
       apiPage = undefined;
-      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-after", await probe.runJson("snapshot")));
+      const lifecycleAfter = storageMetricFromProbe(
+        "storage-lifecycle-after",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(lifecycleAfter);
+      await this.check({
+        scenario: "storage-lifecycle",
+        category: "performance",
+        action: "verify bounded database work amplification",
+        target: "PostgreSQL observation lifecycle",
+        expected: "the lifecycle adds no singleton observation deletes and writes at most 512 MiB of PostgreSQL temporary data",
+      }, async () => {
+        const delta = (field: keyof typeof lifecycleBefore): number | null => {
+          const before = lifecycleBefore[field];
+          const after = lifecycleAfter[field];
+          return typeof before === "number" && typeof after === "number" ? after - before : null;
+        };
+        const tempBytes = delta("tempBytes");
+        const tempBlocks = delta("statementTempBlocksWritten");
+        const singletonDeletes = delta("legacySingletonObservationDeleteCalls");
+        const countersMonotonic = [tempBytes, tempBlocks, singletonDeletes]
+          .every(value => value !== null && value >= 0);
+        const passed = countersMonotonic && tempBytes! <= 512 * 1024 * 1024 &&
+          tempBlocks! <= 65_536 && singletonDeletes === 0;
+        return {passed, observed: JSON.stringify({
+          tempBytes, statementTempBlocksWritten: tempBlocks,
+          legacySingletonObservationDeleteCalls: singletonDeletes,
+        })};
+      });
     } finally {
       if (apiPage) await apiPage.close().catch(() => undefined);
       if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>

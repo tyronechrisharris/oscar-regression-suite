@@ -133,6 +133,14 @@ export interface StorageMetricSample {
   observationInsertCalls: number | null;
   observationInsertRows: number | null;
   observationRowsPerCall: number | null;
+  statementTempBlocksWritten: number | null;
+  observationDeleteCalls: number | null;
+  observationDeleteRows: number | null;
+  observationRowsPerDeleteCall: number | null;
+  legacySingletonObservationDeleteCalls: number | null;
+  batchedObservationDeleteCalls: number | null;
+  batchedObservationDeleteRows: number | null;
+  batchedObservationRowsPerDeleteCall: number | null;
   activeArchiveGenerations: number | null;
   sealedArchiveGenerations: number | null;
   archiveRows: number | null;

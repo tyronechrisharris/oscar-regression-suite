@@ -81,6 +81,7 @@ function structuralStorageFixtureAccepted(value: unknown): boolean {
     typeof media.enableFrameRetention === "boolean" &&
     typeof media.frameRetentionCount === "number" &&
     typeof db.useBatch === "boolean" && db.useBatch === true &&
+    typeof archive.hotRetentionDays === "number" &&
     typeof archive.deleteHotAfterArchive === "boolean" &&
     typeof daily[0]!.maxSegmentBytes === "number";
 }
@@ -403,14 +404,19 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
   assert.doesNotMatch(block, /config_text_matches|daily_config_text|oscar_config_text/);
   assert.doesNotMatch(block, /sed -n 's\/\.\*"(?:intervalMinutes|frameRetentionCount|maxSegmentBytes)/);
   for (const field of [
-    "timeToRetention", "videoQueryPeriod", "enableFrameRetention", "frameRetentionCount", "jpegQuality",
-    "sourceRollbackGraceHours", "metadataReclamationWorkLimit",
+    "timeToRetention", "videoQueryPeriod", "maximumCatchUpHours", "lateArrivalOverlapHours",
+    "lateArrivalScanPeriodMinutes", "lateArrivalCatchUpHours", "reconciliationCatchUpHours",
+    "reconciliationPeriodHours", "occupancyStreamRefreshMinutes",
+    "enableFrameRetention", "frameRetentionCount", "jpegQuality",
+    "sourceRollbackGraceHours", "maintenanceWorkLimit", "metadataReclamationWorkLimit",
     "duckDbMemoryLimitMegabytes", "duckDbThreads", "duckDbMaximumTemporaryMegabytes",
     "duckDbMaximumConcurrentSessions", "duckDbSessionAcquireTimeoutSeconds",
     "duckDbTemporaryDirectory", "archiveResources", "schemaChecksum", "archiveScratch",
+    "archiveEnabled", "hotRetentionDays", "packagedDefaults", "/opt/oscar/config.json",
     "dailyJournal", "rootDirectory", "journalDirectory", "publicationDirectory",
     "dailyFileObservationMode", "fsyncIntervalMillis", "maxUnforcedRecords", "maxUnforcedBytes",
     "maxSegmentBytes", "maxSegmentAgeSeconds", "maxRecordBytes", "sealedJournalRetentionDays",
+    "requireBackupBeforeSealedJournalDeletion",
     "delegateObservationLifecycleToDatabase", "dailyFilePurgeWorkLimit",
   ]) assert.ok(configContract.includes(field), `missing bounded-storage preflight field: ${field}`);
   assert.match(block, /config=\/var\/lib\/oscar\/config[.]json/);
@@ -427,7 +433,7 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
   const database = {objClass: "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
     moduleClass: "org.sensorhub.impl.database.system.SystemDriverDatabase",
     dbConfig: {objClass: "org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig",
-      useBatch: true, archive: {deleteHotAfterArchive: false}}};
+      useBatch: true, archive: {hotRetentionDays: 2, deleteHotAfterArchive: true}}};
   const valid = [daily, oscar, database];
   assert.equal(structuralStorageFixtureAccepted(valid), true);
   assert.equal(structuralStorageFixtureAccepted([
@@ -440,6 +446,8 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
   assert.equal(structuralStorageFixtureAccepted(wrongType), false,
     "a shape-compatible string cannot satisfy a numeric storage field");
   assert.ok(block.includes("AND query ~ '[)][[:space:]]*,[[:space:]]*[(]'"));
+  assert.match(block, /SELECT oid AS dbid FROM pg_database WHERE datname = current_database\(\)/);
+  assert.match(block, /JOIN current_db USING \(dbid\)/);
   assert.match(block, /\$batch_rows -gt \$batch_calls/);
   assert.doesNotMatch(block, /reWriteBatchedInserts|OscarTieredObsSystemDatabase\|/);
 });
@@ -614,13 +622,21 @@ test("media metadata probe validates compact checkpoint and exact binary indexes
   for (const required of [
     ".metadata-reclamation-checkpoint.json", "checkpoint_schema",
     "earliestProcessedObservationEpochHour", "retention-processed-index", "deletion-index",
-    "legacyProcessedMarkerFiles", "legacyDeletionTombstones", "indexFormatFailures", "100000",
+    "totalEntries", "regularFiles", "directories", "legacyProcessedMarkerFiles",
+    "legacyDeletionTombstones", "indexFormatFailures", "find \"$root\" -xdev",
     "4f534341524d50490000000100000024", "4f534341524d44490000000100000024",
   ]) assert.ok(helper.includes(required), `missing media metadata health contract: ${required}`);
   assert.match(helper, /\^\[0-9\]\{19\}-\(0\[0-9\]\|1\[01\]\)\[.]idx\$/);
   assert.match(helper, /\(\(\(size-16\)%36\)\)/);
   assert.doesNotMatch(helper, /records[^\n]*-gt 100000/,
     "valid high-rate five-minute index files must stream rather than fail format validation");
+  assert.doesNotMatch(helper, /total_entries[^\n]*(?:-gt|-le)\s*100000/,
+    "valid retained trees over 100,000 entries must be inventoried rather than rejected");
+  assert.match(helper, /find "\$root" -xdev -mindepth 1 -printf "%y\\t%P\\n" >"\$inventory_file"/,
+    "inventory generation must preserve a failing find status instead of hiding it in a pipe");
+  assert.doesNotMatch(helper, /find "\$root" -xdev -mindepth 1 -printf[^\n]*[|][^\n]*awk/);
+  assert.match(helper, /-name "\*\$newline\*" -o -name "\*\$tab\*"/,
+    "filenames that can corrupt the line-oriented inventory must fail closed");
   assert.match(probe, /  media-metadata-health\)/);
   assert.match(probe, /  retention-runtime-health\)/);
   assert.match(probe, /  archive-scratch-health\)/);
@@ -642,7 +658,18 @@ test("storage snapshot emits activeHolds exactly once", () => {
     "retainedMediaManifestFiles", "retainedMediaJpegFiles", "processedObservationIndexFiles",
     "processedObservationIndexBytes", "deletionIndexFiles", "deletionIndexBytes",
     "legacyProcessedMarkerFiles", "legacyDeletionTombstones", "mediaMetadataCheckpointBytes",
+    "statementTempBlocksWritten", "observationDeleteCalls", "observationDeleteRows",
+    "observationRowsPerDeleteCall", "legacySingletonObservationDeleteCalls",
+    "batchedObservationDeleteCalls", "batchedObservationDeleteRows",
+    "batchedObservationRowsPerDeleteCall",
   ]) assert.ok(block.includes(field), `missing media storage metric: ${field}`);
+  assert.match(block, /current_db AS \(SELECT oid FROM pg_database WHERE datname=current_database\(\)\)/);
+  assert.equal(block.match(/dbid=current_db[.]oid/g)?.length, 2,
+    "insert/delete statement metrics must be scoped to the OSCAR database");
+  assert.ok(block.includes("obs([[:space:]]|[(])"),
+    "insert metrics must not include obs-prefixed tables");
+  assert.ok(block.includes("obs([[:space:]]|$)"),
+    "delete metrics must not include obs-prefixed tables");
 });
 
 test("backup check authenticates markers, epoch, verification, and exact journal outcomes", () => {
@@ -842,7 +869,7 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
     "EXCLUDED.leased_high_water-1099511627778",
     "max(id) FROM obs",
     "max(max_id) FROM oscar_archive_generation",
-    "RETURNING leased_high_water cold_id,leased_high_water-1 hot_id",
+    "RETURNING leased_high_water cold_id,leased_high_water-3 hot_id",
     "9223370937343148029",
     "INSERT INTO obs(id,datastreamid",
     "cold_id::text",
@@ -853,9 +880,11 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
   const allocatorTable = probe.slice(probe.indexOf("ensure_fixture_table()"), probe.indexOf("create_observation_fixture()"));
   assert.match(allocatorTable, /oscar_regression_fixture_allocator/);
   assert.match(allocatorTable, /singleton boolean PRIMARY KEY/);
+  assert.match(allocatorTable, /cold_ids bigint\[\]/);
   assert.doesNotMatch(allocator, /pg_advisory_xact_lock/);
-  assert.match(allocator, /WHERE id IN \(a\.cold_id,a\.hot_id\)/);
-  assert.match(allocator, /FROM cold,hot RETURNING \*/);
+  assert.match(allocator, /WHERE id BETWEEN a\.hot_id AND a\.cold_id/);
+  assert.match(allocator, /generate_series\(0,2\)/);
+  assert.match(allocator, /FROM cold_set,hot RETURNING \*/);
 
   const create = probe.slice(probe.indexOf("  fixture-create)"), probe.indexOf("  fixture-create-race)"));
   const race = probe.slice(probe.indexOf("  fixture-create-race)"), probe.indexOf("  fixture-status)"));
@@ -871,14 +900,15 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
   assert.match(race, /staleActivationRejected/);
 
   const status = probe.slice(probe.indexOf("  fixture-status)"), probe.indexOf("  fixture-accelerate)"));
-  assert.match(status, /g\.row_count=1 AND g\.min_id=f\.cold_id AND g\.max_id=f\.cold_id/);
+  assert.match(status, /g\.row_count=cardinality\(f\.cold_ids\)/);
+  assert.match(status, /g\.min_id=\(SELECT min\(id\) FROM unnest\(f\.cold_ids\)/);
   assert.match(status, /o\.archivegenerationid=g\.id/);
   assert.match(status, /exactRowOwnership/);
 
   const cleanupStart = probe.indexOf("  fixture-cleanup)");
   const cleanup = probe.slice(cleanupStart, probe.indexOf("  *) fail", cleanupStart));
-  assert.match(cleanup, /DELETE FROM oscar_regression_fixture WHERE run_id='\$run' RETURNING cold_id,hot_id/);
-  assert.match(cleanup, /DELETE FROM obs o USING f WHERE o\.id IN \(f\.cold_id,f\.hot_id\)/);
+  assert.match(cleanup, /DELETE FROM oscar_regression_fixture WHERE run_id='\$run' RETURNING cold_ids,hot_id/);
+  assert.match(cleanup, /DELETE FROM obs o USING f WHERE o\.id=ANY\(f\.cold_ids\) OR o\.id=f\.hot_id/);
   assert.doesNotMatch(cleanup, /DELETE FROM obs(?:\s+WHERE|;)/);
 
   const archiveHelper = probe.slice(probe.indexOf("  archive-helper-check)"), probe.indexOf("  fixture-hot-hold-create)"));
@@ -916,9 +946,17 @@ test("storage lifecycle refuses mutation when exact release/profile preflight fa
   assert.match(block, /media\.enabled === REGRESSION_MEDIA_RETENTION\.enabled/);
   assert.match(block, /media\.timeToRetentionDays === REGRESSION_MEDIA_RETENTION\.timeToRetentionDays/);
   assert.match(block, /media\.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION\.queryPeriodMinutes/);
+  assert.match(block, /media\.maximumCatchUpHours === REGRESSION_MEDIA_RETENTION\.maximumCatchUpHours/);
+  assert.match(block, /media\.lateArrivalOverlapHours === REGRESSION_MEDIA_RETENTION\.lateArrivalOverlapHours/);
+  assert.match(block, /media\.lateArrivalScanPeriodMinutes ===/);
+  assert.match(block, /media\.lateArrivalCatchUpHours === REGRESSION_MEDIA_RETENTION\.lateArrivalCatchUpHours/);
+  assert.match(block, /media\.reconciliationCatchUpHours ===/);
+  assert.match(block, /media\.reconciliationPeriodHours ===/);
+  assert.match(block, /media\.occupancyStreamRefreshMinutes ===/);
   assert.match(block, /media\.frameCount === REGRESSION_MEDIA_RETENTION\.frameCount/);
   assert.match(block, /media\.jpegQuality === REGRESSION_MEDIA_RETENTION\.jpegQuality/);
   assert.match(block, /media\.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION\.sourceRollbackGraceHours/);
+  assert.match(block, /media\.maintenanceWorkLimit === REGRESSION_MEDIA_RETENTION\.maintenanceWorkLimit/);
   assert.ok(block.indexOf("verifyGeneratedAlarmRetention") > block.indexOf("if (!profileAccepted)"));
 });
 
@@ -941,7 +979,7 @@ test("storage lifecycle cleans an attempted fixture even when create acknowledge
   const end = scenarios.indexOf("private async storageRestoreDrill", start);
   const block = scenarios.slice(start, end);
   const attempted = block.indexOf("fixtureCreateAttempted = true");
-  const create = block.indexOf('probe.runJson<{coldId: string; hotId: string', attempted);
+  const create = block.indexOf('probe.runJson<{coldId: string; coldRowCount: number; hotId: string', attempted);
   const cleanup = block.indexOf('if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup"', create);
   assert.ok(attempted > 0 && create > attempted && cleanup > create);
   assert.doesNotMatch(block, /fixtureCreated/);
@@ -973,6 +1011,10 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "deletionIndexesIncluded",
     "retainedMediaExpectedSets", "retainedMediaExpectedMembers",
     "retainedMediaExactMembersVerified", "expectedProcessedIndexes", "expectedDeletionIndexes",
+    "verify one guarded multi-row PostgreSQL purge", "batchCalls === 1",
+    "batchRows === fixture.coldRowCount", "fixture.coldRowCount === 3",
+    "verify bounded database work amplification", "legacySingletonObservationDeleteCalls",
+    "512 * 1024 * 1024", "65_536",
   ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
   const holdCreate = block.indexOf('"fixture-hot-hold-create"');
   const heldDelete = block.indexOf("request.delete(", holdCreate);

@@ -103,7 +103,10 @@ The exact daily-file production profile is `rootDirectory=files`,
 `dailyFileObservationMode=LATEST`, `fsyncIntervalMillis=1000`,
 `maxUnforcedRecords=128`, `maxUnforcedBytes=1048576`,
 `maxSegmentBytes=67108864`, `maxSegmentAgeSeconds=900`,
-`maxRecordBytes=4194304`, and `sealedJournalRetentionDays=30`. The OSCAR service
+`maxRecordBytes=4194304`, `sealedJournalRetentionDays=30`, and
+`requireBackupBeforeSealedJournalDeletion=false`. The false default prevents disabled backup mode
+from causing unbounded duplicate journal growth while still requiring immutable publication and
+exact sealed-journal replay parity before deletion. The OSCAR service
 must also set `delegateObservationLifecycleToDatabase=true` and
 `dailyFilePurgeWorkLimit=50`.
 
@@ -130,9 +133,14 @@ canonical release path are rechecked before every probe action. Probe files and
 command captures use a fresh mode-0700 private workspace with mode-0600 files.
 
 The target must use the regression-only accelerated archive profile:
-`intervalMinutes=1`, `rollbackGraceDays=1`, `deleteHotAfterArchive=true`, while
-the configured hot-retention value must match `STORAGE_HOT_RETENTION_DAYS`.
-Never use those acceleration settings as the production retention policy.
+`hotRetentionDays=1`, `intervalMinutes=1`, `rollbackGraceDays=1`, and
+`deleteHotAfterArchive=true`; set `STORAGE_HOT_RETENTION_DAYS=1` so the live
+expectation matches. Never copy the one-day archive eligibility or one-minute
+scheduler interval into production. The platform gate separately reads
+`/opt/oscar/config.json` and requires the shipping policy: two-day archive
+eligibility, one-day rollback grace, verified hot-row deletion enabled, and
+one-day/five-JPEG media eligibility. The eligibility plus grace makes the
+normal hot-row deletion boundary approximately 72 hours.
 
 The disposable configuration must also set these fields in the
 existing OSCAR service `videoRetentionConfig` before OSCAR starts:
@@ -141,10 +149,18 @@ existing OSCAR service `videoRetentionConfig` before OSCAR starts:
 {
   "timeToRetention": 0,
   "videoQueryPeriod": 1,
+  "maximumCatchUpHours": 6,
+  "lateArrivalOverlapHours": 24,
+  "lateArrivalScanPeriodMinutes": 360,
+  "lateArrivalCatchUpHours": 2,
+  "reconciliationCatchUpHours": 24,
+  "reconciliationPeriodHours": 24,
+  "occupancyStreamRefreshMinutes": 15,
   "enableFrameRetention": true,
   "frameRetentionCount": 5,
   "jpegQuality": 85,
   "sourceRollbackGraceHours": 24,
+  "maintenanceWorkLimit": 200,
   "metadataReclamationWorkLimit": 200
 }
 ```
@@ -153,9 +169,11 @@ This is regression-only acceleration: zero days makes alarms from the current
 run eligible on the next one-minute query, while 24 hours keeps each exact source
 MP4 available for the end-of-run ownership/decodability oracle. Preserve all
 other `videoRetentionConfig` fields. Full-profile preflight reads the persisted live
-config and requires all seven values before retained-media polling or cold-fixture
-creation, so a normal seven-day deployment fails early instead of timing out.
-Do not change the packaged default; use `timeToRetention=7` in production.
+config and requires the complete bounded scanner and media-retention profile before retained-media polling or cold-fixture
+creation, so a normal one-day deployment fails early instead of timing out.
+Do not copy the zero-day test value into production; the packaged default is
+`timeToRetention=1`, with a further 24-hour source rollback grace after the five
+JPEGs publish successfully.
 Saving the form does not reconfigure an already running retained-media worker.
 On a newly initialized disposable site, save this profile and use the supported
 OSCAR restart before importing lanes or permitting emulator traffic. Require
@@ -169,20 +187,23 @@ The platform preflight also requires the archive purge helper to read from
 `/dev/null`; this proves that a helper invoked inside the work-list loop cannot
 consume subsequent rows and leave a multi-object purge plan partially applied.
 
-The probe registers exactly two observations copied from an existing
-`gammaCounts` row: one beyond hot retention and one current. A temporary,
+The probe registers exactly four observations copied from an existing
+`gammaCounts` row: a contiguous three-row cold set beyond hot retention and one
+current control. The three cold rows make the live purge oracle prove that one
+guarded set-based delete removes multiple rows rather than merely using an
+`ANY(...)` query shape once per row. A temporary,
 run-scoped PostgreSQL statement trigger inspects the writer's temporary
 activation ledger, and an advisory-lock barrier pauses only the statement that
 exported the fixture cold row; the probe changes that row's result
 time, releases the barrier, and requires the stale activation to fail with no
 archive marker. The trigger/function are always removed. It then requires the
-real retry to mark exactly that one current source row (matching generation
+real retry to mark exactly the three-row current source set (matching generation
 count/min/max), leave the hot control unmarked, and obtain a parity receipt.
 
 Because `obs.id` has no database sequence, these direct-SQL fixtures use a
 singleton allocator row to serialize a collision-checked test-only `BIGINT`
 lease more than 2^40 IDs beyond the durable hot/archive high-water and fail
-atomically if either candidate is no longer free. The archived fixture keeps
+atomically if any of the four candidates is no longer free. The archived fixture keeps
 the larger leased ID so a restart can
 advance the store's durable high-water even after ordinary fixture-row cleanup.
 This deliberate side effect is another reason `storage-lifecycle` is restricted
@@ -373,7 +394,10 @@ state as certification: it must have either generated retained media or an
 explicit `STORAGE_RETAINED_EVENT_ID` that completed the exact API/JPEG/gallery
 proof before mutation. That proof makes checkpoint, processed-index, manifest,
 and five-JPEG population mandatory. These counts and bytes are written to
-`storage-performance.csv`.
+`storage-performance.csv`. The filesystem inventory is streamed and reports
+`totalEntries`, regular-file, and directory counts; it deliberately has no
+100,000-entry correctness ceiling, so a healthy long-running retained tree is
+validated rather than rejected solely because it grew.
 
 ## Backup and performance
 
@@ -382,6 +406,13 @@ configured media-retention query interval plus 15 seconds, then waits for a
 nonempty processed-index inventory and three consecutive stable file-count
 snapshots. This prevents a backup from racing startup reclamation and the first
 durable-index reconstruction scan.
+The lifecycle snapshots database-scoped PostgreSQL statement counters directly
+before and after sealing its three-row cold fixture. It requires exactly one
+guarded `id=ANY(...)` delete to remove all three rows and zero calls to the
+retired singleton path. Across the complete lifecycle it also fails if more
+than 512 MiB (65,536 standard 8-KiB blocks) of temporary query work is added.
+The corresponding batch/singleton call, row, rows-per-call, and
+statement-temp-block counters remain in the CSV for trend analysis.
 The backup check then creates a coordinated backup and invokes the supported
 `backup-verify` command again. Independently, it recomputes `SHA256SUMS.hmac`
 with the configured backup key, verifies every listed checksum, and rejects

@@ -315,7 +315,10 @@ test("storage paths, modes, and numeric bounds fail closed", () => {
     assert.throws(() => loadConfig([]), /literal lowercase value disabled or single/);
   });
   withEnvironment(baseEnvironment, () => {
-    assert.equal(loadConfig([]).storageBackupMode, "disabled");
+    const config = loadConfig([]);
+    assert.equal(config.storageBackupMode, "disabled");
+    assert.equal(config.storageHotRetentionDays, 1,
+      "disposable lifecycle defaults to the documented accelerated one-day policy");
   });
   withEnvironment({...baseEnvironment, OSCAR_RELEASE_DIR: "/opt/oscar/./release"}, () => {
     assert.throws(() => loadConfig(["--scenario", "storage-health"]), /canonical, non-root/);

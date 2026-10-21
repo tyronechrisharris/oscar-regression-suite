@@ -532,9 +532,35 @@ export interface StoragePlatformProbe {
   batchRewriteObservedCalls: number;
   batchRewriteObservedRows: number;
   dailyJournalConfigured: boolean;
+  archiveEnabled: boolean | null;
   archiveIntervalMinutes: number | null;
+  hotRetentionDays: number | null;
   deleteHotAfterArchive: boolean | null;
   rollbackGraceDays: number | null;
+  packagedDefaults: {
+    archiveEnabled: boolean | null;
+    archiveIntervalMinutes: number | null;
+    hotRetentionDays: number | null;
+    rollbackGraceDays: number | null;
+    deleteHotAfterArchive: boolean | null;
+    videoRetentionDays: number | null;
+    videoQueryPeriodMinutes: number | null;
+    maximumCatchUpHours: number | null;
+    lateArrivalOverlapHours: number | null;
+    lateArrivalScanPeriodMinutes: number | null;
+    lateArrivalCatchUpHours: number | null;
+    reconciliationCatchUpHours: number | null;
+    reconciliationPeriodHours: number | null;
+    occupancyStreamRefreshMinutes: number | null;
+    retainedFrameCount: number | null;
+    jpegQuality: number | null;
+    sourceRollbackGraceHours: number | null;
+    metadataReclamationWorkLimit: number | null;
+    maintenanceWorkLimit: number | null;
+    frameRetentionEnabled: boolean | null;
+    sealedJournalRetentionDays: number | null;
+    requireBackupBeforeSealedJournalDeletion: boolean | null;
+  };
   archiveResources: {
     memoryLimitMegabytes: number | null;
     threads: number | null;
@@ -557,6 +583,7 @@ export interface StoragePlatformProbe {
     maxSegmentAgeSeconds: number | null;
     maxRecordBytes: number | null;
     sealedJournalRetentionDays: number | null;
+    requireBackupBeforeSealedJournalDeletion: boolean | null;
     observationLifecycleDelegated: boolean | null;
     purgeWorkLimit: number | null;
   };
@@ -564,10 +591,18 @@ export interface StoragePlatformProbe {
     enabled: boolean | null;
     timeToRetentionDays: number | null;
     queryPeriodMinutes: number | null;
+    maximumCatchUpHours: number | null;
+    lateArrivalOverlapHours: number | null;
+    lateArrivalScanPeriodMinutes: number | null;
+    lateArrivalCatchUpHours: number | null;
+    reconciliationCatchUpHours: number | null;
+    reconciliationPeriodHours: number | null;
+    occupancyStreamRefreshMinutes: number | null;
     frameCount: number | null;
     jpegQuality: number | null;
     sourceRollbackGraceHours: number | null;
     metadataReclamationWorkLimit: number | null;
+    maintenanceWorkLimit: number | null;
   };
 }
 
@@ -595,6 +630,9 @@ export interface MediaMetadataHealthProbe {
   checkpointPresent: boolean;
   checkpointValid: boolean;
   checkpointSchemaVersion: number | null;
+  totalEntries: number;
+  regularFiles: number;
+  directories: number;
   processedIndexFiles: number;
   processedIndexBytes: number;
   deletionIndexFiles: number;
@@ -874,10 +912,44 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
       "batchRewriteObservedRows",
     ),
     dailyJournalConfigured: probe.dailyJournalConfigured === true,
+    archiveEnabled: typeof probe.archiveEnabled === "boolean" ? probe.archiveEnabled : null,
     archiveIntervalMinutes: nullableNumber(probe.archiveIntervalMinutes),
+    hotRetentionDays: nullableNumber(probe.hotRetentionDays),
     deleteHotAfterArchive: typeof probe.deleteHotAfterArchive === "boolean"
       ? probe.deleteHotAfterArchive : null,
     rollbackGraceDays: nullableNumber(probe.rollbackGraceDays),
+    packagedDefaults: (() => {
+      const defaults = object(probe.packagedDefaults, "packagedDefaults");
+      return {
+        archiveEnabled: typeof defaults.archiveEnabled === "boolean"
+          ? defaults.archiveEnabled : null,
+        archiveIntervalMinutes: nullableNumber(defaults.archiveIntervalMinutes),
+        hotRetentionDays: nullableNumber(defaults.hotRetentionDays),
+        rollbackGraceDays: nullableNumber(defaults.rollbackGraceDays),
+        deleteHotAfterArchive: typeof defaults.deleteHotAfterArchive === "boolean"
+          ? defaults.deleteHotAfterArchive : null,
+        videoRetentionDays: nullableNumber(defaults.videoRetentionDays),
+        videoQueryPeriodMinutes: nullableNumber(defaults.videoQueryPeriodMinutes),
+        maximumCatchUpHours: nullableNumber(defaults.maximumCatchUpHours),
+        lateArrivalOverlapHours: nullableNumber(defaults.lateArrivalOverlapHours),
+        lateArrivalScanPeriodMinutes: nullableNumber(defaults.lateArrivalScanPeriodMinutes),
+        lateArrivalCatchUpHours: nullableNumber(defaults.lateArrivalCatchUpHours),
+        reconciliationCatchUpHours: nullableNumber(defaults.reconciliationCatchUpHours),
+        reconciliationPeriodHours: nullableNumber(defaults.reconciliationPeriodHours),
+        occupancyStreamRefreshMinutes: nullableNumber(defaults.occupancyStreamRefreshMinutes),
+        retainedFrameCount: nullableNumber(defaults.retainedFrameCount),
+        jpegQuality: nullableNumber(defaults.jpegQuality),
+        sourceRollbackGraceHours: nullableNumber(defaults.sourceRollbackGraceHours),
+        metadataReclamationWorkLimit: nullableNumber(defaults.metadataReclamationWorkLimit),
+        maintenanceWorkLimit: nullableNumber(defaults.maintenanceWorkLimit),
+        frameRetentionEnabled: typeof defaults.frameRetentionEnabled === "boolean"
+          ? defaults.frameRetentionEnabled : null,
+        sealedJournalRetentionDays: nullableNumber(defaults.sealedJournalRetentionDays),
+        requireBackupBeforeSealedJournalDeletion:
+          typeof defaults.requireBackupBeforeSealedJournalDeletion === "boolean"
+            ? defaults.requireBackupBeforeSealedJournalDeletion : null,
+      };
+    })(),
     archiveResources: (() => {
       const resources = object(probe.archiveResources, "archiveResources");
       return {
@@ -905,6 +977,9 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         maxSegmentAgeSeconds: nullableNumber(journal.maxSegmentAgeSeconds),
         maxRecordBytes: nullableNumber(journal.maxRecordBytes),
         sealedJournalRetentionDays: nullableNumber(journal.sealedJournalRetentionDays),
+        requireBackupBeforeSealedJournalDeletion:
+          typeof journal.requireBackupBeforeSealedJournalDeletion === "boolean"
+            ? journal.requireBackupBeforeSealedJournalDeletion : null,
         observationLifecycleDelegated: typeof journal.observationLifecycleDelegated === "boolean"
           ? journal.observationLifecycleDelegated : null,
         purgeWorkLimit: nullableNumber(journal.purgeWorkLimit),
@@ -916,10 +991,18 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         enabled: typeof retention.enabled === "boolean" ? retention.enabled : null,
         timeToRetentionDays: nullableNumber(retention.timeToRetentionDays),
         queryPeriodMinutes: nullableNumber(retention.queryPeriodMinutes),
+        maximumCatchUpHours: nullableNumber(retention.maximumCatchUpHours),
+        lateArrivalOverlapHours: nullableNumber(retention.lateArrivalOverlapHours),
+        lateArrivalScanPeriodMinutes: nullableNumber(retention.lateArrivalScanPeriodMinutes),
+        lateArrivalCatchUpHours: nullableNumber(retention.lateArrivalCatchUpHours),
+        reconciliationCatchUpHours: nullableNumber(retention.reconciliationCatchUpHours),
+        reconciliationPeriodHours: nullableNumber(retention.reconciliationPeriodHours),
+        occupancyStreamRefreshMinutes: nullableNumber(retention.occupancyStreamRefreshMinutes),
         frameCount: nullableNumber(retention.frameCount),
         jpegQuality: nullableNumber(retention.jpegQuality),
         sourceRollbackGraceHours: nullableNumber(retention.sourceRollbackGraceHours),
         metadataReclamationWorkLimit: nullableNumber(retention.metadataReclamationWorkLimit),
+        maintenanceWorkLimit: nullableNumber(retention.maintenanceWorkLimit),
       };
     })(),
   };
@@ -983,6 +1066,9 @@ export function assessMediaMetadataHealth(value: unknown): MediaMetadataHealthPr
     checkpointPresent: probe.checkpointPresent === true,
     checkpointValid: probe.checkpointValid === true,
     checkpointSchemaVersion: nullableNumber(probe.checkpointSchemaVersion),
+    totalEntries: integer(probe.totalEntries, "totalEntries"),
+    regularFiles: integer(probe.regularFiles, "regularFiles"),
+    directories: integer(probe.directories, "directories"),
     processedIndexFiles: integer(probe.processedIndexFiles, "processedIndexFiles"),
     processedIndexBytes: integer(probe.processedIndexBytes, "processedIndexBytes"),
     deletionIndexFiles: integer(probe.deletionIndexFiles, "deletionIndexFiles"),
@@ -1007,6 +1093,7 @@ export function mediaMetadataHealthIsSafe(
   const structurallySafe = value.partialArtifacts === 0 && value.unsafeEntries === 0 &&
     value.indexFormatFailures === 0 && value.legacyProcessedMarkerFiles === 0 &&
     value.legacyDeletionTombstones === 0 &&
+    value.totalEntries === value.regularFiles + value.directories &&
     (!value.checkpointPresent ||
       (value.checkpointValid && value.checkpointSchemaVersion === 2)) &&
     (value.processedIndexFiles === 0 ||
@@ -1122,6 +1209,7 @@ export function storagePlatformHasExactReleaseIdentity(
     Number.isFinite(Date.parse(value.archiveMarker.initializedAt)) &&
     value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
     value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
+    value.archiveEnabled === true &&
     value.archiveResources.memoryLimitMegabytes === 256 &&
     value.archiveResources.threads === 2 &&
     value.archiveResources.maximumTemporaryMegabytes === 4096 &&
@@ -1142,6 +1230,9 @@ export function storagePlatformHasExactReleaseIdentity(
     value.dailyJournal.maxSegmentAgeSeconds === 900 &&
     value.dailyJournal.maxRecordBytes === 4_194_304 &&
     value.dailyJournal.sealedJournalRetentionDays === 30 &&
+    value.dailyJournal.requireBackupBeforeSealedJournalDeletion === false &&
+    value.packagedDefaults.sealedJournalRetentionDays === 30 &&
+    value.packagedDefaults.requireBackupBeforeSealedJournalDeletion === false &&
     value.dailyJournal.observationLifecycleDelegated === true &&
     value.dailyJournal.purgeWorkLimit === 50;
 }
@@ -1186,7 +1277,11 @@ export function storageMetricFromProbe(
     "databaseSizeBytes", "observationTableBytes", "observationIndexBytes", "walBytes",
     "tempBytes", "tuplesInserted", "tuplesUpdated", "tuplesDeleted", "transactionCommits",
     "transactionRollbacks", "observationInsertCalls", "observationInsertRows",
-    "observationRowsPerCall", "activeArchiveGenerations", "sealedArchiveGenerations",
+    "observationRowsPerCall", "statementTempBlocksWritten", "observationDeleteCalls",
+    "observationDeleteRows", "observationRowsPerDeleteCall",
+    "legacySingletonObservationDeleteCalls", "batchedObservationDeleteCalls",
+    "batchedObservationDeleteRows", "batchedObservationRowsPerDeleteCall",
+    "activeArchiveGenerations", "sealedArchiveGenerations",
     "archiveRows", "archiveBytes", "failedArchiveJobs", "failedParityReceipts", "activeHolds",
     "verifiedBackups", "journalBytes", "dailyFileBytes", "retainedMediaBytes",
     "retainedMediaManifestFiles", "retainedMediaJpegFiles", "processedObservationIndexFiles",
