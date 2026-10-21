@@ -3,7 +3,12 @@ import {mkdtempSync, readFileSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join, resolve} from "node:path";
 import test from "node:test";
-import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "../src/config.js";
+import {
+  assertMutationAllowed,
+  loadConfig,
+  MIN_EXTENDED_OCCUPANCY_SECONDS,
+  requiresRemoteSuiteLease,
+} from "../src/config.js";
 
 const baseEnvironment = {
   OSCAR_BASE_URL: "https://192.0.2.10",
@@ -337,6 +342,22 @@ test("storage paths, modes, and numeric bounds fail closed", () => {
       () => loadConfig([]),
       /STORAGE_RESTORE_PROBE_TIMEOUT_MS must be an integer between 600000 and 28800000/,
     );
+  });
+});
+
+test("extended occupancy reserves reconnect and post-threshold observation time", () => {
+  withEnvironment(baseEnvironment, () => {
+    assert.equal(MIN_EXTENDED_OCCUPANCY_SECONDS, 150);
+    assert.equal(loadConfig([]).extendedOccupancySeconds, 150);
+  });
+  withEnvironment({...baseEnvironment, EXTENDED_OCCUPANCY_SECONDS: "149"}, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /EXTENDED_OCCUPANCY_SECONDS must be an integer >= 150/,
+    );
+  });
+  withEnvironment({...baseEnvironment, EXTENDED_OCCUPANCY_SECONDS: "180"}, () => {
+    assert.equal(loadConfig([]).extendedOccupancySeconds, 180);
   });
 });
 

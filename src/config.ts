@@ -4,6 +4,20 @@ import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane
 import {publicObservationId} from "./public-observation-id.js";
 import type {BackupMode, CapabilityMode, Profile, SuiteConfig} from "./types.js";
 
+// A newly restarted emulator can enter OCCUPIED before OSCAR's prior socket
+// reaches its heartbeat timeout and reconnects.  The Viewer deliberately uses
+// the first occupancy sample OSCAR actually observes as its start time, and its
+// default fault threshold is strictly greater than 60 seconds.  Budget the
+// emulator's complete 60-second reconnect allowance plus a 30-second window in
+// which both Health and Dashboard can observe the post-threshold state.
+export const EXTENDED_OCCUPANCY_THRESHOLD_SECONDS = 60;
+export const EXTENDED_OCCUPANCY_RECONNECT_ALLOWANCE_SECONDS = 60;
+export const EXTENDED_OCCUPANCY_OBSERVATION_WINDOW_SECONDS = 30;
+export const MIN_EXTENDED_OCCUPANCY_SECONDS =
+  EXTENDED_OCCUPANCY_THRESHOLD_SECONDS +
+  EXTENDED_OCCUPANCY_RECONNECT_ALLOWANCE_SECONDS +
+  EXTENDED_OCCUPANCY_OBSERVATION_WINDOW_SECONDS;
+
 function loadDotEnv(path = resolve(".env")): void {
   try {
     for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/)) {
@@ -280,7 +294,11 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     metricsIntervalMs: integer("METRICS_INTERVAL_MS", 5_000, 1_000),
     uiTimeoutMs: integer("UI_TIMEOUT_MS", 30_000, 1_000),
     eventTimeoutMs: integer("EVENT_TIMEOUT_MS", 90_000, 10_000),
-    extendedOccupancySeconds: integer("EXTENDED_OCCUPANCY_SECONDS", 70, 61),
+    extendedOccupancySeconds: integer(
+      "EXTENDED_OCCUPANCY_SECONDS",
+      MIN_EXTENDED_OCCUPANCY_SECONDS,
+      MIN_EXTENDED_OCCUPANCY_SECONDS,
+    ),
     eventUuidWorkflow,
     alarmTransferCameraWorkflow,
     storageWorkflow,

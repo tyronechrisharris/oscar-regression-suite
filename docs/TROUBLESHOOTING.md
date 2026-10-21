@@ -83,6 +83,23 @@ Stop further full runs and follow the manual recovery procedure in
 [SAFETY.md](SAFETY.md). The recovery JSON is in the failed run's `evidence/`
 directory.
 
+## Extended occupancy stays Clear or shows less than the configured duration
+
+Do not infer a product fault from the emulator's wall-clock occupancy alone.
+Replacing the reserved RPM configuration restarts its TCP server; the emulator
+may enter `OCCUPIED` before OSCAR's old connection reaches its heartbeat timeout
+and reconnects. The Viewer intentionally uses the canonical start time OSCAR
+actually observed and activates the default fault only when elapsed time is
+strictly greater than 60 seconds. Consequently, a former 70-second fixture
+could leave fewer than 60 observable seconds and legitimately remain Clear.
+
+Use the tracked default/minimum `EXTENDED_OCCUPANCY_SECONDS=150`. It budgets the
+complete 60-second reconnect allowance plus a 30-second post-threshold window
+for both UI assertions. If a 150-second run still fails, compare the emulator
+client/reconnect timestamps, the displayed occupancy duration, and the two UI
+rows. Do not weaken the strict threshold assertion or reinterpret a second
+automatic occupancy as proof of the first.
+
 ## Report generation times out
 
 Inspect the Viewer message and OSCAR service logs, then retry the individual

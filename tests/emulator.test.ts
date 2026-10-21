@@ -37,6 +37,20 @@ test("short alarm config rejects non-positive and fractional durations", () => {
   }
 });
 
+test("extended occupancy config creates a quiet deterministic long occupancy", () => {
+  const client = new RpmEmulatorClient("http://127.0.0.1:8000");
+  const configured = client.extendedOccupancyConfig(original, 150);
+
+  assert.deepEqual(configured.occupancy_duration_range, [150, 150]);
+  assert.equal(configured.occupancy_frequency, 1);
+  assert.equal(configured.occupancy_schedule_enabled, false);
+  assert.equal(configured.gamma_alarm_probability, 0);
+  assert.equal(configured.neutron_alarm_probability, 0);
+  assert.equal(configured.unique_alarm_probability, 0);
+  assert.deepEqual(configured.camera_ids, ["camera-50"]);
+  assert.deepEqual(original.occupancy_duration_range, [6, 10]);
+});
+
 test("known-clear Tamper baseline requires an explicit false state from every connected RPM", () => {
   const assessment = assessKnownClearTamperBaseline([
     {rpmId: "rpm-01", running: true, connectedClients: 1, tamperFault: false},

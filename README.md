@@ -223,6 +223,7 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>|<ssh-target>|<canonical-release-dir>|DISPOSABLE-STORAGE` interlock for every storage probe, including smoke |
 | `OSCAR_BUILD_LABEL` | exact artifact/component identity; mandatory for `3.9.2-release` |
 | `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` | complete PASS directory from the matching unfiltered restore drill; mandatory only for single-mode `3.9.2-release` certification |
+| `EXTENDED_OCCUPANCY_SECONDS` | deterministic emulator occupancy duration; default/minimum 150 seconds reserves OSCAR's 60-second reconnect allowance and a 30-second Health/Dashboard observation window beyond the strict one-minute threshold |
 
 Before any storage command or probe upload, the runner resolves
 `OSCAR_RELEASE_DIR` on the SSH target and requires it to be an existing,
@@ -254,6 +255,16 @@ visible denied-permission feedback followed by a successful retry. `auto` skips 
 when the camera controls are absent; `disabled` always skips this workflow. This
 is browser-level scanner coverage, not a physical camera or native
 operating-system permission-dialog test.
+
+Keep `EXTENDED_OCCUPANCY_SECONDS` at 150 or longer. Replacing the reserved RPM
+configuration restarts its TCP server, and the emulator can begin the forced
+occupancy before OSCAR detects the closed prior socket and reconnects. OSCAR and
+the Viewer correctly time extended occupancy from the first start sample they
+actually observe, not from the runner's configuration request. The 150-second
+minimum covers the full 60-second reconnect allowance, the Viewer's strict
+`duration > 60 seconds` default, and 30 seconds for the Status of Health and
+Dashboard assertions to see the active state. A 70-second occupancy has only a
+ten-second theoretical margin and is therefore not a valid release oracle.
 
 The canonical future-build fixture is
 [`fixtures/oscar-50-lane-config.csv`](fixtures/oscar-50-lane-config.csv). It uses
