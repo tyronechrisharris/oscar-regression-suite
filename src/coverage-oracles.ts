@@ -137,6 +137,18 @@ export function importedAlarmChartsRendered(
   });
 }
 
+/** Require both live Lane Details datasets to paint, not merely their canvases. */
+export function liveLaneTelemetryChartsRendered(
+  gamma: AlarmChartCanvasSnapshot,
+  neutron: AlarmChartCanvasSnapshot,
+): boolean {
+  const visible = (snapshot: AlarmChartCanvasSnapshot) =>
+    snapshot.width > 0 && snapshot.height > 0 &&
+    snapshot.clientWidth > 0 && snapshot.clientHeight > 0;
+  return visible(gamma) && visible(neutron) &&
+    gamma.gammaPlotPixels > 0 && neutron.neutronPlotPixels > 0;
+}
+
 export function canonicalAlarmTransferDocumentJson(value: unknown): string {
   if (!value || typeof value !== "object") {
     throw new Error("Alarm transfer document must be an object");

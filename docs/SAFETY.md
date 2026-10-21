@@ -153,6 +153,14 @@ records for each generated alarm.
 Event and adjudication history is intentionally not deleted. It is audit data and
 is the expected permanent footprint of a full run.
 
+The smoke Dashboard baseline does not toggle faults. It reads the modeled
+`tamper_fault` boolean from every emulator RPM and fails closed if any RPM is
+stopped, disconnected, active, or lacks an explicit value. The separate Viewer
+assertion then proves OSCAR's Rapiscan driver published its required initial
+Tamper-clear observation for the established connections. That driver baseline
+is emitted before later `TT`/`TC` messages are processed. Never replace the two
+independent checks with a harness assumption based only on an Online icon.
+
 ## Automatic restoration
 
 Before mutation, the complete original RPM configuration is saved as

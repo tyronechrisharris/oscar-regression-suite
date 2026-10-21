@@ -5,6 +5,7 @@ import {
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
   importedAlarmChartsRendered,
+  liveLaneTelemetryChartsRendered,
   operationalViewScopePair,
   scopedUuidOperationalViewChecksEnabled,
 } from "../src/coverage-oracles.js";
@@ -100,6 +101,18 @@ test("imported chart oracle requires the expected series color on each visible c
   assert.equal(importedAlarmChartsRendered(["gamma"], [legendOnly]), false);
   assert.equal(importedAlarmChartsRendered(["gamma", "neutron"], [neutron, gamma]), false);
   assert.equal(importedAlarmChartsRendered([], []), false);
+});
+
+test("live lane chart oracle requires painted Gamma and Neutron series, not empty canvases", () => {
+  const gamma = {
+    width: 640, height: 320, clientWidth: 640, clientHeight: 320,
+    gammaPlotPixels: 40, neutronPlotPixels: 0,
+  };
+  const neutron = {...gamma, gammaPlotPixels: 0, neutronPlotPixels: 30};
+  assert.equal(liveLaneTelemetryChartsRendered(gamma, neutron), true);
+  assert.equal(liveLaneTelemetryChartsRendered({...gamma, gammaPlotPixels: 0}, neutron), false);
+  assert.equal(liveLaneTelemetryChartsRendered(gamma, {...neutron, neutronPlotPixels: 0}), false);
+  assert.equal(liveLaneTelemetryChartsRendered({...gamma, clientWidth: 0}, neutron), false);
 });
 
 test("canonical alarm document comparison ignores export-only QR metadata", () => {

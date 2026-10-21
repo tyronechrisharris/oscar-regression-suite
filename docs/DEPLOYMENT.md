@@ -43,6 +43,13 @@ Saved** notification. Perform one supported OSCAR restart and require all 50
 Lane, RPM, and camera modules to return before starting regression. Clicking
 Save without confirming Yes must fail provisioning.
 
+OSCAR's Rapiscan driver must publish an initial Tamper-clear observation every
+time an RPM connection is established, before processing later device `TT`/`TC`
+messages. Deploy or restart OSCAR normally so all 50 test RPM connections pass
+through that initialization path. The suite independently verifies the
+emulator's modeled boolean and the resulting Dashboard state; the harness will
+not infer clear from an Online icon or toggle Tamper across the site.
+
 The retained-media worker reads its profile at OSCAR startup. On a newly initialized
 disposable 3.9.2 target, save the accelerated profile and perform a supported restart
 before importing the lane fixture or permitting emulator traffic. Require

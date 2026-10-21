@@ -42,6 +42,22 @@ export interface ConnectionRewriteSummary {
   offlineMatched: number;
 }
 
+export interface DashboardTamperIndicatorSnapshot {
+  laneId: string;
+  state: string | null;
+  label: string;
+}
+
+export interface DashboardTamperBaselineAssessment {
+  passed: boolean;
+  laneCount: number;
+  uniqueLaneCount: number;
+  clearCount: number;
+  unknownLaneIds: string[];
+  activeLaneIds: string[];
+  invalidLaneIds: string[];
+}
+
 type JsonRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -161,6 +177,49 @@ export function assessDashboardConnectionResolution(
     unexpected,
     duplicates: [...duplicates].sort(),
     unresolved,
+  };
+}
+
+/**
+ * Dashboard clear fault states intentionally have no compact icon. After the
+ * live latest-observation batches have settled, one card per expected lane and
+ * no Tamper indicator is therefore the user-visible known-clear baseline.
+ */
+export function assessDashboardKnownClearTamper(
+  laneIds: readonly string[],
+  indicators: readonly DashboardTamperIndicatorSnapshot[],
+  expectedLaneCount: number,
+): DashboardTamperBaselineAssessment {
+  const uniqueLaneIds = new Set(laneIds);
+  const unknownLaneIds = indicators
+    .filter(({state}) => state === "unknown")
+    .map(({laneId}) => laneId)
+    .sort();
+  const activeLaneIds = indicators
+    .filter(({state}) => state === "active")
+    .map(({laneId}) => laneId)
+    .sort();
+  const invalidLaneIds = indicators
+    .filter(({laneId, state, label}) =>
+      !uniqueLaneIds.has(laneId) ||
+      (state !== "unknown" && state !== "active") ||
+      !/^Tamper: (?:Unknown|Fault)$/.test(label))
+    .map(({laneId}) => laneId)
+    .sort();
+  const lanesAreCanonical = laneIds.length === expectedLaneCount &&
+    uniqueLaneIds.size === expectedLaneCount && laneIds.every(Boolean);
+  const passed = lanesAreCanonical && indicators.length === 0;
+  const indicatedLaneIds = new Set(indicators.map(({laneId}) => laneId));
+  const clearCount = [...uniqueLaneIds].filter((laneId) => !indicatedLaneIds.has(laneId)).length;
+
+  return {
+    passed,
+    laneCount: laneIds.length,
+    uniqueLaneCount: uniqueLaneIds.size,
+    clearCount,
+    unknownLaneIds,
+    activeLaneIds,
+    invalidLaneIds,
   };
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assessDashboardConnectionResolution,
+  assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
@@ -73,6 +74,47 @@ test("dashboard connection oracle requires every exact expected chip to resolve 
   const duplicateAssessment = assessDashboardConnectionResolution([...online, online[0]!], expected);
   assert.equal(duplicateAssessment.passed, false);
   assert.deepEqual(duplicateAssessment.duplicates, ["lane-health-Lane01-rpm"]);
+});
+
+test("dashboard Tamper baseline requires every lane card and no fault indicator", () => {
+  const lanes = ["Lane01", "Lane02", "Lane03"];
+  assert.deepEqual(assessDashboardKnownClearTamper(lanes, [], 3), {
+    passed: true,
+    laneCount: 3,
+    uniqueLaneCount: 3,
+    clearCount: 3,
+    unknownLaneIds: [],
+    activeLaneIds: [],
+    invalidLaneIds: [],
+  });
+
+  const unknown = assessDashboardKnownClearTamper(lanes, [{
+    laneId: "Lane02",
+    state: "unknown",
+    label: "Tamper: Unknown",
+  }], 3);
+  assert.equal(unknown.passed, false);
+  assert.equal(unknown.clearCount, 2);
+  assert.deepEqual(unknown.unknownLaneIds, ["Lane02"]);
+
+  const active = assessDashboardKnownClearTamper(lanes, [{
+    laneId: "Lane03",
+    state: "active",
+    label: "Tamper: Fault",
+  }], 3);
+  assert.equal(active.passed, false);
+  assert.deepEqual(active.activeLaneIds, ["Lane03"]);
+});
+
+test("dashboard Tamper baseline rejects missing, duplicate, or malformed lane state", () => {
+  assert.equal(assessDashboardKnownClearTamper(["Lane01", "Lane01"], [], 2).passed, false);
+  const invalid = assessDashboardKnownClearTamper(["Lane01", "Lane02"], [{
+    laneId: "Lane99",
+    state: "clear",
+    label: "Tamper: Clear",
+  }], 2);
+  assert.equal(invalid.passed, false);
+  assert.deepEqual(invalid.invalidLaneIds, ["Lane99"]);
 });
 
 test("health polling parser recognizes only batched latest-observation queries", () => {

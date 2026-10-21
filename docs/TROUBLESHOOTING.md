@@ -46,6 +46,27 @@ checks use browser-only response fixtures; they do not disconnect cameras or
 modify SensorHub data. Preserve the evidence screenshot and do not weaken the
 batch or accessibility assertions to accommodate a failing build.
 
+If the failure reports `Tamper: Unknown`, compare both baseline rows. The
+emulator-source row must show every RPM running, OSCAR-connected, and explicitly
+`tamper_fault=false`; the Dashboard row must then show all lanes clear with no
+Unknown indicator. A source-row failure is an emulator inventory/state problem.
+A passing source row plus a failing Dashboard row means OSCAR's Rapiscan driver
+did not publish or retain its required initial Tamper-clear observation when the
+RPM connection was established. Inspect or upgrade OSCAR's driver and reconnect
+the authorized test RPMs so that initialization path runs before later `TT`/`TC`
+messages are processed. Do not infer clear from an Online icon and do not bulk
+toggle Tamper just to seed observations.
+
+## Lane Details shows only Threshold or empty measurement charts
+
+The `lane-video` scenario navigates from Dashboard to Lane Details and requires
+actual red Gamma and blue Neutron plot pixels, excluding title/legend regions.
+If this row fails while the canvases and video pass, preserve
+`lane-detail-live-telemetry.png` and inspect the Gamma/Neutron real-time
+datasource subscription lifecycle during the route transition. A visible chart
+container or a purple Threshold series is not evidence that measurement data is
+flowing.
+
 ## Viewer navigation reports `net::ERR_TOO_MANY_RETRIES`
 
 The suite treats this exact Chromium connection-pool error as a bounded

@@ -14,15 +14,15 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Admin | SensorHub Admin loads and exposes configured sensor/module content | smoke | none |
 | Health inventory | expected lane and camera counts; all fault fields present | smoke | none |
 | Connections | reserved RPM and every configured camera resolve Online | smoke | none |
-| Dashboard health | expected lane/RPM/per-camera indicator inventory; every exact expected connection-chip identity resolves to an accessible live Online state within 45 seconds; one selected camera Offline while every other component stays Online; deterministic all-Offline and completed Unknown reconciliation; all five exact Unknown fault labels; live recovery; keyboard lane navigation; health batches of at most 10 streams with at most two requests in flight | smoke | browser response fixtures only |
-| Lane detail | charts and event table render | smoke | HLS start/stop commands |
+| Dashboard health | expected lane/RPM/per-camera indicator inventory; every emulator RPM explicitly reports `tamper_fault=false` while connected; every lane resolves with no Tamper Unknown/Active indicator; every exact expected connection-chip identity resolves to an accessible live Online state within 45 seconds; one selected camera Offline while every other component stays Online; deterministic all-Offline and completed Unknown reconciliation; all five exact Unknown fault labels; live recovery; keyboard lane navigation; health batches of at most 10 streams with at most two requests in flight | smoke | read-only emulator state plus browser response fixtures |
+| Lane detail | charts and event table render; after real Dashboard navigation, live Gamma and Neutron datasets each paint their chart-specific plot color outside the legend region | smoke | HLS start/stop commands |
 | Video | decoded dimensions, ready state, and advancing playback time | smoke | HLS start/stop commands |
 | Events | rows load and Advanced Filter returns only the requested lane | smoke | none |
 | Operational views | fixture-derived exact Dashboard card/RPM/camera membership and Status of Health lane sets for east/west/north/south/pedestrian/entrance/exit; Dashboard-to-Health query persistence; invalid, unassigned, and duplicate parameters fail closed | smoke | none |
 | Reports | site, one-lane lane, alarm, alarm/occupancy, and health PDFs | smoke | report bucket writes |
 | Alarm import | malformed payload is rejected visibly | smoke | none |
 | Alarm camera import | deterministic Chromium 640x480 stream starts; preview and contained scan overlay are visible and non-zero; visible status says `Scanning`; active camera reports the deterministic identity and 640 × 480; dense QR v23/1,170-character transport decodes with valid integrity and UUID; all tracks stop; denied permission is reported and retry succeeds | both | local generated media only |
-| RPM connection | stop/restart appears Offline/Online on Status of Health and the Dashboard while camera state remains independently Online; the Status-of-Health oracle matches the RPM's own labeled state and cannot pass early on a camera's Online text | full | reserved RPM only |
+| RPM connection | stop/restart appears Offline/Online on Status of Health and the Dashboard while camera state remains independently Online; the Status-of-Health oracle matches the RPM's own labeled state and cannot pass early on a camera's Online text; the reconnected RPM must also publish and display an explicit `Tamper: Clear` baseline | full | reserved RPM only |
 | Faults | gamma high/low, neutron high, and tamper assert and clear on Status of Health and the Dashboard; Dashboard tamper clear stays in place, posts the real SensorHub control command, and clears the observed state | full | reserved RPM only |
 | Alarms | back-to-back one-second gamma and neutron occupancies make the second camera OPEN queue behind the first generation's keyframe-gated OPEN/CLOSE; the exact OSCAR log window has zero camera timeout/quarantine/rejection/result-timeout/stale-generation/command-failure symptoms; both alarms reach Event Log and each row resolves its exact public occupancy observation ID; authenticated `result.videoPaths` contains one nonblank unique `videos/clips/<camera-token>/<timestamp>-g<generation>.mp4` per OSH-configured lane camera; cross-event uniqueness, directory ownership, nonzero source objects, and Chromium MP4 metadata are verified | full | permanent event data and source clips |
 | Event identity | capture the persisted public occupancy observation ID shown as “Event UUID”; accept its opaque normalized 1–128-character product form without imposing RFC 4122 punctuation; verify details, UUID search, canonical direct link, clipboard actions, fresh-page resolution, explicit not-found state, assigned-view query preservation, non-member-view fail-closed behavior, print-to-PDF text, and QR v1 round-trip with exact identity equality | full | one permanent alarm event; local clipboard/artifacts |
@@ -90,12 +90,24 @@ These require a disposable deployment and a separate, explicit test plan.
 `adjudication-report`, `storage-health`, `storage-lifecycle`, and the isolated
 `storage-restore-drill` scenario selected only by `--profile restore-drill`.
 
-`dashboard-health` is a read-only browser scenario. It verifies the complete
-lane/RPM/camera inventory and live Online state, then intercepts only the
-Dashboard's batched latest-observation responses to prove accessible Offline
-and Unknown rendering without changing SensorHub or emulator state. The full
-profile separately stops/restarts the reserved RPM and injects each supported
-fault to verify real Dashboard transitions and recovery.
+`dashboard-health` is a read-only scenario. Before accepting the UI baseline it
+queries every emulator RPM and requires a distinct, running, OSCAR-connected
+inventory whose modeled `tamper_fault` is explicitly `false`. It then requires
+every Dashboard lane to resolve with no Tamper Unknown or Active indicator after
+the live latest-observation batches settle. An Online icon alone is not the
+harness's Tamper oracle, and the harness does not assert then clear Tamper to seed
+telemetry. The product contract is that OSCAR's Rapiscan driver publishes an
+initial clear observation whenever an RPM connection is established, before it
+processes subsequent `TT`/`TC` messages. The scenario then intercepts only the
+Dashboard's batched latest-observation responses to prove accessible Offline and
+Unknown rendering without changing SensorHub or emulator state. The full profile
+separately stops/restarts the reserved RPM and injects each supported fault to
+verify real Dashboard transitions and recovery.
+
+`lane-video` starts on the Dashboard and uses the real lane link. In addition to
+the component and HLS checks, it waits for red Gamma and blue Neutron pixels in
+the central Chart.js plot regions. Legend pixels are excluded, so an empty chart
+container or threshold-only Gamma chart cannot pass.
 
 `event-uuid` is capability-gated with `EVENT_UUID_WORKFLOW`. Its default `auto`
 mode skips cleanly on older Viewer builds; use `required` for builds that claim

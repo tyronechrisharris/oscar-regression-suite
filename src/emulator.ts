@@ -3,6 +3,66 @@ import {poll} from "./util.js";
 
 type FaultType = "gh" | "gl" | "nh" | "tamper";
 
+export interface RpmTamperBaselineEntry {
+  rpmId: string;
+  running: boolean;
+  connectedClients: number | null;
+  tamperFault: boolean | null;
+}
+
+export interface KnownClearTamperAssessment {
+  passed: boolean;
+  expectedCount: number;
+  rpmCount: number;
+  clearCount: number;
+  duplicateIds: string[];
+  stoppedIds: string[];
+  disconnectedIds: string[];
+  activeIds: string[];
+  unknownIds: string[];
+}
+
+/**
+ * Require an explicit false tamper model value for every connected emulator
+ * RPM. Connectivity by itself is never interpreted as a clear tamper state.
+ */
+export function assessKnownClearTamperBaseline(
+  entries: readonly RpmTamperBaselineEntry[],
+  expectedCount: number,
+): KnownClearTamperAssessment {
+  const seen = new Set<string>();
+  const duplicateIds = new Set<string>();
+  for (const {rpmId} of entries) {
+    if (seen.has(rpmId)) duplicateIds.add(rpmId);
+    seen.add(rpmId);
+  }
+
+  const stoppedIds = entries.filter(({running}) => !running).map(({rpmId}) => rpmId);
+  const disconnectedIds = entries
+    .filter(({connectedClients}) => connectedClients === null || connectedClients < 1)
+    .map(({rpmId}) => rpmId);
+  const activeIds = entries.filter(({tamperFault}) => tamperFault === true).map(({rpmId}) => rpmId);
+  const unknownIds = entries
+    .filter(({tamperFault}) => tamperFault !== true && tamperFault !== false)
+    .map(({rpmId}) => rpmId);
+  const clearCount = entries.filter(({tamperFault}) => tamperFault === false).length;
+
+  return {
+    passed: entries.length === expectedCount && seen.size === expectedCount &&
+      duplicateIds.size === 0 && stoppedIds.length === 0 &&
+      disconnectedIds.length === 0 && activeIds.length === 0 &&
+      unknownIds.length === 0 && clearCount === expectedCount,
+    expectedCount,
+    rpmCount: entries.length,
+    clearCount,
+    duplicateIds: [...duplicateIds].sort(),
+    stoppedIds: stoppedIds.sort(),
+    disconnectedIds: disconnectedIds.sort(),
+    activeIds: activeIds.sort(),
+    unknownIds: unknownIds.sort(),
+  };
+}
+
 export class RpmEmulatorClient {
   constructor(private readonly baseUrl: string, private readonly timeoutMs = 15_000) {}
 
@@ -40,6 +100,25 @@ export class RpmEmulatorClient {
       if (error instanceof Error && error.message.includes(" returned 404:")) return null;
       throw error;
     }
+  }
+
+  /**
+   * Read the modeled tamper state for every emulator RPM without changing it.
+   * This is the source-state oracle; the Dashboard assertion independently
+   * proves that OSCAR's Rapiscan driver published its required clear baseline
+   * when the connection was established.
+   */
+  async tamperBaseline(): Promise<RpmTamperBaselineEntry[]> {
+    const rpms = [...await this.list()].sort((left, right) => left.id.localeCompare(right.id));
+    return Promise.all(rpms.map(async (rpm) => {
+      const status = rpm.running ? await this.statusOrNull(rpm.id) : null;
+      return {
+        rpmId: rpm.id,
+        running: rpm.running,
+        connectedClients: status?.connected_clients ?? null,
+        tamperFault: status?.tamper_fault ?? null,
+      };
+    }));
   }
 
   fault(rpmId: string, type: FaultType, active: boolean): Promise<{message: string}> {

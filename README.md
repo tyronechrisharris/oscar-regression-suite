@@ -27,11 +27,13 @@ source review before the suite can certify that version.
 - every configured lane and camera on Status of Health
 - compact Dashboard health indicators for every lane, with independent RPM and
   per-camera connectivity; gamma-high/low, neutron-high, tamper, and extended-
-  occupancy states; operational-view membership; keyboard navigation; and
-  bounded shared health requests
+  occupancy states; an explicit known-clear Tamper baseline for every emulated
+  RPM/lane; operational-view membership; keyboard navigation; and bounded
+  shared health requests
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
   extended-occupancy detection and recovery
-- live HLS camera playback, decoded dimensions, and advancing playback time
+- live Gamma and Neutron plot data after Dashboard-to-Lane Details navigation,
+  plus HLS camera playback, decoded dimensions, and advancing playback time
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
@@ -81,15 +83,22 @@ See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.
 
 The smoke profile requires live Online observations for every configured RPM
-and camera. Its deterministic camera Offline and Unknown checks intercept only
-browser responses and do not disconnect live cameras. The full profile performs
-the real reserved-RPM disconnect/reconnect and supported fault transitions.
+and camera. It also reads every emulator RPM's modeled `tamper_fault` value and
+requires an explicit `false` value plus a corresponding known-clear Dashboard
+state for every lane. The harness never treats an Online icon alone as proof that
+Tamper is clear and never toggles Tamper to manufacture a passing baseline. On
+each newly established RPM connection, OSCAR's Rapiscan driver must publish its
+initial Tamper-clear observation before processing subsequent device `TT`/`TC`
+messages. Deterministic camera Offline and Unknown checks intercept only browser
+responses and do not disconnect live cameras. The full profile performs the real
+reserved-RPM disconnect/reconnect and supported fault transitions.
 
 ## Safety model
 
 `smoke` is non-fault-injecting, but it authenticates, posts a national-statistics
 command, creates report bucket files, and behavior-tests the storage atomic publisher
-when `storage-health` is selected. `full` also changes emulator state and creates permanent,
+when `storage-health` is selected. It also reads each emulator RPM's explicit
+Tamper model state without changing it. `full` also changes emulator state and creates permanent,
 clearly marked adjudication audit records. Full runs are refused unless
 `OSCAR_TEST_TARGET_ACK` exactly matches the host in `OSCAR_BASE_URL`.
 It also requires exact emulator-host and RPM-to-lane acknowledgements. Every

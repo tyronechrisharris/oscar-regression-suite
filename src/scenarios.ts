@@ -16,6 +16,7 @@ import {
 } from "./alarm-media-oracles.js";
 import {
   assessDashboardConnectionResolution,
+  assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
@@ -30,12 +31,13 @@ import {
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
   importedAlarmChartsRendered,
+  liveLaneTelemetryChartsRendered,
   operationalViewScopePair,
   scopedUuidOperationalViewChecksEnabled,
   type AlarmChartCanvasSnapshot,
   type AlarmChartSeries,
 } from "./coverage-oracles.js";
-import {RpmEmulatorClient} from "./emulator.js";
+import {assessKnownClearTamperBaseline, RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
 import {MetricsSampler} from "./metrics.js";
 import {navigateWithBoundedRetry} from "./navigation.js";
@@ -402,6 +404,47 @@ export class RegressionScenarios {
 
   private async screenshotOnFailure(page: Page, name: string): Promise<string> {
     try { return await this.browser.screenshot(page, name); } catch { return ""; }
+  }
+
+  private chartCanvasSnapshot(canvas: Locator): Promise<AlarmChartCanvasSnapshot> {
+    return canvas.evaluate((element): AlarmChartCanvasSnapshot => {
+      const chart = element as HTMLCanvasElement;
+      const context = chart.getContext("2d");
+      let gammaPlotPixels = 0;
+      let neutronPlotPixels = 0;
+      if (context && chart.width > 0 && chart.height > 0) {
+        const pixels = context.getImageData(0, 0, chart.width, chart.height).data;
+        // Exclude the title and bottom legend so a colored legend swatch cannot
+        // make an empty dataset look live. The remaining band is Chart.js's plot.
+        const firstPlotRow = Math.floor(chart.height * 0.15);
+        const lastPlotRow = Math.ceil(chart.height * 0.82);
+        const firstPlotColumn = Math.floor(chart.width * 0.05);
+        const lastPlotColumn = Math.ceil(chart.width * 0.95);
+        for (let y = firstPlotRow; y < lastPlotRow; y++) {
+          for (let x = firstPlotColumn; x < lastPlotColumn; x++) {
+            const index = (y * chart.width + x) * 4;
+            const red = pixels[index] ?? 0;
+            const green = pixels[index + 1] ?? 0;
+            const blue = pixels[index + 2] ?? 0;
+            const alpha = pixels[index + 3] ?? 0;
+            if (alpha === 0) continue;
+            if (Math.abs(red - 244) <= 24 && Math.abs(green - 67) <= 24 &&
+              Math.abs(blue - 54) <= 24) gammaPlotPixels++;
+            if (Math.abs(red - 41) <= 24 && Math.abs(green - 182) <= 24 &&
+              Math.abs(blue - 246) <= 24) neutronPlotPixels++;
+          }
+        }
+      }
+      const bounds = chart.getBoundingClientRect();
+      return {
+        width: chart.width,
+        height: chart.height,
+        clientWidth: bounds.width,
+        clientHeight: bounds.height,
+        gammaPlotPixels,
+        neutronPlotPixels,
+      };
+    });
   }
 
   async runReadOnly(): Promise<void> {
@@ -933,6 +976,27 @@ export class RegressionScenarios {
     });
 
     try {
+      await this.check({
+        scenario: "dashboard-health",
+        category: "dashboard-health",
+        action: "validate explicit known-clear Tamper source state",
+        target: "RPM emulator inventory",
+        expected: `${this.config.expectedLaneCount} running, OSCAR-connected RPMs explicitly report tamper_fault=false`,
+      }, async () => {
+        const entries = await this.emulator.tamperBaseline();
+        const assessment = assessKnownClearTamperBaseline(entries, this.config.expectedLaneCount);
+        return {
+          passed: assessment.passed,
+          observed: `RPMs=${assessment.rpmCount}/${assessment.expectedCount}; ` +
+            `explicit clear=${assessment.clearCount}; ` +
+            `stopped=${assessment.stoppedIds.join("|") || "none"}; ` +
+            `disconnected=${assessment.disconnectedIds.join("|") || "none"}; ` +
+            `active=${assessment.activeIds.join("|") || "none"}; ` +
+            `unknown=${assessment.unknownIds.join("|") || "none"}; ` +
+            `duplicate IDs=${assessment.duplicateIds.join("|") || "none"}`,
+        };
+      });
+
       const card = await this.openDashboard(page);
       await this.check({
         scenario: "dashboard-health", category: "dashboard-health", action: "enumerate compact lane health indicators",
@@ -1026,6 +1090,56 @@ export class RegressionScenarios {
         return {
           passed: assessment.passed,
           observed: `${values.length} unique batches; sizes=${values.map((batch) => batch.streamIds.length).join("|")}; peak in flight=${peakHealthRequests}; lane count=${this.config.expectedLaneCount}`,
+        };
+      });
+
+      await this.check({
+        scenario: "dashboard-health",
+        category: "dashboard-health",
+        action: "resolve every lane from the Rapiscan connection baseline",
+        target: "Dashboard Lane Status",
+        expected: `${this.config.expectedLaneCount} lane cards resolve Tamper clear with no Unknown or Active Tamper indicator`,
+      }, async () => {
+        const cards = page.locator('[data-testid^="lane-health-card-"]');
+        const indicators = page.locator('[data-testid^="lane-health-"][data-testid$="-tamper"]');
+        const readState = async () => {
+          const laneIds = await cards.evaluateAll((nodes) => nodes.map((node) =>
+            (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+          ));
+          const tamperIndicators = await indicators.evaluateAll((nodes) => nodes.map((node) => {
+            const cardNode = node.closest('[data-testid^="lane-health-card-"]');
+            return {
+              laneId: (cardNode?.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+              state: node.getAttribute("data-state"),
+              label: node.getAttribute("aria-label") ?? "",
+            };
+          }));
+          return assessDashboardKnownClearTamper(
+            laneIds,
+            tamperIndicators,
+            this.config.expectedLaneCount,
+          );
+        };
+        const assessment = await poll(
+          readState,
+          (value) => value.passed,
+          {
+            timeoutMs: 45_000,
+            intervalMs: 1_000,
+            description: "every Dashboard lane to resolve the Rapiscan connection Tamper baseline",
+          },
+        ).catch(readState);
+        const evidence = assessment.passed
+          ? ""
+          : await this.screenshotOnFailure(page, "dashboard-health-tamper-baseline");
+        return {
+          passed: assessment.passed,
+          observed: `lanes=${assessment.laneCount}/${this.config.expectedLaneCount}; ` +
+            `unique=${assessment.uniqueLaneCount}; explicit clear=${assessment.clearCount}; ` +
+            `Unknown=${assessment.unknownLaneIds.join("|") || "none"}; ` +
+            `Active=${assessment.activeLaneIds.join("|") || "none"}; ` +
+            `invalid=${assessment.invalidLaneIds.join("|") || "none"}`,
+          evidence,
         };
       });
 
@@ -1218,7 +1332,7 @@ export class RegressionScenarios {
       await laneLabel.click();
       await page.waitForURL(/\/lane-view/);
       await this.check({
-        scenario: "lane-video", category: "video", action: "render lane detail telemetry",
+        scenario: "lane-video", category: "telemetry", action: "render lane detail telemetry",
         target: this.config.testLaneLabel, expected: "lane heading, gamma chart, neutron chart, and event table visible",
       }, async () => {
         const heading = await page.getByText(`Lane ID: ${this.config.testLaneLabel}`, {exact: true})
@@ -1229,6 +1343,45 @@ export class RegressionScenarios {
         const passed = heading && gamma && neutron && table;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "lane-detail-components");
         return {passed, observed: `heading=${heading}; gamma=${gamma}; neutron=${neutron}; table=${table}`, evidence};
+      });
+      await this.check({
+        scenario: "lane-video",
+        category: "telemetry",
+        action: "paint live gamma and neutron datasets after Dashboard navigation",
+        target: this.config.testLaneLabel,
+        expected: "the Gamma dataset paints red plot pixels and the Neutron dataset paints blue plot pixels, excluding legends",
+      }, async () => {
+        const gammaCanvas = page.locator("#chart-view-gamma canvas").first();
+        const neutronCanvas = page.locator("#chart-view-neutron canvas").first();
+        await Promise.all([
+          gammaCanvas.waitFor({state: "visible", timeout: this.config.uiTimeoutMs}),
+          neutronCanvas.waitFor({state: "visible", timeout: this.config.uiTimeoutMs}),
+        ]);
+        const readCharts = async () => ({
+          gamma: await this.chartCanvasSnapshot(gammaCanvas),
+          neutron: await this.chartCanvasSnapshot(neutronCanvas),
+        });
+        const snapshots = await poll(
+          readCharts,
+          ({gamma, neutron}) => liveLaneTelemetryChartsRendered(gamma, neutron),
+          {
+            timeoutMs: 45_000,
+            intervalMs: 500,
+            description: "live Gamma and Neutron Lane Details datasets to paint",
+          },
+        ).catch(() => readCharts());
+        const passed = liveLaneTelemetryChartsRendered(snapshots.gamma, snapshots.neutron);
+        const evidence = passed
+          ? ""
+          : await this.screenshotOnFailure(page, "lane-detail-live-telemetry");
+        return {
+          passed,
+          observed: `gamma canvas=${snapshots.gamma.width}x${snapshots.gamma.height}; ` +
+            `gamma plot pixels=${snapshots.gamma.gammaPlotPixels}; ` +
+            `neutron canvas=${snapshots.neutron.width}x${snapshots.neutron.height}; ` +
+            `neutron plot pixels=${snapshots.neutron.neutronPlotPixels}`,
+          evidence,
+        };
       });
       await this.check({
         scenario: "lane-video", category: "video", action: "play live camera video",
@@ -2003,14 +2156,17 @@ export class RegressionScenarios {
     }
   }
 
-  private async waitHealthText(page: Page, text: string, timeoutMs = 45_000): Promise<string> {
+  private async waitHealthText(page: Page, expected: string | RegExp, timeoutMs = 45_000): Promise<string> {
     await this.goto(page, "/health");
     const row = this.healthRow(page);
     await row.waitFor({timeout: timeoutMs});
+    const description = typeof expected === "string" ? expected : expected.toString();
     await poll(
       () => row.innerText(),
-      (value) => value.toLowerCase().includes(text.toLowerCase()),
-      {timeoutMs, intervalMs: 1_000, description: `${this.config.testLaneLabel} health to include ${text}`},
+      (value) => typeof expected === "string"
+        ? value.toLowerCase().includes(expected.toLowerCase())
+        : expected.test(value),
+      {timeoutMs, intervalMs: 1_000, description: `${this.config.testLaneLabel} health to match ${description}`},
     );
     return row.innerText();
   }
@@ -2019,15 +2175,18 @@ export class RegressionScenarios {
     page: Page,
     state: "online" | "offline",
     timeoutMs = 45_000,
+    requireTamperClear = false,
   ): Promise<string> {
     await this.goto(page, "/health");
     const row = this.healthRow(page);
     await row.waitFor({timeout: timeoutMs});
     await poll(
       () => row.innerText(),
-      (value) => healthRowHasRpmConnectionState(value, state),
+      (value) => healthRowHasRpmConnectionState(value, state) &&
+        (!requireTamperClear || /Tamper:\s*Clear/i.test(value)),
       {timeoutMs, intervalMs: 1_000,
-        description: `${this.config.testLaneLabel} RPM health to become ${state}`},
+        description: `${this.config.testLaneLabel} RPM health to become ${state}` +
+          (requireTamperClear ? " with Tamper clear" : "")},
     );
     return row.innerText();
   }
@@ -2068,10 +2227,14 @@ export class RegressionScenarios {
     }
     await this.check({
       scenario: "rpm-connection", category: "health", action: "detect RPM reconnection",
-      target: this.config.testLaneLabel, expected: "Status of Health returns the reserved RPM to Online",
+      target: this.config.testLaneLabel,
+      expected: "Status of Health returns the reserved RPM to Online with an explicit Tamper: Clear baseline",
     }, async () => {
-      const text = await this.waitHealthRpmConnection(page, "online", 60_000);
-      return {passed: healthRowHasRpmConnectionState(text, "online"), observed: text};
+      const text = await this.waitHealthRpmConnection(page, "online", 60_000, true);
+      return {
+        passed: healthRowHasRpmConnectionState(text, "online") && /Tamper:\s*Clear/i.test(text),
+        observed: text,
+      };
     });
     await this.check({
       scenario: "rpm-connection", category: "dashboard-health", action: "show reconnected RPM on dashboard",
