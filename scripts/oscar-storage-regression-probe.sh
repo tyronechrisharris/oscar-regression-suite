@@ -1073,7 +1073,7 @@ WITH payload AS (
         AND g.activated_at<=now()-make_interval(days=>c.rollback_grace_days)
         AND EXISTS (SELECT 1 FROM obs o WHERE o.archivegenerationid=g.id)) eligible_hot_deletes,
     (SELECT count(*) FROM (
-      SELECT 1 FROM obs o JOIN datastream d ON d.id=o.datastreamid, config c
+      SELECT 1 FROM obs o JOIN obs_datastreams d ON d.id=o.datastreamid, config c
       WHERE o.archivegenerationid IS NULL
         AND o.phenomenontime<now()-make_interval(days=>c.hot_retention_days)
         AND d.data->>'outputName'=ANY(c.output_names)

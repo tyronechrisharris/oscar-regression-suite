@@ -1040,7 +1040,8 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
   const idle = probe.slice(probe.indexOf("archive_maintenance_idle_json()"), probe.indexOf("case $action in"));
   for (const required of [
     "hotRetentionDays", "rollbackGraceDays", "outputNames", "eligible_unowned_rows",
-    "o.archivegenerationid IS NULL", "LIMIT 1", "make_interval(days=>c.hot_retention_days)",
+    "JOIN obs_datastreams d", "o.archivegenerationid IS NULL", "LIMIT 1",
+    "make_interval(days=>c.hot_retention_days)",
     "make_interval(days=>c.rollback_grace_days)",
   ]) assert.ok(idle.includes(required), `missing bounded deployed-config idle contract: ${required}`);
   const holdCreate = block.indexOf('"fixture-hot-hold-create"');
