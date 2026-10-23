@@ -143,6 +143,17 @@ immediate asynchronous five-JPEG media eligibility with a 24-hour source-video
 rollback grace. The archive eligibility plus grace makes the
 normal hot-row deletion boundary approximately 72 hours.
 
+The lifecycle fixture also remains isolated on a populated disposable test
+catalog. It selects a complete UTC-hour window at least two hours before the
+earliest existing archive generation or job window, while remaining older than
+the configured hot-retention threshold. Its deletion cutoff therefore cannot
+select later pre-existing generations. Before taking the guarded-delete metric
+baseline, the suite additionally requires three clean samples spanning more
+than one worker cadence: no active export, no latest failed retry, no
+rollback-grace-eligible generation with hot rows, and an empty DuckDB scratch
+directory. The exact-generation plan, hold, confirmation-token, parity, and
+fail-closed non-fixture rejection remain mandatory.
+
 The disposable configuration must also set these fields in the
 existing OSCAR service `videoRetentionConfig` before OSCAR starts:
 
@@ -544,6 +555,10 @@ snapshot cannot satisfy disruption coverage.
 Set all operational-view, event-UUID, Alarm Transfer camera, storage, and backup
 workflows to `required`; set the expected `OSCAR_BACKUP_MODE` and exact
 `OSCAR_BUILD_LABEL`; then run `npm run test:3.9.2-release` without `--scenario`.
+Every privileged storage probe also reverse-checks the uniquely running Compose
+application container: its working-directory and compose-file labels must resolve
+to that exact acknowledged release directory. This prevents an old runner binding
+from silently testing a newer container that reuses the same image tags.
 Disabled mode is certified live without restore evidence. For single mode,
 preserve the complete PASS directory from a matching unfiltered destructive
 drill and set `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` to it.

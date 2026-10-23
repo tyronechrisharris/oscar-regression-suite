@@ -4329,6 +4329,38 @@ export class RegressionScenarios {
       const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
       const hotPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.hotId));
       const streamPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.datastreamId));
+      const maintenanceIdle = await this.check({
+        scenario: "storage-lifecycle", category: "performance",
+        action: "isolate fixture hot-delete accounting",
+        target: this.config.targetHost,
+        expected: "three clean samples spanning a worker cadence prove no export, failed retry, eligible hot delete, or DuckDB scratch work before the fixture baseline",
+      }, async () => {
+        type ArchiveIdle = {idle: boolean; exportingJobs: number; latestFailedJobs: number;
+          eligibleHotDeleteGenerations: number; scratchEntries: number};
+        let idleSince = 0;
+        let stableSamples = 0;
+        const value = await poll(async () => {
+          const current = await probe.runJson<ArchiveIdle>("archive-maintenance-idle");
+          if (current.idle && current.exportingJobs === 0 && current.latestFailedJobs === 0 &&
+              current.eligibleHotDeleteGenerations === 0 && current.scratchEntries === 0) {
+            if (stableSamples === 0) idleSince = Date.now();
+            stableSamples++;
+          } else {
+            idleSince = 0;
+            stableSamples = 0;
+          }
+          return {...current, stableSamples, stableForMs: idleSince ? Date.now() - idleSince : 0};
+        }, state => state.idle && state.stableSamples >= 3 && state.stableForMs >= 65_000, {
+          timeoutMs: this.config.storageArchiveTimeoutMs,
+          intervalMs: 35_000,
+          description: "pre-existing archive maintenance to remain idle across one worker cadence",
+        });
+        const passed = value.idle && value.stableSamples >= 3 && value.stableForMs >= 65_000;
+        return {passed, value: passed, observed: JSON.stringify(value)};
+      });
+      if (!maintenanceIdle) {
+        throw new Error("Fixture hot-delete accounting refused while pre-existing archive maintenance remained active");
+      }
       const archiveDeleteBefore = storageMetricFromProbe(
         "storage-lifecycle-before-multirow-hot-delete",
         await probe.runJson("snapshot"),

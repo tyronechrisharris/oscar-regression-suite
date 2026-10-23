@@ -883,6 +883,10 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
     "hot_id::text",
     "oscar_archive_id_block",
     "oscar_obs_overlay",
+    "fixture_archive_time_sql()",
+    "min(window_start) FROM oscar_archive_generation",
+    "min(window_start) FROM oscar_archive_job",
+    "interval '2 hours'",
   ]) assert.ok(allocator.includes(required), `missing collision-safe fixture allocation contract: ${required}`);
   const allocatorTable = probe.slice(probe.indexOf("ensure_fixture_table()"), probe.indexOf("create_observation_fixture()"));
   assert.match(allocatorTable, /oscar_regression_fixture_allocator/);
@@ -903,6 +907,7 @@ test("disposable lifecycle proves exact-row activation and deployed helper behav
   assert.match(race, /pg_advisory_xact_lock/);
   assert.match(race, /pg_temp\.oscar_archive_activation_row WHERE observation_id=\$cold_id/);
   assert.match(race, /resulttime=resulttime\+interval '1 microsecond'/);
+  assert.match(race, /fixture_archive_time_sql "\$retention" 'clock_timestamp\(\)'/);
   assert.match(race, /j\.state='FAILED'/);
   assert.match(race, /staleActivationRejected/);
 
@@ -1015,6 +1020,8 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "retentionRuntimeReady", "REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS",
     "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
+    "archive-maintenance-idle", "isolate fixture hot-delete accounting", "maintenanceIdle",
+    "stableSamples >= 3", "stableForMs >= 65_000",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",
     "deletionIndexesIncluded",

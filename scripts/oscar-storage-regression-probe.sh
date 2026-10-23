@@ -989,6 +989,22 @@ create_observation_fixture() {
   printf '%s\n' "$fixture_json"
 }
 
+# Put lifecycle fixtures in a complete archive window strictly before every
+# window already known to this deployment. A two-hour margin keeps the
+# fixture's UTC-hour window disjoint even when the existing minimum is exactly
+# on an hour boundary. Keep the ordinary age-derived time as an upper bound so
+# an empty catalog still exercises the configured retention threshold.
+fixture_archive_time_sql() {
+  local retention=$1 clock_expression=$2
+  [[ $retention =~ ^[1-9][0-9]*$ ]] || fail 'Invalid fixture retention days.'
+  case $clock_expression in
+    fixture_clock.sampled_at|clock_timestamp\(\)) ;;
+    *) fail 'Invalid fixture clock expression.' ;;
+  esac
+  printf "(SELECT least(%s-make_interval(days=>%s+2),coalesce((SELECT min(window_start) FROM oscar_archive_generation),'infinity'::timestamptz),coalesce((SELECT min(window_start) FROM oscar_archive_job),'infinity'::timestamptz))-interval '2 hours')" \
+    "$clock_expression" "$retention"
+}
+
 case $action in
   camera-recording-log-start)
     (($# == 0)) || fail 'Camera-recording log start accepts no arguments.'
@@ -2213,8 +2229,9 @@ COMMANDS
     [[ $retention =~ ^[1-9][0-9]*$ ]] || fail 'Invalid retention days.'
     ensure_fixture_table
     [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';") == 0 ]] || fail 'Fixture already exists.'
+    fixture_cold_time=$(fixture_archive_time_sql "$retention" fixture_clock.sampled_at)
     create_observation_fixture "$run" \
-      "fixture_clock.sampled_at-make_interval(days=>$retention+2)" \
+      "$fixture_cold_time" \
       "fixture_clock.sampled_at-interval '1 minute'"
     ;;
 
@@ -2286,8 +2303,9 @@ COMMANDS
       END \$\$;
       CREATE TRIGGER $trigger_name BEFORE UPDATE OF archivegenerationid ON obs FOR EACH STATEMENT
         EXECUTE FUNCTION $function_name();" >/dev/null
+    fixture_cold_time=$(fixture_archive_time_sql "$retention" 'clock_timestamp()')
     chilled=$(scalar "WITH boundary AS (
-        SELECT now()-make_interval(days=>$retention+2) archived_at),
+        SELECT $fixture_cold_time archived_at),
       changed AS (UPDATE obs o SET
         phenomenontime=boundary.archived_at+(f.cold_id-o.id)*interval '1 microsecond',
         resulttime=boundary.archived_at+(f.cold_id-o.id)*interval '1 microsecond'
@@ -2332,6 +2350,37 @@ COMMANDS
     trap - EXIT
     printf '%s' "${fixture_json%?}"
     printf ',"activationBlocked":true,"sourceMutated":true,"staleActivationRejected":true,"staleRowUnmarked":true}\n'
+    ;;
+
+  archive-maintenance-idle)
+    (($# == 0)) || fail 'Archive maintenance idle accepts no arguments.'
+    scratch_entries=$(compose exec -T oscar sh -eu -c '
+      root=/var/lib/oscar/duckdb-tmp
+      if [ ! -e "$root" ] && [ ! -L "$root" ]; then printf 0; exit; fi
+      [ -d "$root" ] && [ ! -L "$root" ]
+      find "$root" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d "[:space:]"
+    ' archive-maintenance-idle)
+    [[ $scratch_entries =~ ^[0-9]+$ ]] ||
+      fail 'DuckDB scratch idle probe returned a nonnumeric count.'
+    json_query "WITH state AS (
+      SELECT
+        (SELECT count(*) FROM oscar_archive_job WHERE state='EXPORTING') exporting_jobs,
+        (SELECT count(*) FROM oscar_archive_job failed
+          WHERE failed.state='FAILED' AND NOT EXISTS (
+            SELECT 1 FROM oscar_archive_job newer
+            WHERE newer.store_key=failed.store_key AND newer.id_scope=failed.id_scope
+              AND newer.profile=failed.profile AND newer.window_start=failed.window_start
+              AND newer.window_end=failed.window_end AND newer.revision>failed.revision)) latest_failed_jobs,
+        (SELECT count(*) FROM oscar_archive_generation g
+          WHERE g.state='ACTIVE' AND g.parity_verified
+            AND g.activated_at<=now()-interval '1 day'
+            AND EXISTS (SELECT 1 FROM obs o WHERE o.archivegenerationid=g.id)) eligible_hot_deletes)
+      SELECT json_build_object(
+        'idle',exporting_jobs=0 AND latest_failed_jobs=0 AND eligible_hot_deletes=0 AND $scratch_entries=0,
+        'exportingJobs',exporting_jobs,
+        'latestFailedJobs',latest_failed_jobs,
+        'eligibleHotDeleteGenerations',eligible_hot_deletes,
+        'scratchEntries',$scratch_entries) FROM state;"
     ;;
 
   fixture-status)
