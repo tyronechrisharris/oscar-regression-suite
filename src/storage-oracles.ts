@@ -14,6 +14,9 @@ export const MAX_RETAINED_EVENT_BYTES = 64 * 1024 * 1024;
 export const MAX_RETAINED_EVENT_PIXELS = 120_000_000;
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const DUCKDB_SCRATCH_ID_PATTERN =
+  /^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MAX_DUCKDB_SCRATCH_IDENTITIES = 512;
 
 export const OSCAR_STORAGE_SCHEMA_VERSION = 5;
 export const OSCAR_STORAGE_SCHEMA_CHECKSUM =
@@ -616,6 +619,12 @@ export interface ArchiveScratchProbe {
   entryCount: number;
 }
 
+export interface ArchiveScratchRestartAssessment {
+  before: string[];
+  after: string[];
+  stale: string[];
+}
+
 export interface RetentionRuntimeHealthProbe {
   checkpointPresent: boolean;
   checkpointValid: boolean;
@@ -1019,6 +1028,67 @@ export function assessArchiveScratch(value: unknown): ArchiveScratchProbe {
     archiveDisjoint: scratch.archiveDisjoint === true,
     entryCount: integer(scratch.entryCount, "archiveScratch.entryCount"),
   };
+}
+
+function scratchIdentityArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > MAX_DUCKDB_SCRATCH_IDENTITIES) {
+    throw new Error(`${field} must be an array of at most ${MAX_DUCKDB_SCRATCH_IDENTITIES} identities`);
+  }
+  const identities = value.map((candidate, index) => {
+    if (typeof candidate !== "string" || !DUCKDB_SCRATCH_ID_PATTERN.test(candidate)) {
+      throw new Error(`${field}[${index}] is not a canonical DuckDB scratch identity`);
+    }
+    return candidate;
+  });
+  const canonical = [...new Set(identities)].sort();
+  if (canonical.length !== identities.length ||
+      canonical.some((identity, index) => identity !== identities[index])) {
+    throw new Error(`${field} must contain unique identities in canonical order`);
+  }
+  return identities;
+}
+
+/** Validates the exact pre/post scratch identity intersection around a supported restart. */
+export function assessArchiveScratchRestart(value: unknown): ArchiveScratchRestartAssessment {
+  const restart = object(value, "archive scratch restart");
+  const before = scratchIdentityArray(restart.scratchBeforeRestart, "scratchBeforeRestart");
+  const after = scratchIdentityArray(restart.scratchAfterRestart, "scratchAfterRestart");
+  const stale = scratchIdentityArray(
+    restart.staleScratchAfterRestart,
+    "staleScratchAfterRestart",
+  );
+  const beforeCount = integer(
+    restart.scratchBeforeRestartCount,
+    "scratchBeforeRestartCount",
+    0,
+    MAX_DUCKDB_SCRATCH_IDENTITIES,
+  );
+  const afterCount = integer(
+    restart.scratchAfterRestartCount,
+    "scratchAfterRestartCount",
+    0,
+    MAX_DUCKDB_SCRATCH_IDENTITIES,
+  );
+  const staleCount = integer(
+    restart.staleScratchAfterRestartCount,
+    "staleScratchAfterRestartCount",
+    0,
+    MAX_DUCKDB_SCRATCH_IDENTITIES,
+  );
+  if (beforeCount !== before.length || afterCount !== after.length || staleCount !== stale.length) {
+    throw new Error("DuckDB scratch restart counts do not match their identity arrays");
+  }
+  const afterSet = new Set(after);
+  const expectedStale = before.filter(identity => afterSet.has(identity));
+  if (expectedStale.length !== stale.length ||
+      expectedStale.some((identity, index) => identity !== stale[index])) {
+    throw new Error("staleScratchAfterRestart is not the exact pre/post identity intersection");
+  }
+  return {before, after, stale};
+}
+
+export function archiveScratchRestartIsSafe(value: ArchiveScratchRestartAssessment): boolean {
+  return value.stale.length === 0;
 }
 
 export function assessRetentionRuntimeHealth(value: unknown): RetentionRuntimeHealthProbe {

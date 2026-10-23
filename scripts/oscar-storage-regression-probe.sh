@@ -306,6 +306,47 @@ archive_scratch_json() {
       "$real_directory" "$owner" "$group" "$mode" "$disjoint" "${entries:-0}"
   ' scratch-health "$scratch_path" "$archive_path"
 }
+archive_scratch_inventory() {
+  compose exec -T oscar sh -eu -c '
+    root=/var/lib/oscar/duckdb-tmp
+    if [ ! -e "$root" ] && [ ! -L "$root" ]; then exit 0; fi
+    [ -d "$root" ] && [ ! -L "$root" ] || exit 20
+    real_root=$(realpath -e -- "$root")
+    [ "$real_root" = "$root" ] || exit 21
+    find "$root" -xdev -mindepth 1 -maxdepth 1 -printf "%f\n" | LC_ALL=C sort -u |
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        printf "%s" "$name" |
+          grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" || exit 22
+        child="$root/$name"
+        if [ ! -e "$child" ] && [ ! -L "$child" ]; then continue; fi
+        [ -d "$child" ] && [ ! -L "$child" ] || exit 23
+        real_child=$(realpath -e -- "$child" 2>/dev/null || true)
+        if [ -z "$real_child" ]; then
+          if [ ! -e "$child" ] && [ ! -L "$child" ]; then continue; fi
+          exit 24
+        fi
+        [ "$(dirname -- "$real_child")" = "$real_root" ] || exit 25
+        printf "%s\n" "$name"
+      done
+  ' scratch-inventory
+}
+scratch_inventory_json() {
+  local inventory=$1 line count=0 first=true
+  [[ -f $inventory && ! -L $inventory ]] ||
+    fail 'DuckDB scratch inventory is not a regular file.'
+  printf '['
+  while IFS= read -r line; do
+    [[ $line =~ ^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+      fail 'DuckDB scratch inventory contains an unsafe identity.'
+    count=$((count+1)); ((count <= 512)) ||
+      fail 'DuckDB scratch inventory exceeds its 512-entry safety bound.'
+    $first || printf ','
+    first=false
+    printf '"%s"' "$line"
+  done <"$inventory"
+  printf ']'
+}
 media_metadata_health_json() {
   local checkpoint=/var/lib/oscar/files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json
   local checkpoint_present=false checkpoint_valid=false checkpoint_schema=null checkpoint_encoded='' checkpoint_result=''
@@ -2231,6 +2272,13 @@ COMMANDS
     segments_before=$(wc -l <"$before_inventory" | tr -d '[:space:]')
     [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 512 ]] ||
       fail 'Pre-restart segment inventory is empty or exceeds its bound.'
+    scratch_before=$restart_work/scratch-before.txt
+    if ! archive_scratch_inventory >"$scratch_before"; then
+      fail 'Could not capture the validated pre-restart DuckDB scratch inventory.'
+    fi
+    scratch_before_count=$(wc -l <"$scratch_before" | tr -d '[:space:]')
+    [[ $scratch_before_count =~ ^[0-9]+$ && $scratch_before_count -le 512 ]] ||
+      fail 'Pre-restart DuckDB scratch inventory exceeds its bound.'
     restart_started=$(date --iso-8601=seconds)
     restart_log=$restart_work/supported-restart.log
     if ! sudo bash oscar.sh restart >"$restart_log" 2>&1; then
@@ -2243,6 +2291,18 @@ COMMANDS
       [[ $state == *healthy* ]] && { healthy=true; break; }
       sleep 2
     done
+    scratch_after=$restart_work/scratch-after.txt
+    if ! archive_scratch_inventory >"$scratch_after"; then
+      fail 'Could not capture the validated post-restart DuckDB scratch inventory.'
+    fi
+    scratch_after_count=$(wc -l <"$scratch_after" | tr -d '[:space:]')
+    [[ $scratch_after_count =~ ^[0-9]+$ && $scratch_after_count -le 512 ]] ||
+      fail 'Post-restart DuckDB scratch inventory exceeds its bound.'
+    stale_scratch=$restart_work/scratch-stale.txt
+    comm -12 "$scratch_before" "$scratch_after" >"$stale_scratch"
+    stale_scratch_count=$(wc -l <"$stale_scratch" | tr -d '[:space:]')
+    [[ $stale_scratch_count =~ ^[0-9]+$ && $stale_scratch_count -le 512 ]] ||
+      fail 'Restart-surviving DuckDB scratch inventory exceeds its bound.'
     segments_preserved=0; segment_failures=0; segments_verified=0
     mapfile -t before_rows <"$before_inventory"
     for before_row in "${before_rows[@]}"; do
@@ -2305,8 +2365,13 @@ COMMANDS
     recovery_errors=$(grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' "$restart_service_log" || true)
     shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)' "$restart_service_log" || true)
     camera_recording_errors=$(grep -Eic 'Timed out waiting for camera .* command; quarantining its queue|Camera .* command queue is quarantined|Timed out waiting for video files for occupancy generation|returned a stale or mismatched saved-video result for occupancy generation|Camera .* failed to close occupancy generation|Failed to finish matched camera recording generation' "$restart_service_log" || true)
-    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s}\n' \
-      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors"
+    scratch_before_json=$(scratch_inventory_json "$scratch_before")
+    scratch_after_json=$(scratch_inventory_json "$scratch_after")
+    stale_scratch_json=$(scratch_inventory_json "$stale_scratch")
+    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s,"scratchBeforeRestartCount":%s,"scratchAfterRestartCount":%s,"staleScratchAfterRestartCount":%s,"scratchBeforeRestart":%s,"scratchAfterRestart":%s,"staleScratchAfterRestart":%s}\n' \
+      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors" \
+      "$scratch_before_count" "$scratch_after_count" "$stale_scratch_count" \
+      "$scratch_before_json" "$scratch_after_json" "$stale_scratch_json"
     cleanup_journal_restart
     trap - EXIT
     ;;

@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
 import test from "node:test";
 import {
+  archiveScratchRestartIsSafe,
   archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratchRestart,
   assessArchiveScratch,
   assessDailyFilePublication,
   assessJpeg,
@@ -447,6 +449,48 @@ test("archive scratch and retained-media metadata contracts fail closed", () => 
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointPresent: false,
     checkpointValid: false, checkpointSchemaVersion: null}, false), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, retainedJpegFiles: 4}, true), false);
+});
+
+test("restart scratch oracle rejects every surviving pre-restart identity", () => {
+  const before = "cold-query-11111111-1111-4111-8111-111111111111";
+  const afterOnly = "metadata-query-22222222-2222-4222-8222-222222222222";
+  const newOnly = assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 1,
+    staleScratchAfterRestartCount: 0,
+    scratchBeforeRestart: [before],
+    scratchAfterRestart: [afterOnly],
+    staleScratchAfterRestart: [],
+  });
+  assert.equal(archiveScratchRestartIsSafe(newOnly), true,
+    "a genuinely new post-start session must be allowed");
+
+  const survivor = assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 2,
+    staleScratchAfterRestartCount: 1,
+    scratchBeforeRestart: [before],
+    scratchAfterRestart: [before, afterOnly],
+    staleScratchAfterRestart: [before],
+  });
+  assert.equal(archiveScratchRestartIsSafe(survivor), false);
+
+  assert.throws(() => assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 2,
+    staleScratchAfterRestartCount: 0,
+    scratchBeforeRestart: [before],
+    scratchAfterRestart: [before, afterOnly],
+    staleScratchAfterRestart: [],
+  }), /exact pre\/post identity intersection/);
+  assert.throws(() => assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 0,
+    staleScratchAfterRestartCount: 0,
+    scratchBeforeRestart: ["../unsafe"],
+    scratchAfterRestart: [],
+    staleScratchAfterRestart: [],
+  }), /canonical DuckDB scratch identity/);
 });
 
 test("retained-media runtime requires a valid current durable scan cursor", () => {

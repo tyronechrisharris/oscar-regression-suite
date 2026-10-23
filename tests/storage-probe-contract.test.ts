@@ -578,15 +578,38 @@ test("journal restart exercises dependency-ordered launcher shutdown", () => {
   assert.match(block, /for before_row in "\$\{before_rows\[@\]\}"/);
   assert.match(block, /segments_verified == "\$segments_before"/);
   assert.doesNotMatch(block, /done <"\$before_inventory"/);
+  const scratchBefore = block.indexOf('archive_scratch_inventory >"$scratch_before"');
+  const supportedRestart = block.indexOf('sudo bash oscar.sh restart');
+  const scratchAfter = block.indexOf('archive_scratch_inventory >"$scratch_after"');
+  assert.ok(scratchBefore >= 0 && supportedRestart > scratchBefore,
+    "all validated scratch identities must be captured immediately before restart");
+  assert.ok(scratchAfter > supportedRestart,
+    "all validated scratch identities must be captured after restart");
+  assert.match(block, /comm -12 "\$scratch_before" "\$scratch_after" >"\$stale_scratch"/);
   for (const required of [
     "BasicEventHandler", "DataStreamTransactionHandler", "DatabasePurger",
     "ModuleRegistry", "journal-restart-partials", '! -newermt "$cutoff"',
     "Timed out waiting for camera", "command queue is quarantined",
     "Timed out waiting for video files", "stale or mismatched saved-video result",
     '"shutdownErrors":%s', '"cameraRecordingErrors":%s',
+    '"scratchBeforeRestartCount":%s', '"scratchAfterRestartCount":%s',
+    '"staleScratchAfterRestartCount":%s', '"scratchBeforeRestart":%s',
+    '"scratchAfterRestart":%s', '"staleScratchAfterRestart":%s',
   ]) assert.ok(block.includes(required), `missing ordered-restart oracle: ${required}`);
   assert.doesNotMatch(block, /FATAL:[^'\n]*terminating connection due to administrator command/,
     "normal PostgreSQL disconnects during the supported restart are not shutdown failures");
+});
+
+test("scratch inventory accepts only real canonical operation directories", () => {
+  const start = probe.indexOf("archive_scratch_inventory() {");
+  const end = probe.indexOf("scratch_inventory_json() {", start);
+  const block = probe.slice(start, end);
+  assert.ok(start >= 0 && end > start, "missing archive scratch inventory helper");
+  assert.match(block, /\[ -d "\$root" \] && \[ ! -L "\$root" \]/);
+  assert.match(block, /\[ -d "\$child" \] && \[ ! -L "\$child" \]/);
+  assert.match(block, /real_child=.*realpath -e -- "\$child"/);
+  assert.match(block, /\[ "\$\(dirname -- "\$real_child"\)" = "\$real_root" \]/);
+  assert.match(block, /\^\[a-z\]\[a-z0-9-\]\{0,31\}-\[0-9a-f\]\{8\}/);
 });
 
 test("camera recording log probe uses one exact guarded window and count-only output", () => {

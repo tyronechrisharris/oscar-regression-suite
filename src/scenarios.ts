@@ -46,8 +46,10 @@ import {navigateWithBoundedRetry} from "./navigation.js";
 import {RunReporter} from "./reporter.js";
 import {StorageProbeClient} from "./storage-probe.js";
 import {
+  archiveScratchRestartIsSafe,
   archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratchRestart,
   assessArchiveScratch,
   assessJpeg,
   assessMediaMetadataHealth,
@@ -4597,7 +4599,14 @@ export class RegressionScenarios {
           recoveryErrors: number;
           shutdownErrors: number;
           cameraRecordingErrors: number;
+          scratchBeforeRestartCount: number;
+          scratchAfterRestartCount: number;
+          staleScratchAfterRestartCount: number;
+          scratchBeforeRestart: string[];
+          scratchAfterRestart: string[];
+          staleScratchAfterRestart: string[];
         }>("journal-restart", [directJournalLaneUid!]);
+        const scratchRestart = assessArchiveScratchRestart(value);
         const lane = await probe.runJson<DirectJournalLaneState>(
           "journal-lane-state",
           [directJournalLaneUid!],
@@ -4611,8 +4620,10 @@ export class RegressionScenarios {
           value.segmentFailures === 0;
           return {passed: value.healthy && exactRestartPreservation &&
             value.partialFiles === 0 && value.recoveryErrors === 0 &&
-            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
-          observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
+            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable &&
+            archiveScratchRestartIsSafe(scratchRestart),
+          observed: JSON.stringify({restart: value, scratchRestart, lane,
+            preRestart: directJournalAfterAppend})};
         });
       } finally {
         this.metrics.setPhase("storage-lifecycle-post-restart");
