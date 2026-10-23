@@ -11,6 +11,18 @@ const probe = readFileSync(probePath, "utf8");
 const scenarios = readFileSync(resolve("src/scenarios.ts"), "utf8");
 const storageClient = readFileSync(resolve("src/storage-probe.ts"), "utf8");
 
+function embeddedComposeShell(functionName: string, argumentZero: string): string {
+  const functionStart = probe.indexOf(`${functionName}() {`);
+  assert.ok(functionStart >= 0, `missing ${functionName}`);
+  const marker = "compose exec -T oscar sh -eu -c '\n";
+  const scriptStart = probe.indexOf(marker, functionStart);
+  assert.ok(scriptStart >= 0, `missing embedded shell for ${functionName}`);
+  const contentStart = scriptStart + marker.length;
+  const contentEnd = probe.indexOf(`\n  ' ${argumentZero}`, contentStart);
+  assert.ok(contentEnd >= 0, `missing embedded shell terminator for ${functionName}`);
+  return probe.slice(contentStart, contentEnd);
+}
+
 function entrypointContractAccepts(entrypoint: string): boolean {
   const helper = probe.match(/^entrypoint_has_managed_tmp_contract\(\) \{\n[\s\S]*?^\}/mu)?.[0];
   assert.ok(helper, "missing entrypoint temp-contract helper");
@@ -149,6 +161,28 @@ test("storage probe remains valid Bash and gates exact 3.9.2 image identity", ()
   assert.match(probe, /docker compose --project-name oscar --env-file \.env --file compose\.yaml/);
   assert.match(probe, /env -u OSCAR_ARCHIVE_DIR/);
   assert.doesNotMatch(probe, /lock_directory=\$\{OSCAR_STORAGE_LOCK_DIR/);
+});
+
+test("DuckDB scratch health and restart inventories are valid target POSIX shell", () => {
+  for (const [functionName, argumentZero, hereDocument] of [
+    ["archive_scratch_json", "scratch-health", "OSCAR_SCRATCH_CLASSIFIER"],
+    ["archive_scratch_inventory", "scratch-inventory", "OSCAR_SCRATCH_CHILD"],
+  ] as const) {
+    const embedded = embeddedComposeShell(functionName, argumentZero);
+    assert.doesNotThrow(
+      () => execFileSync("sh", ["-n"], {input: embedded, stdio: ["pipe", "pipe", "pipe"]}),
+      `${functionName} must parse under the same POSIX sh used in the OSCAR container`,
+    );
+    const payloadStartMarker = `<<\\${hereDocument}\n`;
+    const payloadStart = embedded.indexOf(payloadStartMarker);
+    const payloadEnd = embedded.indexOf(`\n${hereDocument}\n`, payloadStart + payloadStartMarker.length);
+    assert.ok(payloadStart >= 0 && payloadEnd > payloadStart, `missing ${hereDocument}`);
+    const payload = embedded.slice(payloadStart + payloadStartMarker.length, payloadEnd);
+    assert.doesNotThrow(
+      () => execFileSync("sh", ["-n"], {input: payload, stdio: ["pipe", "pipe", "pipe"]}),
+      `${hereDocument} must parse under the same POSIX sh used in the OSCAR container`,
+    );
+  }
 });
 
 test("alarm-media probe scopes a no-replace baseline and removes every temporary marker", () => {
@@ -614,7 +648,9 @@ test("scratch inventory ignores only the exact safe permanent lease", () => {
   assert.match(block, /-print0 >"\$work\/first\.raw"/);
   assert.match(block, /sort -zu "\$work\/first\.raw"/);
   assert.match(block, /cmp -s "\$work\/first\.sorted" "\$work\/second\.sorted" \|\| exit 25/);
-  assert.match(block, /xargs -0 -r sh -eu -c "\$validator"/);
+  assert.match(block, /validator="\$work\/validator[.]sh"/);
+  assert.match(block, /chmod 600 "\$validator"/);
+  assert.match(block, /xargs -0 -r sh -eu "\$validator" "\$root" "\$lease"/);
   assert.match(block, /\[ -d "\$child" \] && \[ ! -L "\$child" \]/);
   assert.match(block, /real_child=\$\(realpath -e -- "\$child"\)/);
   assert.match(block, /stat -c %d:%i -- "\$lease"/);
@@ -633,7 +669,9 @@ test("scratch health reports the lease, operation count, and every unexpected en
   ]) assert.ok(block.includes(field), `scratch health is missing ${field}`);
   assert.match(block, /-print0 >"\$work\/first\.raw"/);
   assert.match(block, /cmp -s "\$work\/first\.sorted" "\$work\/second\.sorted"/);
-  assert.match(block, /xargs -0 -r sh -eu -c "\$classifier"/);
+  assert.match(block, /classifier="\$work\/classifier[.]sh"/);
+  assert.match(block, /chmod 600 "\$classifier"/);
+  assert.match(block, /xargs -0 -r sh -eu "\$classifier" "\$scratch" "\$lease"/);
   assert.match(block, /printf "operation\\n"/);
   assert.match(block, /printf "unexpected\\n"/);
   assert.match(block, /unexpected=\$\(grep -c "\^unexpected\$"/);

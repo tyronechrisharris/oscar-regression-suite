@@ -312,7 +312,8 @@ archive_scratch_json() {
       LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
       inventory_stable=true
       cmp -s "$work/first.sorted" "$work/second.sorted" || inventory_stable=false
-      classifier=$(cat <<\OSCAR_SCRATCH_CLASSIFIER
+      classifier="$work/classifier.sh"
+      cat >"$classifier" <<\OSCAR_SCRATCH_CLASSIFIER
 root=$1
 lease=$2
 shift 2
@@ -341,8 +342,9 @@ for child do
   printf "unexpected\n"
 done
 OSCAR_SCRATCH_CLASSIFIER
+      chmod 600 "$classifier"
       if [ -s "$work/second.sorted" ]; then
-        xargs -0 -r sh -eu -c "$classifier" scratch-child "$scratch" "$lease" \
+        xargs -0 -r sh -eu "$classifier" "$scratch" "$lease" \
           <"$work/second.sorted" >"$work/classes"
       else
         : >"$work/classes"
@@ -388,7 +390,8 @@ archive_scratch_inventory() {
     find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
     LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
     cmp -s "$work/first.sorted" "$work/second.sorted" || exit 25
-    validator=$(cat <<\OSCAR_SCRATCH_CHILD
+    validator="$work/validator.sh"
+    cat >"$validator" <<\OSCAR_SCRATCH_CHILD
 root=$1
 lease=$2
 shift 2
@@ -410,8 +413,9 @@ for child do
   printf "%s\n" "$name"
 done
 OSCAR_SCRATCH_CHILD
+    chmod 600 "$validator"
     if [ -s "$work/second.sorted" ]; then
-      xargs -0 -r sh -eu -c "$validator" scratch-child "$root" "$lease" \
+      xargs -0 -r sh -eu "$validator" "$root" "$lease" \
         <"$work/second.sorted" >"$work/operations"
     else
       : >"$work/operations"
