@@ -1208,6 +1208,8 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   assert.match(health, /STORAGE_RETAINED_EVENT_ID is missing and this run cannot self-seed/);
   assert.match(health, /daily-journal inventory to reach an atomic clean boundary/);
   assert.match(health, /candidate => assessDailyJournalStatus\(candidate\)\.passed/);
+  assert.match(health, /retained-media metadata to reach an atomic clean boundary/);
+  assert.match(health, /candidate => mediaMetadataHealthIsSafe\(candidate, requirePopulated\)/);
 
   const generatedStart = scenarios.indexOf("private async verifyGeneratedAlarmRetention");
   const generatedEnd = scenarios.indexOf("private storageUnavailable", generatedStart);

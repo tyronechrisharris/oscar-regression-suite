@@ -4144,9 +4144,15 @@ export class RegressionScenarios {
         target: "retained-media/v1",
         expected: "checkpoint schema 2 and compact hourly/deletion indexes are structurally valid, with no legacy markers, tombstones, partials, or unsafe entries",
       }, async () => {
-        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
+        const requirePopulated = Boolean(this.config.storageRetainedEventId);
+        const value = await poll(
+          async () => assessMediaMetadataHealth(await probe.runJson("media-metadata-health")),
+          candidate => mediaMetadataHealthIsSafe(candidate, requirePopulated),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "retained-media metadata to reach an atomic clean boundary"},
+        );
         return {
-          passed: mediaMetadataHealthIsSafe(value, Boolean(this.config.storageRetainedEventId)),
+          passed: mediaMetadataHealthIsSafe(value, requirePopulated),
           observed: JSON.stringify(value),
         };
       });
@@ -4425,8 +4431,13 @@ export class RegressionScenarios {
         target: "retained-media/v1",
         expected: "generated five-frame media has schema-2 checkpoint state and compact hourly processed indexes with no legacy or unsafe metadata",
       }, async () => {
-        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
         const requirePopulated = this.generatedAlarmMedia.size > 0;
+        const value = await poll(
+          async () => assessMediaMetadataHealth(await probe.runJson("media-metadata-health")),
+          candidate => mediaMetadataHealthIsSafe(candidate, requirePopulated),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "retained-media metadata to reach an atomic clean boundary"},
+        );
         return {passed: mediaMetadataHealthIsSafe(value, requirePopulated), observed: JSON.stringify(value)};
       });
       const lifecycleBefore = storageMetricFromProbe(
@@ -4793,7 +4804,7 @@ export class RegressionScenarios {
               stableMetadataSamples = signature === stableMetadataSignature
                 ? stableMetadataSamples + 1 : 1;
               stableMetadataSignature = signature;
-              return value.processedIndexFiles > 0 && stableMetadataSamples >= 3;
+              return mediaMetadataHealthIsSafe(value, true) && stableMetadataSamples >= 3;
             },
             {timeoutMs: 120_000, intervalMs: 2_000,
               description: "retained-media indexes to repopulate and stabilize after restart"},
