@@ -1005,6 +1005,93 @@ fixture_archive_time_sql() {
     "$clock_expression" "$retention"
 }
 
+archive_maintenance_idle_json() {
+  local config_path=$1 scratch_entries=$2
+  [[ $scratch_entries =~ ^[0-9]+$ ]] || fail 'Invalid archive scratch entry count.'
+  {
+    cat <<'SQL'
+\set ON_ERROR_STOP on
+CREATE TEMP TABLE oscar_idle_config_input (sequence bigserial, line text NOT NULL);
+\copy oscar_idle_config_input(line) FROM STDIN
+SQL
+    compose exec -T oscar base64 "$config_path"
+    printf '\\.\n\\set scratch_entries %s\n' "$scratch_entries"
+    cat <<'SQL'
+WITH payload AS (
+  SELECT convert_from(decode(string_agg(line, '' ORDER BY sequence), 'base64'), 'UTF8') AS text
+  FROM oscar_idle_config_input
+), document AS (
+  SELECT text::json AS raw FROM payload WHERE left(ltrim(text), 1) = '['
+), items AS (
+  SELECT item AS raw
+  FROM document, LATERAL json_array_elements(raw) item
+), candidates AS (
+  SELECT raw
+  FROM items
+  WHERE json_typeof(raw) = 'object'
+    AND raw->>'objClass' = 'org.sensorhub.impl.database.system.SystemDriverDatabaseConfig'
+), selected AS (
+  SELECT raw->'dbConfig'->'archive' AS archive
+  FROM candidates
+  WHERE (SELECT count(*) FROM candidates) = 1
+    AND NOT EXISTS (SELECT key FROM json_each(raw) GROUP BY key HAVING count(*) <> 1)
+    AND json_typeof(raw->'dbConfig') = 'object'
+    AND NOT EXISTS (SELECT key FROM json_each(raw->'dbConfig') GROUP BY key HAVING count(*) <> 1)
+    AND raw->'dbConfig'->>'objClass' =
+      'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig'
+), config AS (
+  SELECT archive,
+    (archive->>'hotRetentionDays')::integer AS hot_retention_days,
+    (archive->>'rollbackGraceDays')::integer AS rollback_grace_days,
+    ARRAY(SELECT value #>> '{}' FROM json_array_elements(archive->'outputNames') value) AS output_names
+  FROM selected
+  WHERE json_typeof(archive) = 'object'
+    AND NOT EXISTS (SELECT key FROM json_each(archive) GROUP BY key HAVING count(*) <> 1)
+    AND archive->>'objClass' = 'org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig'
+    AND json_typeof(archive->'hotRetentionDays') = 'number'
+    AND archive->>'hotRetentionDays' ~ '^[1-9][0-9]*$'
+    AND json_typeof(archive->'rollbackGraceDays') = 'number'
+    AND archive->>'rollbackGraceDays' ~ '^[1-9][0-9]*$'
+    AND json_typeof(archive->'outputNames') = 'array'
+    AND json_array_length(archive->'outputNames') BETWEEN 1 AND 64
+    AND NOT EXISTS (
+      SELECT 1 FROM json_array_elements(archive->'outputNames') value
+      WHERE json_typeof(value) <> 'string' OR length(value #>> '{}') = 0)
+    AND json_array_length(archive->'outputNames') = (
+      SELECT count(DISTINCT value #>> '{}') FROM json_array_elements(archive->'outputNames') value)
+), state AS (
+  SELECT
+    (SELECT count(*) FROM oscar_archive_job WHERE state='EXPORTING') exporting_jobs,
+    (SELECT count(*) FROM oscar_archive_job failed
+      WHERE failed.state='FAILED' AND NOT EXISTS (
+        SELECT 1 FROM oscar_archive_job newer
+        WHERE newer.store_key=failed.store_key AND newer.id_scope=failed.id_scope
+          AND newer.profile=failed.profile AND newer.window_start=failed.window_start
+          AND newer.window_end=failed.window_end AND newer.revision>failed.revision)) latest_failed_jobs,
+    (SELECT count(*) FROM oscar_archive_generation g, config c
+      WHERE g.state='ACTIVE' AND g.parity_verified
+        AND g.activated_at<=now()-make_interval(days=>c.rollback_grace_days)
+        AND EXISTS (SELECT 1 FROM obs o WHERE o.archivegenerationid=g.id)) eligible_hot_deletes,
+    (SELECT count(*) FROM (
+      SELECT 1 FROM obs o JOIN datastream d ON d.id=o.datastreamid, config c
+      WHERE o.archivegenerationid IS NULL
+        AND o.phenomenontime<now()-make_interval(days=>c.hot_retention_days)
+        AND d.data->>'outputName'=ANY(c.output_names)
+      LIMIT 1) candidate) eligible_unowned_rows,
+    (SELECT count(*) FROM config) config_rows
+)
+SELECT json_build_object(
+  'idle',config_rows=1 AND exporting_jobs=0 AND latest_failed_jobs=0
+    AND eligible_hot_deletes=0 AND eligible_unowned_rows=0 AND :scratch_entries::bigint=0,
+  'exportingJobs',exporting_jobs,
+  'latestFailedJobs',latest_failed_jobs,
+  'eligibleHotDeleteGenerations',eligible_hot_deletes,
+  'eligibleUnownedRows',eligible_unowned_rows,
+  'scratchEntries',:scratch_entries::bigint) FROM state;
+SQL
+  } | psql_admin --quiet --tuples-only --no-align | tail -n 1
+}
+
 case $action in
   camera-recording-log-start)
     (($# == 0)) || fail 'Camera-recording log start accepts no arguments.'
@@ -2362,25 +2449,17 @@ COMMANDS
     ' archive-maintenance-idle)
     [[ $scratch_entries =~ ^[0-9]+$ ]] ||
       fail 'DuckDB scratch idle probe returned a nonnumeric count.'
-    json_query "WITH state AS (
-      SELECT
-        (SELECT count(*) FROM oscar_archive_job WHERE state='EXPORTING') exporting_jobs,
-        (SELECT count(*) FROM oscar_archive_job failed
-          WHERE failed.state='FAILED' AND NOT EXISTS (
-            SELECT 1 FROM oscar_archive_job newer
-            WHERE newer.store_key=failed.store_key AND newer.id_scope=failed.id_scope
-              AND newer.profile=failed.profile AND newer.window_start=failed.window_start
-              AND newer.window_end=failed.window_end AND newer.revision>failed.revision)) latest_failed_jobs,
-        (SELECT count(*) FROM oscar_archive_generation g
-          WHERE g.state='ACTIVE' AND g.parity_verified
-            AND g.activated_at<=now()-interval '1 day'
-            AND EXISTS (SELECT 1 FROM obs o WHERE o.archivegenerationid=g.id)) eligible_hot_deletes)
-      SELECT json_build_object(
-        'idle',exporting_jobs=0 AND latest_failed_jobs=0 AND eligible_hot_deletes=0 AND $scratch_entries=0,
-        'exportingJobs',exporting_jobs,
-        'latestFailedJobs',latest_failed_jobs,
-        'eligibleHotDeleteGenerations',eligible_hot_deletes,
-        'scratchEntries',$scratch_entries) FROM state;"
+    config=/var/lib/oscar/config.json
+    compose exec -T oscar sh -eu -c '
+      path=$1
+      test -f "$path" && test ! -L "$path"
+      size=$(stat -c %s -- "$path")
+      test "$size" -gt 0 && test "$size" -le 16777216
+    ' archive-maintenance-config "$config" ||
+      fail 'The live OSCAR config is unsafe for the archive maintenance idle probe.'
+    idle_json=$(archive_maintenance_idle_json "$config" "$scratch_entries")
+    [[ -n $idle_json ]] || fail 'Could not derive one deployed archive configuration for the idle probe.'
+    printf '%s\n' "$idle_json"
     ;;
 
   fixture-status)

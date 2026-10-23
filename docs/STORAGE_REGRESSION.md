@@ -148,11 +148,12 @@ catalog. It selects a complete UTC-hour window at least two hours before the
 earliest existing archive generation or job window, while remaining older than
 the configured hot-retention threshold. Its deletion cutoff therefore cannot
 select later pre-existing generations. Before taking the guarded-delete metric
-baseline, the suite additionally requires three clean samples spanning more
-than one worker cadence: no active export, no latest failed retry, no
-rollback-grace-eligible generation with hot rows, and an empty DuckDB scratch
-directory. The exact-generation plan, hold, confirmation-token, parity, and
-fail-closed non-fixture rejection remain mandatory.
+baseline, the suite additionally requires three clean samples spanning a
+maintenance/delete polling interval: no active export, no latest failed retry,
+no allowlisted unowned row older than the deployed hot-retention cutoff, no
+generation with hot rows older than the deployed rollback grace, and an empty
+DuckDB scratch directory. The exact-generation plan, hold, confirmation-token,
+parity, and fail-closed non-fixture rejection remain mandatory.
 
 The disposable configuration must also set these fields in the
 existing OSCAR service `videoRetentionConfig` before OSCAR starts:

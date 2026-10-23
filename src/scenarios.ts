@@ -4333,16 +4333,17 @@ export class RegressionScenarios {
         scenario: "storage-lifecycle", category: "performance",
         action: "isolate fixture hot-delete accounting",
         target: this.config.targetHost,
-        expected: "three clean samples spanning a worker cadence prove no export, failed retry, eligible hot delete, or DuckDB scratch work before the fixture baseline",
+        expected: "three clean samples spanning a maintenance/delete interval prove no export, failed retry, eligible unowned row, eligible hot delete, or DuckDB scratch work before the fixture baseline",
       }, async () => {
         type ArchiveIdle = {idle: boolean; exportingJobs: number; latestFailedJobs: number;
-          eligibleHotDeleteGenerations: number; scratchEntries: number};
+          eligibleHotDeleteGenerations: number; eligibleUnownedRows: number; scratchEntries: number};
         let idleSince = 0;
         let stableSamples = 0;
         const value = await poll(async () => {
           const current = await probe.runJson<ArchiveIdle>("archive-maintenance-idle");
           if (current.idle && current.exportingJobs === 0 && current.latestFailedJobs === 0 &&
-              current.eligibleHotDeleteGenerations === 0 && current.scratchEntries === 0) {
+              current.eligibleHotDeleteGenerations === 0 && current.eligibleUnownedRows === 0 &&
+              current.scratchEntries === 0) {
             if (stableSamples === 0) idleSince = Date.now();
             stableSamples++;
           } else {
@@ -4353,7 +4354,7 @@ export class RegressionScenarios {
         }, state => state.idle && state.stableSamples >= 3 && state.stableForMs >= 65_000, {
           timeoutMs: this.config.storageArchiveTimeoutMs,
           intervalMs: 35_000,
-          description: "pre-existing archive maintenance to remain idle across one worker cadence",
+          description: "pre-existing archive maintenance to remain idle across a maintenance/delete interval",
         });
         const passed = value.idle && value.stableSamples >= 3 && value.stableForMs >= 65_000;
         return {passed, value: passed, observed: JSON.stringify(value)};

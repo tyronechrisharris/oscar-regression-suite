@@ -1021,7 +1021,7 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "&order=asc", "&order=desc",
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archive-maintenance-idle", "isolate fixture hot-delete accounting", "maintenanceIdle",
-    "stableSamples >= 3", "stableForMs >= 65_000",
+    "eligibleUnownedRows", "stableSamples >= 3", "stableForMs >= 65_000",
     "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",
     "deletionIndexesIncluded",
@@ -1037,6 +1037,12 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "unaccountedSingletonDeletes === 0",
     "512 * 1024 * 1024", "65_536",
   ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
+  const idle = probe.slice(probe.indexOf("archive_maintenance_idle_json()"), probe.indexOf("case $action in"));
+  for (const required of [
+    "hotRetentionDays", "rollbackGraceDays", "outputNames", "eligible_unowned_rows",
+    "o.archivegenerationid IS NULL", "LIMIT 1", "make_interval(days=>c.hot_retention_days)",
+    "make_interval(days=>c.rollback_grace_days)",
+  ]) assert.ok(idle.includes(required), `missing bounded deployed-config idle contract: ${required}`);
   const holdCreate = block.indexOf('"fixture-hot-hold-create"');
   const heldDelete = block.indexOf("request.delete(", holdCreate);
   const holdRelease = block.indexOf('"fixture-hot-hold-release"', heldDelete);
