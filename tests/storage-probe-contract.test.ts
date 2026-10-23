@@ -600,16 +600,59 @@ test("journal restart exercises dependency-ordered launcher shutdown", () => {
     "normal PostgreSQL disconnects during the supported restart are not shutdown failures");
 });
 
-test("scratch inventory accepts only real canonical operation directories", () => {
+test("scratch inventory ignores only the exact safe permanent lease", () => {
   const start = probe.indexOf("archive_scratch_inventory() {");
   const end = probe.indexOf("scratch_inventory_json() {", start);
   const block = probe.slice(start, end);
   assert.ok(start >= 0 && end > start, "missing archive scratch inventory helper");
   assert.match(block, /\[ -d "\$root" \] && \[ ! -L "\$root" \]/);
+  assert.match(block, /lease="\$root\/\.oscar-duckdb\.lock"/);
+  assert.match(block, /\[ -f "\$lease" \] && \[ ! -L "\$lease" \]/);
+  assert.match(block, /stat -c %u -- "\$lease"\)" = 10001/);
+  assert.match(block, /stat -c %g -- "\$lease"\)" = 10001/);
+  assert.match(block, /stat -c %a -- "\$lease"\)" = 600/);
+  assert.match(block, /-print0 >"\$work\/first\.raw"/);
+  assert.match(block, /sort -zu "\$work\/first\.raw"/);
+  assert.match(block, /cmp -s "\$work\/first\.sorted" "\$work\/second\.sorted" \|\| exit 25/);
+  assert.match(block, /xargs -0 -r sh -eu -c "\$validator"/);
   assert.match(block, /\[ -d "\$child" \] && \[ ! -L "\$child" \]/);
-  assert.match(block, /real_child=.*realpath -e -- "\$child"/);
-  assert.match(block, /\[ "\$\(dirname -- "\$real_child"\)" = "\$real_root" \]/);
-  assert.match(block, /\^\[a-z\]\[a-z0-9-\]\{0,31\}-\[0-9a-f\]\{8\}/);
+  assert.match(block, /real_child=\$\(realpath -e -- "\$child"\)/);
+  assert.match(block, /stat -c %d:%i -- "\$lease"/);
+  assert.doesNotMatch(block, /find[^\n]*\|/,
+    "an authoritative find failure must not be masked by a successful pipeline tail");
+});
+
+test("scratch health reports the lease, operation count, and every unexpected entry", () => {
+  const start = probe.indexOf("archive_scratch_json() {");
+  const end = probe.indexOf("archive_scratch_inventory() {", start);
+  const block = probe.slice(start, end);
+  assert.ok(start >= 0 && end > start, "missing archive scratch health helper");
+  for (const field of [
+    "leaseFilePresent", "leaseFileRegular", "leaseFileOwnerUid", "leaseFileOwnerGid",
+    "leaseFileMode", "entryCount", "unexpectedEntryCount",
+  ]) assert.ok(block.includes(field), `scratch health is missing ${field}`);
+  assert.match(block, /-print0 >"\$work\/first\.raw"/);
+  assert.match(block, /cmp -s "\$work\/first\.sorted" "\$work\/second\.sorted"/);
+  assert.match(block, /xargs -0 -r sh -eu -c "\$classifier"/);
+  assert.match(block, /printf "operation\\n"/);
+  assert.match(block, /printf "unexpected\\n"/);
+  assert.match(block, /unexpected=\$\(grep -c "\^unexpected\$"/);
+  assert.match(block, /inventory_stable.*unexpected=\$\(\(unexpected\+1\)\)/s);
+  assert.doesNotMatch(block, /find[^\n]*\|/,
+    "scratch health must observe a find failure rather than count partial output");
+  assert.doesNotMatch(block, /entries=\$\(find "\$scratch" -mindepth 1 -maxdepth 1 -print/,
+    "the permanent lease must not be counted as active operation work");
+});
+
+test("archive maintenance idle counts operation directories rather than the permanent lease", () => {
+  const start = probe.indexOf("  archive-maintenance-idle)");
+  const end = probe.indexOf("  fixture-status)", start);
+  const block = probe.slice(start, end);
+  assert.ok(start >= 0 && end > start, "missing archive maintenance idle action");
+  assert.match(block, /scratch_inventory=\$\(archive_scratch_inventory\)/);
+  assert.match(block, /scratch_entries=0/);
+  assert.match(block, /scratch_entries=\$\(grep -c \. <<<"\$scratch_inventory"\)/);
+  assert.doesNotMatch(block, /find "\$root" -mindepth 1 -maxdepth 1 -print \| wc -l/);
 });
 
 test("camera recording log probe uses one exact guarded window and count-only output", () => {
@@ -1045,7 +1088,7 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
     "archive-maintenance-idle", "isolate fixture hot-delete accounting", "maintenanceIdle",
     "eligibleUnownedRows", "stableSamples >= 3", "stableForMs >= 65_000",
-    "archiveScratchIsSafe(value, true)", "duckDbScratchExcluded",
+    "archiveScratchIsSafe(value)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",
     "deletionIndexesIncluded",
     "retainedMediaExpectedSets", "retainedMediaExpectedMembers",

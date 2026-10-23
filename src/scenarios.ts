@@ -3983,15 +3983,15 @@ export class RegressionScenarios {
       await this.check({
         scenario: "storage-health", category: "cold-archive", action: "verify bounded DuckDB scratch hygiene",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "the configured scratch root is absent or a private archive-disjoint empty runtime directory",
+        expected: "the private archive-disjoint scratch root contains its exact 0600 lease and no operation or unexpected entries",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, false),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "DuckDB scratch to become empty between bounded operations"},
+            description: "DuckDB scratch to retain only its safe lease between bounded operations"},
         );
-        const clean = archiveScratchIsSafe(value, false);
+        const clean = archiveScratchIsSafe(value);
         return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
 
@@ -4181,15 +4181,15 @@ export class RegressionScenarios {
         scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify clean DuckDB scratch before fixture mutation",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "the configured private archive-disjoint scratch root is empty between archive operations",
+        expected: "the private archive-disjoint scratch root contains only its exact safe lease between archive operations",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, false),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "pre-lifecycle DuckDB scratch to become empty"},
+            description: "pre-lifecycle DuckDB scratch to retain only its safe lease"},
         );
-        const clean = archiveScratchIsSafe(value, false);
+        const clean = archiveScratchIsSafe(value);
         return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
       if (!scratchAccepted) {
@@ -4570,15 +4570,15 @@ export class RegressionScenarios {
         scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify DuckDB operation scratch cleanup",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "archive/export/query/count/delete sessions leave the private archive-disjoint scratch root empty",
+        expected: "archive/export/query/count/delete sessions remove every operation directory while preserving the exact safe lease",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, true),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "post-lifecycle DuckDB scratch to become empty"},
+            description: "post-lifecycle DuckDB scratch to retain only its safe lease"},
         );
-        return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
+        return {passed: archiveScratchIsSafe(value), observed: JSON.stringify(value)};
       });
       const lifecycleRestartPhase = "storage-lifecycle-restart-disruption";
       // Finish any interval sample that captured the steady-state phase before allowing the

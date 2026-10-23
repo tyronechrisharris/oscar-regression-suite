@@ -289,7 +289,9 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
       maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
       sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"},
     archiveScratch: {present: true, realDirectory: true, ownerUid: 10001, ownerGid: 10001,
-      mode: "700", archiveDisjoint: true, entryCount: 0},
+      mode: "700", archiveDisjoint: true, leaseFilePresent: true, leaseFileRegular: true,
+      leaseFileOwnerUid: 10001, leaseFileOwnerGid: 10001, leaseFileMode: "600",
+      entryCount: 0, unexpectedEntryCount: 0},
     dailyJournal: {rootDirectory: "files", journalDirectory: ".dailyfile-journal",
       publicationDirectory: "dailyfiles", zoneId: "UTC", observationMode: "LATEST",
       fsyncIntervalMillis: 1000, maxUnforcedRecords: 128, maxUnforcedBytes: 1048576,
@@ -317,7 +319,7 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
   assert.deepEqual(platform.archiveResources, {memoryLimitMegabytes: 256, threads: 2,
     maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
     sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"});
-  assert.equal(archiveScratchIsSafe(platform.archiveScratch, true), true);
+  assert.equal(archiveScratchIsSafe(platform.archiveScratch), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(platform, "3.9.2"), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, configuredRelease: "4.0.0"},
@@ -332,7 +334,7 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     "3.9.2",
   ), false);
   const activeScratch = {...platform.archiveScratch, entryCount: 1};
-  assert.equal(archiveScratchIsSafe(activeScratch, false), false);
+  assert.equal(archiveScratchIsSafe(activeScratch), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, archiveScratch: activeScratch},
     "3.9.2",
@@ -431,10 +433,27 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
 });
 
 test("archive scratch and retained-media metadata contracts fail closed", () => {
-  assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
-    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), false), true);
-  assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
-    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), true), false);
+  const safeScratch = assessArchiveScratch({present: true, realDirectory: true,
+    ownerUid: 10001, ownerGid: 10001, mode: "700", archiveDisjoint: true,
+    leaseFilePresent: true, leaseFileRegular: true, leaseFileOwnerUid: 10001,
+    leaseFileOwnerGid: 10001, leaseFileMode: "600", entryCount: 0,
+    unexpectedEntryCount: 0});
+  assert.equal(archiveScratchIsSafe(safeScratch), true);
+  const absentScratch = assessArchiveScratch({present: false, realDirectory: false,
+    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true,
+    leaseFilePresent: false, leaseFileRegular: false, leaseFileOwnerUid: null,
+    leaseFileOwnerGid: null, leaseFileMode: "", entryCount: 0, unexpectedEntryCount: 0});
+  assert.equal(archiveScratchIsSafe(absentScratch), false,
+    "the permanent product lease is required even before the first operation");
+  for (const unsafeLease of [
+    {...safeScratch, leaseFilePresent: false},
+    {...safeScratch, leaseFileRegular: false},
+    {...safeScratch, leaseFileOwnerUid: 0},
+    {...safeScratch, leaseFileOwnerGid: 0},
+    {...safeScratch, leaseFileMode: "644"},
+  ]) assert.equal(archiveScratchIsSafe(unsafeLease), false);
+  assert.equal(archiveScratchIsSafe({...safeScratch, unexpectedEntryCount: 1}), false);
+  assert.equal(archiveScratchIsSafe({...safeScratch, entryCount: 1}), false);
   const metadataHealth = assessMediaMetadataHealth({rootPresent: true, checkpointPresent: true,
     checkpointValid: true, checkpointSchemaVersion: 2,
     totalEntries: 100_001, regularFiles: 90_001, directories: 10_000, processedIndexFiles: 1,

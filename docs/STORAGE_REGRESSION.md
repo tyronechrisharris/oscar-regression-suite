@@ -86,17 +86,21 @@ necessary but not sufficient: `pg_stat_statements` must show a multi-values
 batch rewriting. The gate requires the
 archive resource policy exactly: 256 MiB DuckDB memory, two threads, 4,096 MiB
 maximum spill, at most two process-wide concurrent sessions with a 30-second
-admission timeout, and `/var/lib/oscar/duckdb-tmp`. That scratch root may be absent
-before first use; once used it must be a real archive-disjoint directory owned
-by UID/GID 10001, mode `0700`, with no remaining per-operation entries. The
-full lifecycle checks it after export, parity, cold query/count, and hot-delete
-work. A backup must exclude `duckdb-tmp` entirely.
+admission timeout, and `/var/lib/oscar/duckdb-tmp`. The scratch root must be a
+real archive-disjoint directory owned by UID/GID 10001 with mode `0700`. It
+permanently contains exactly one control file, `.oscar-duckdb.lock`: a regular,
+non-symlink file owned by UID/GID 10001 with mode `0600`. `entryCount` counts
+only canonical operation UUID directories; the lock is not active work and any
+other entry is reported separately and fails closed. The full lifecycle checks
+that completed export, parity, cold query/count, and hot-delete work leaves zero
+operation directories while preserving this exact lock. A backup must exclude
+`duckdb-tmp` entirely, including the runtime-only lock.
 
 The suite gates the persisted two-session/30-second admission controls but does
 not intentionally hold native queries open for 30 seconds to saturate them.
 Fair-wait, timeout, and permit-recovery timing remain product integration tests;
 the release E2E gate proves exact configuration and that completed operations
-leave no scratch directories behind.
+leave no operation scratch directories behind.
 
 The exact daily-file production profile is `rootDirectory=files`,
 `journalDirectory=.dailyfile-journal`, `publicationDirectory=dailyfiles`, UTC,
@@ -152,7 +156,8 @@ baseline, the suite additionally requires three clean samples spanning a
 maintenance/delete polling interval: no active export, no latest failed retry,
 no allowlisted unowned row older than the deployed hot-retention cutoff, no
 generation with hot rows older than the deployed rollback grace, and an empty
-DuckDB scratch directory. The exact-generation plan, hold, confirmation-token,
+DuckDB operation inventory with only the validated permanent lease present. The
+exact-generation plan, hold, confirmation-token,
 parity, and fail-closed non-fixture rejection remain mandatory.
 
 The disposable configuration must also set these fields in the
@@ -315,7 +320,11 @@ progress. `storage-health` polls for a clean atomic boundary for up to 30
 seconds; a partial that persists beyond that window, or any unsafe entry, still
 fails the release gate. The restart proof inventories all captured segments
 before shutdown and requires every one—not merely the first stdin row—to retain
-its exact prefix afterward.
+its exact prefix afterward. It also snapshots every validated operation-directory
+identity immediately before and after restart and fails if any pre-restart
+identity survives. A new post-start operation is allowed; only the permanent
+lease is omitted, and then only after its type, ownership, and mode pass the
+strict lease contract.
 
 The smoke check requires either eligible published CSV/manifest pairs or the
 strict durable-current-day state described above, and no partial artifacts;

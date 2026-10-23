@@ -160,8 +160,10 @@ Require exact storage schema v5 checksum
 `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`
 before lifecycle mutation and before/after restore. Require DuckDB's exact 256
 MiB memory, two-thread, 4,096 MiB spill, two-session process-wide admission,
-30-second admission-timeout policy and private archive-disjoint empty
-`/var/lib/oscar/duckdb-tmp`; prove the scratch is excluded from backup. Require
+30-second admission-timeout policy and private archive-disjoint
+`/var/lib/oscar/duckdb-tmp`. Require its permanent `.oscar-duckdb.lock` to be a
+real UID/GID 10001 mode-0600 file inside the mode-0700 root, with no completed
+operation directories or unexpected entries; prove the scratch is excluded from backup. Require
 the exact direct-daily-file config, a reserved-lane UID append caused by a real
 emulator transition, exact bounded 12-key publication manifests, and byte
 durability after the supported whole-deployment restart. The restart gate must

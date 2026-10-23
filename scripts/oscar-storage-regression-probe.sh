@@ -282,7 +282,7 @@ archive_scratch_json() {
   compose exec -T oscar sh -eu -c '
     scratch=$1; archive=$2
     if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then
-      printf "{\"present\":false,\"realDirectory\":false,\"ownerUid\":null,\"ownerGid\":null,\"mode\":\"\",\"archiveDisjoint\":true,\"entryCount\":0}\n"
+      printf "{\"present\":false,\"realDirectory\":false,\"ownerUid\":null,\"ownerGid\":null,\"mode\":\"\",\"archiveDisjoint\":true,\"leaseFilePresent\":false,\"leaseFileRegular\":false,\"leaseFileOwnerUid\":null,\"leaseFileOwnerGid\":null,\"leaseFileMode\":\"\",\"entryCount\":0,\"unexpectedEntryCount\":0}\n"
       exit 0
     fi
     real_directory=false
@@ -290,9 +290,66 @@ archive_scratch_json() {
     owner=$(stat -c %u -- "$scratch" 2>/dev/null || printf -1)
     group=$(stat -c %g -- "$scratch" 2>/dev/null || printf -1)
     mode=$(stat -c %a -- "$scratch" 2>/dev/null || printf missing)
-    entries=0
+    lease="$scratch/.oscar-duckdb.lock"
+    lease_present=false; lease_regular=false
+    lease_owner=-1; lease_group=-1; lease_mode=missing
+    if [ -e "$lease" ] || [ -L "$lease" ]; then
+      lease_present=true
+      if [ -f "$lease" ] && [ ! -L "$lease" ]; then lease_regular=true; fi
+      lease_owner=$(stat -c %u -- "$lease" 2>/dev/null || printf -1)
+      lease_group=$(stat -c %g -- "$lease" 2>/dev/null || printf -1)
+      lease_mode=$(stat -c %a -- "$lease" 2>/dev/null || printf missing)
+    fi
+    entries=0; unexpected=0
     if [ "$real_directory" = true ]; then
-      entries=$(find "$scratch" -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d "[:space:]")
+      work=$(mktemp -d /tmp/oscar-scratch-health.XXXXXXXX)
+      chmod 700 "$work"
+      cleanup() { rm -rf -- "$work"; }
+      trap cleanup EXIT HUP INT TERM
+      find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
+      LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
+      find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
+      LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
+      inventory_stable=true
+      cmp -s "$work/first.sorted" "$work/second.sorted" || inventory_stable=false
+      classifier=$(cat <<\OSCAR_SCRATCH_CLASSIFIER
+root=$1
+lease=$2
+shift 2
+newline=$(printf "\nx")
+newline=${newline%x}
+carriage_return=$(printf "\rx")
+carriage_return=${carriage_return%x}
+for child do
+  if [ "$child" = "$lease" ]; then
+    printf "lease\n"
+    continue
+  fi
+  name=${child#"$root/"}
+  case "$name" in
+    *"$newline"*|*"$carriage_return"*) printf "unexpected\n"; continue ;;
+  esac
+  if printf "%s\n" "$name" |
+       grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" &&
+     [ -d "$child" ] && [ ! -L "$child" ]; then
+    real_child=$(realpath -e -- "$child" 2>/dev/null || true)
+    if [ -n "$real_child" ] && [ "$(dirname -- "$real_child")" = "$root" ]; then
+      printf "operation\n"
+      continue
+    fi
+  fi
+  printf "unexpected\n"
+done
+OSCAR_SCRATCH_CLASSIFIER
+      if [ -s "$work/second.sorted" ]; then
+        xargs -0 -r sh -eu -c "$classifier" scratch-child "$scratch" "$lease" \
+          <"$work/second.sorted" >"$work/classes"
+      else
+        : >"$work/classes"
+      fi
+      entries=$(grep -c "^operation$" "$work/classes" || true)
+      unexpected=$(grep -c "^unexpected$" "$work/classes" || true)
+      [ "$inventory_stable" = true ] || unexpected=$((unexpected+1))
     fi
     disjoint=false
     if [ "$real_directory" = true ] && [ -d "$archive" ] && [ ! -L "$archive" ]; then
@@ -302,33 +359,69 @@ archive_scratch_json() {
         case "$archive_real/" in "$scratch_real/"*) ;; *) disjoint=true ;; esac
       esac
     fi
-    printf "{\"present\":true,\"realDirectory\":%s,\"ownerUid\":%s,\"ownerGid\":%s,\"mode\":\"%s\",\"archiveDisjoint\":%s,\"entryCount\":%s}\n" \
-      "$real_directory" "$owner" "$group" "$mode" "$disjoint" "${entries:-0}"
+    printf "{\"present\":true,\"realDirectory\":%s,\"ownerUid\":%s,\"ownerGid\":%s,\"mode\":\"%s\",\"archiveDisjoint\":%s,\"leaseFilePresent\":%s,\"leaseFileRegular\":%s,\"leaseFileOwnerUid\":%s,\"leaseFileOwnerGid\":%s,\"leaseFileMode\":\"%s\",\"entryCount\":%s,\"unexpectedEntryCount\":%s}\n" \
+      "$real_directory" "$owner" "$group" "$mode" "$disjoint" \
+      "$lease_present" "$lease_regular" "$lease_owner" "$lease_group" "$lease_mode" \
+      "${entries:-0}" "${unexpected:-0}"
   ' scratch-health "$scratch_path" "$archive_path"
 }
 archive_scratch_inventory() {
   compose exec -T oscar sh -eu -c '
     root=/var/lib/oscar/duckdb-tmp
-    if [ ! -e "$root" ] && [ ! -L "$root" ]; then exit 0; fi
     [ -d "$root" ] && [ ! -L "$root" ] || exit 20
     real_root=$(realpath -e -- "$root")
     [ "$real_root" = "$root" ] || exit 21
-    find "$root" -xdev -mindepth 1 -maxdepth 1 -printf "%f\n" | LC_ALL=C sort -u |
-      while IFS= read -r name; do
-        [ -n "$name" ] || continue
-        printf "%s" "$name" |
-          grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" || exit 22
-        child="$root/$name"
-        if [ ! -e "$child" ] && [ ! -L "$child" ]; then continue; fi
-        [ -d "$child" ] && [ ! -L "$child" ] || exit 23
-        real_child=$(realpath -e -- "$child" 2>/dev/null || true)
-        if [ -z "$real_child" ]; then
-          if [ ! -e "$child" ] && [ ! -L "$child" ]; then continue; fi
-          exit 24
-        fi
-        [ "$(dirname -- "$real_child")" = "$real_root" ] || exit 25
-        printf "%s\n" "$name"
-      done
+    [ "$(stat -c %u -- "$root")" = 10001 ] && [ "$(stat -c %g -- "$root")" = 10001 ] &&
+      [ "$(stat -c %a -- "$root")" = 700 ] || exit 22
+    lease="$root/.oscar-duckdb.lock"
+    [ -f "$lease" ] && [ ! -L "$lease" ] || exit 23
+    [ "$(stat -c %u -- "$lease")" = 10001 ] && [ "$(stat -c %g -- "$lease")" = 10001 ] &&
+      [ "$(stat -c %a -- "$lease")" = 600 ] || exit 24
+    root_identity=$(stat -c %d:%i -- "$root")
+    lease_identity=$(stat -c %d:%i -- "$lease")
+    work=$(mktemp -d /tmp/oscar-scratch-inventory.XXXXXXXX)
+    chmod 700 "$work"
+    cleanup() { rm -rf -- "$work"; }
+    trap cleanup EXIT HUP INT TERM
+    find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
+    LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
+    find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
+    LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
+    cmp -s "$work/first.sorted" "$work/second.sorted" || exit 25
+    validator=$(cat <<\OSCAR_SCRATCH_CHILD
+root=$1
+lease=$2
+shift 2
+newline=$(printf "\nx")
+newline=${newline%x}
+carriage_return=$(printf "\rx")
+carriage_return=${carriage_return%x}
+for child do
+  [ "$child" != "$lease" ] || continue
+  name=${child#"$root/"}
+  case "$name" in
+    *"$newline"*|*"$carriage_return"*) exit 30 ;;
+  esac
+  printf "%s\n" "$name" |
+    grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" || exit 31
+  [ -d "$child" ] && [ ! -L "$child" ] || exit 32
+  real_child=$(realpath -e -- "$child")
+  [ "$(dirname -- "$real_child")" = "$root" ] || exit 33
+  printf "%s\n" "$name"
+done
+OSCAR_SCRATCH_CHILD
+    if [ -s "$work/second.sorted" ]; then
+      xargs -0 -r sh -eu -c "$validator" scratch-child "$root" "$lease" \
+        <"$work/second.sorted" >"$work/operations"
+    else
+      : >"$work/operations"
+    fi
+    [ "$(stat -c %d:%i -- "$root")" = "$root_identity" ] &&
+      [ "$(stat -c %u:%g:%a -- "$root")" = 10001:10001:700 ] &&
+      [ "$(stat -c %d:%i -- "$lease")" = "$lease_identity" ] &&
+      [ "$(stat -c %u:%g:%a -- "$lease")" = 10001:10001:600 ] &&
+      [ -f "$lease" ] && [ ! -L "$lease" ] || exit 34
+    LC_ALL=C sort -u "$work/operations"
   ' scratch-inventory
 }
 scratch_inventory_json() {
@@ -2506,12 +2599,13 @@ COMMANDS
 
   archive-maintenance-idle)
     (($# == 0)) || fail 'Archive maintenance idle accepts no arguments.'
-    scratch_entries=$(compose exec -T oscar sh -eu -c '
-      root=/var/lib/oscar/duckdb-tmp
-      if [ ! -e "$root" ] && [ ! -L "$root" ]; then printf 0; exit; fi
-      [ -d "$root" ] && [ ! -L "$root" ]
-      find "$root" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d "[:space:]"
-    ' archive-maintenance-idle)
+    scratch_inventory=$(archive_scratch_inventory) ||
+      fail 'DuckDB scratch root, permanent lease, or operation inventory is unsafe.'
+    if [[ -z $scratch_inventory ]]; then
+      scratch_entries=0
+    else
+      scratch_entries=$(grep -c . <<<"$scratch_inventory")
+    fi
     [[ $scratch_entries =~ ^[0-9]+$ ]] ||
       fail 'DuckDB scratch idle probe returned a nonnumeric count.'
     config=/var/lib/oscar/config.json

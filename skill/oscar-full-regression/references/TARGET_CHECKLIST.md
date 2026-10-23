@@ -44,7 +44,8 @@
   `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`;
   DuckDB is fixed at 256 MiB/two threads/4,096 MiB spill/two concurrent sessions/
   30-second admission timeout and its private
-  archive-disjoint scratch is empty; the direct-daily-file config matches the
+  archive-disjoint mode-0700 scratch contains only the real UID/GID 10001,
+  mode-0600 `.oscar-duckdb.lock`; the direct-daily-file config matches the
   documented production values
 
 ## Runner

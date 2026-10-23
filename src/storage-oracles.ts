@@ -616,7 +616,13 @@ export interface ArchiveScratchProbe {
   ownerGid: number | null;
   mode: string;
   archiveDisjoint: boolean;
+  leaseFilePresent: boolean;
+  leaseFileRegular: boolean;
+  leaseFileOwnerUid: number | null;
+  leaseFileOwnerGid: number | null;
+  leaseFileMode: string;
   entryCount: number;
+  unexpectedEntryCount: number;
 }
 
 export interface ArchiveScratchRestartAssessment {
@@ -1026,7 +1032,16 @@ export function assessArchiveScratch(value: unknown): ArchiveScratchProbe {
     ownerGid: nullableNumber(scratch.ownerGid),
     mode: typeof scratch.mode === "string" ? scratch.mode : "",
     archiveDisjoint: scratch.archiveDisjoint === true,
+    leaseFilePresent: scratch.leaseFilePresent === true,
+    leaseFileRegular: scratch.leaseFileRegular === true,
+    leaseFileOwnerUid: nullableNumber(scratch.leaseFileOwnerUid),
+    leaseFileOwnerGid: nullableNumber(scratch.leaseFileOwnerGid),
+    leaseFileMode: typeof scratch.leaseFileMode === "string" ? scratch.leaseFileMode : "",
     entryCount: integer(scratch.entryCount, "archiveScratch.entryCount"),
+    unexpectedEntryCount: integer(
+      scratch.unexpectedEntryCount,
+      "archiveScratch.unexpectedEntryCount",
+    ),
   };
 }
 
@@ -1118,15 +1133,16 @@ export function retentionRuntimeReady(
     (value.cursorLagSeconds as number) <= maximumCursorLagSeconds;
 }
 
-export function archiveScratchIsSafe(value: ArchiveScratchProbe, requirePresent: boolean): boolean {
-  if (!value.present) return !requirePresent && value.entryCount === 0;
+export function archiveScratchIsSafe(value: ArchiveScratchProbe): boolean {
   return archiveScratchRootIsSafe(value) && value.entryCount === 0;
 }
 
 function archiveScratchRootIsSafe(value: ArchiveScratchProbe): boolean {
-  if (!value.present) return value.entryCount === 0;
-  return value.realDirectory && value.ownerUid === 10001 && value.ownerGid === 10001 &&
-    value.mode === "700" && value.archiveDisjoint;
+  return value.present && value.realDirectory && value.ownerUid === 10001 &&
+    value.ownerGid === 10001 && value.mode === "700" && value.archiveDisjoint &&
+    value.leaseFilePresent && value.leaseFileRegular && value.leaseFileOwnerUid === 10001 &&
+    value.leaseFileOwnerGid === 10001 && value.leaseFileMode === "600" &&
+    value.unexpectedEntryCount === 0;
 }
 
 export function assessMediaMetadataHealth(value: unknown): MediaMetadataHealthProbe {
