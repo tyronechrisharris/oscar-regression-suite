@@ -5,6 +5,28 @@ export interface HealthObservationBatch {
 
 export const DASHBOARD_HEALTH_MAX_BATCH_STREAMS = 10;
 export const DASHBOARD_HEALTH_MAX_IN_FLIGHT = 2;
+export const DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS = 30_000;
+
+/**
+ * Playwright invokes route handlers outside the scenario's awaited call tree.
+ * Convert an intercepted fixture request failure into an observed result and a
+ * best-effort aborted request so a rejected route.fetch cannot terminate Node
+ * as an unhandled promise rejection before the reporter finalizes the run.
+ */
+export async function guardDashboardHealthFixtureRoute(
+  operation: () => Promise<void>,
+  onFailure: (error: unknown) => void,
+  abort: () => Promise<void>,
+): Promise<boolean> {
+  try {
+    await operation();
+    return true;
+  } catch (error) {
+    onFailure(error);
+    await abort().catch(() => undefined);
+    return false;
+  }
+}
 
 export interface HealthBatchAssessment {
   passed: boolean;

@@ -19,12 +19,14 @@ import {
   assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
+  DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
   DASHBOARD_HEALTH_MAX_IN_FLIGHT,
   expectedDashboardConnectionIds,
   healthRowHasRpmConnectionState,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
+  guardDashboardHealthFixtureRoute,
   parseHealthObservationBatch,
 } from "./dashboard-health.js";
 import {
@@ -959,6 +961,7 @@ export class RegressionScenarios {
     let probeEnabled = true;
     let currentHealthRequests = 0;
     let peakHealthRequests = 0;
+    let fixtureRouteFailure: unknown;
     const trackedRequests = new Set<Request>();
     const batches: Array<{streamIds: string[]; limit: number | null}> = [];
 
@@ -996,16 +999,35 @@ export class RegressionScenarios {
         return;
       }
 
-      const response = await route.fetch();
-      const payload: unknown = await response.json();
-      if (fixtureMode === "mixed") {
-        const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
-        mixedConnectionObservations += summary.matched;
-        mixedOfflineObservations += summary.offlineMatched;
-      } else {
-        forcedConnectionObservations += forceConnectionObservationsOffline(payload);
-      }
-      await route.fulfill({response, json: payload});
+      await guardDashboardHealthFixtureRoute(async () => {
+        const response = await route.fetch({timeout: DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS});
+        const payload: unknown = await response.json();
+        if (fixtureMode === "mixed") {
+          const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
+          mixedConnectionObservations += summary.matched;
+          mixedOfflineObservations += summary.offlineMatched;
+        } else {
+          forcedConnectionObservations += forceConnectionObservationsOffline(payload);
+        }
+        await route.fulfill({response, json: payload});
+      }, (error) => {
+        if (fixtureRouteFailure !== undefined) return;
+        fixtureRouteFailure = error;
+        const observed = `intercepted latest-observation request failed: ${describeError(error)}`;
+        this.reporter.error("dashboard-health", "fixture-route", observed);
+        this.reporter.outcome(
+          "dashboard-health",
+          "dashboard-health",
+          "complete bounded fixture observation request",
+          route.request().url(),
+          `the intercepted request completes within ${DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS} ms`,
+          observed,
+          "incorrect",
+          DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
+          "",
+          describeError(error),
+        );
+      }, () => route.abort("timedout"));
     });
 
     try {
