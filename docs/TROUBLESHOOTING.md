@@ -57,6 +57,26 @@ the authorized test RPMs so that initialization path runs before later `TT`/`TC`
 messages are processed. Do not infer clear from an Online icon and do not bulk
 toggle Tamper just to seed observations.
 
+## National Statistics refresh does not complete
+
+The National smoke row does not accept HTTP 200, a re-enabled button, or an
+already-rendered **Local Node** row as proof of completion. It records the
+pre-refresh observation when one exists (zero is valid on a fresh site), follows
+the exact `command@id` through durable command status, requires a successful
+terminal result with a different `observation@id` from any baseline, requires
+the Viewer's exact-observation GET to succeed, fetches that exact observation,
+and compares all eight table counts with it. The 15-minute bound is a hang
+guard, not the pass condition.
+
+If **Refresh Statistics** becomes enabled while the command remains pending,
+fix the Viewer's asynchronous command lifecycle. If the terminal result reuses
+the baseline ID, fix the OSCAR statistics publisher so it waits for and returns
+the observation created by that command rather than whichever observation was
+already latest. Preserve the command ID and status/error row; do not increase a
+short UI timeout or accept a stale row. Long completion on an accumulated test
+database is a separate performance finding, but it must still terminate with
+the exact result before later Dashboard or storage checks begin.
+
 ## Lane Details shows only Threshold or empty measurement charts
 
 The `lane-video` scenario navigates from Dashboard to Lane Details and requires

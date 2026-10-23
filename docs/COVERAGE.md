@@ -9,7 +9,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Gateway caching | authenticated hashed Viewer bundles return private one-year immutable caching while `/sw.js` requires revalidation; a clean unauthenticated request for the same protected bundle returns 401/403 without public, immutable, or positive-age cache directives | smoke | none |
 | Navigation | dashboard, events, health, reports, transfer, map, national, servers | smoke | none |
 | Map | interactive map has a non-zero rendered area | smoke | none |
-| National | statistics command returns HTTP success and local-node row renders | smoke | statistics command/bucket data |
+| National | capture the exact baseline observation when one exists (a fresh zero-observation site is valid); require Refresh to remain disabled with `aria-busy=true` while its command is pending and return to enabled/idle only afterward; follow that command's durable status to `COMPLETED` (or legacy `ACCEPTED` only with a result); reject failed/rejected/canceled commands; require a new exact `observation@id` relative to any baseline; require the Viewer's exact GET to succeed; fetch that observation and compare all rendered local-node counts to it | smoke | statistics command/bucket data |
 | Servers | local node list and add-server form render | smoke | none |
 | Admin | SensorHub Admin loads and exposes configured sensor/module content | smoke | none |
 | Health inventory | expected lane and camera counts; all fault fields present | smoke | none |

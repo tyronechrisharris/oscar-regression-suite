@@ -1,7 +1,7 @@
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
-import type {Locator, Page, Request} from "playwright";
+import type {Locator, Page, Request, Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
@@ -74,6 +74,27 @@ import {
 } from "./daily-journal-oracle.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
+import {
+  assertNationalRefreshCompletedControl,
+  assertFreshNationalStatisticsObservation,
+  assertNationalRefreshPendingControl,
+  assessExactNationalStatisticsObservation,
+  assessLatestNationalStatisticsObservation,
+  assessNationalStatisticsCommandStatus,
+  assessNationalStatisticsCommandSubmission,
+  classifyNationalStatisticsViewerObservationResponse,
+  isNationalRefreshCompletedControl,
+  NATIONAL_REFRESH_CONTROL_SELECTOR,
+  NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS,
+  NATIONAL_STATISTICS_FIELDS,
+  NATIONAL_STATISTICS_OBSERVED_PROPERTY,
+  nationalStatisticsEqual,
+  parseRenderedNationalStatistics,
+  type NationalStatisticsCommandProgress,
+  type NationalStatisticsField,
+  type NationalStatisticsObservation,
+  type NationalRefreshControlState,
+} from "./national-statistics.js";
 
 interface ProbeResult<T = undefined> {
   passed: boolean;
@@ -707,29 +728,152 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "map-national-servers", category: "national", action: "refresh national statistics",
-        target: "/national-view", expected: "statistics refresh completes and renders the local node row",
+        target: "/national-view",
+        expected: "the refresh command reaches a successful durable terminal status and its exact new observation renders in the local node row",
       }, async () => {
+        const baselineResponsePromise = page.waitForResponse((response) => {
+          if (response.request().method() !== "GET") return false;
+          const url = new URL(response.url());
+          return /\/observations\/?$/.test(url.pathname) &&
+            url.searchParams.get("resultTime") === "latest" &&
+            url.searchParams.get("observedProperty") === NATIONAL_STATISTICS_OBSERVED_PROPERTY;
+        }, {timeout: this.config.eventTimeoutMs});
         await this.goto(page, "/national-view");
-        const refresh = page.getByRole("button", {name: "Refresh Statistics"});
-        await refresh.waitFor();
+        const baselineResponse = await baselineResponsePromise;
+        if (!baselineResponse.ok()) {
+          throw new Error(`National statistics baseline returned HTTP ${baselineResponse.status()}`);
+        }
+        const baseline = assessLatestNationalStatisticsObservation(await baselineResponse.json());
+        const refreshControl = page.locator(NATIONAL_REFRESH_CONTROL_SELECTOR);
+        await refreshControl.waitFor();
+        if (await refreshControl.count() !== 1) {
+          throw new Error("National statistics page must expose exactly one stable refresh control");
+        }
+        const readRefreshControl = (): Promise<NationalRefreshControlState> =>
+          refreshControl.evaluate((element) => ({
+            enabled: !(element as HTMLButtonElement).disabled,
+            ariaBusy: element.getAttribute("aria-busy"),
+          }));
         const commandResponse = page.waitForResponse(
           (response) => response.request().method() === "POST" &&
             /\/controlstreams\/[^/]+\/commands/.test(new URL(response.url()).pathname),
           {timeout: this.config.eventTimeoutMs},
         );
-        await refresh.click();
-        const response = await commandResponse;
-        await poll(
-          () => refresh.isEnabled(),
-          (enabled) => enabled,
-          {timeoutMs: 90_000, intervalMs: 1_000, description: "national statistics refresh to complete"},
-        );
-        const body = await page.locator("body").innerText();
-        const hasNode = /Local Node/i.test(body);
-        return {
-          passed: response.ok() && hasNode,
-          observed: `command HTTP ${response.status()}; Local Node rendered=${hasNode}`,
+        const exactUiObservationIds = new Set<string>();
+        const exactUiObservationFailures: string[] = [];
+        const captureExactUiObservation = (response: Response) => {
+          const classified = classifyNationalStatisticsViewerObservationResponse(
+            response.request().method(),
+            response.url(),
+            response.status(),
+            baselineResponse.url(),
+          );
+          if (!classified) return;
+          if (classified.successful) {
+            exactUiObservationIds.add(classified.observationId);
+          } else {
+            exactUiObservationFailures.push(
+              `${classified.observationId}: HTTP ${classified.status}`,
+            );
+          }
         };
+        page.on("response", captureExactUiObservation);
+        const requestStartedAt = Date.now();
+        try {
+          await page.getByRole("button", {name: "Refresh Statistics"}).click();
+          const response = await commandResponse;
+          if (!response.ok()) {
+            throw new Error(`National statistics command returned HTTP ${response.status()}`);
+          }
+
+          let progress: NationalStatisticsCommandProgress =
+            assessNationalStatisticsCommandSubmission(await response.json());
+          const commandsUrl = new URL(response.url());
+          const statusUrl = new URL(commandsUrl);
+          statusUrl.pathname = `${commandsUrl.pathname.replace(/\/+$/, "")}/${encodeURIComponent(progress.commandId)}/status`;
+          statusUrl.search = "format=application/json&offset=0&limit=100";
+
+          const completionDeadline = requestStartedAt + NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS;
+          while (progress.state !== "complete") {
+            assertNationalRefreshPendingControl(progress, await readRefreshControl());
+            if (Date.now() >= completionDeadline) {
+              throw new Error(
+                `National statistics command ${progress.commandId} did not reach a successful terminal status within ` +
+                `${NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS / 60_000} minutes`,
+              );
+            }
+            await sleep(2_000);
+            const statusResponse = await page.context().request.get(statusUrl.toString());
+            try {
+              if (!statusResponse.ok()) {
+                throw new Error(`National statistics command status returned HTTP ${statusResponse.status()}`);
+              }
+              progress = assessNationalStatisticsCommandStatus(
+                await statusResponse.json(),
+                progress.commandId,
+              );
+            } finally {
+              await statusResponse.dispose();
+            }
+          }
+
+          const observationId = progress.observationId;
+          if (!observationId) {
+            throw new Error(`National statistics command ${progress.commandId} omitted its observation result`);
+          }
+          const observationUrl = new URL(baselineResponse.url());
+          observationUrl.search = "";
+          observationUrl.pathname = `${observationUrl.pathname.replace(/\/+$/, "")}/${encodeURIComponent(observationId)}`;
+          const exactResponse = await page.context().request.get(observationUrl.toString());
+          let refreshed: NationalStatisticsObservation;
+          try {
+            if (!exactResponse.ok()) {
+              throw new Error(`Exact national statistics observation returned HTTP ${exactResponse.status()}`);
+            }
+            refreshed = assessExactNationalStatisticsObservation(await exactResponse.json(), observationId);
+          } finally {
+            await exactResponse.dispose();
+          }
+          assertFreshNationalStatisticsObservation(baseline, refreshed);
+
+          const rendered = await poll(async () => {
+            const localRow = page.locator(".MuiDataGrid-row").filter({
+              has: page.locator('[data-field="site"]', {hasText: "Local Node"}),
+            }).first();
+            await localRow.waitFor({timeout: this.config.uiTimeoutMs});
+            const values = {} as Record<NationalStatisticsField, string>;
+            for (const field of NATIONAL_STATISTICS_FIELDS) {
+              values[field] = await localRow.locator(`[data-field="${field}"]`).innerText();
+            }
+            const statistics = parseRenderedNationalStatistics(values);
+            return {
+              statistics,
+              exactObservationRequestedByViewer: exactUiObservationIds.has(observationId),
+              refreshControl: await readRefreshControl(),
+              viewerFetchFailures: [...exactUiObservationFailures],
+            };
+          }, candidate => candidate.exactObservationRequestedByViewer &&
+              isNationalRefreshCompletedControl(candidate.refreshControl) &&
+              nationalStatisticsEqual(candidate.statistics, refreshed.statistics), {
+            timeoutMs: this.config.eventTimeoutMs,
+            intervalMs: 250,
+            description: `Viewer to render exact national statistics observation ${observationId}`,
+          });
+
+          assertNationalRefreshCompletedControl(rendered.refreshControl);
+          const passed = rendered.exactObservationRequestedByViewer &&
+              nationalStatisticsEqual(rendered.statistics, refreshed.statistics);
+          return {
+            passed,
+            observed: `command HTTP ${response.status()}; command=${progress.commandId}; ` +
+              `terminal=${progress.statusCode}; legacy accepted result=${progress.legacyAcceptedResult}; ` +
+              `baseline=${baseline?.id ?? "none"}; refreshed=${refreshed.id}; exact Viewer fetch=` +
+              `${rendered.exactObservationRequestedByViewer}; Viewer fetch failures=` +
+              `${JSON.stringify(rendered.viewerFetchFailures)}; rendered=${JSON.stringify(rendered.statistics)}`,
+          };
+        } finally {
+          page.off("response", captureExactUiObservation);
+        }
       });
 
       await this.check({
