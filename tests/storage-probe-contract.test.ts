@@ -610,11 +610,13 @@ test("alarm scenario queues back-to-back short occupancies before Viewer resolut
   assert.ok(start >= 0 && end > start, "alarm scenario is missing");
   assert.match(block, /shortAlarmConfig\(this\.originalRpmConfig\)/);
   const triggers = block.indexOf("for (const type of");
-  const resolutions = block.indexOf("for (const {type, occupancyCount} of generated)");
+  const resolutions = block.indexOf("for (const {type, trigger} of generated)");
   assert.ok(triggers >= 0 && resolutions > triggers,
     "both short alarms must trigger before either event is resolved");
   assert.match(block, /camera-recording-log-check/);
   assert.match(block, /counts\.every\(count => Number\.isSafeInteger\(count\) && count === 0\)/);
+  assert.match(block, /findAlarmRow\(page, new RegExp\(type, "i"\), trigger\)/,
+    "alarm lookup must retain the exact creating trigger instead of trusting a reusable occupancy count");
 });
 
 test("media metadata probe validates compact checkpoint and exact binary indexes", () => {

@@ -63,6 +63,7 @@ import {
   storageMetricFromProbe,
 } from "./storage-oracles.js";
 import {isPublicObservationId} from "./public-observation-id.js";
+import {alarmRowMatchesTrigger, type AlarmTriggerIdentity} from "./alarm-trigger.js";
 import {
   assessDailyJournalStatus,
   type DailyJournalStatus,
@@ -242,6 +243,7 @@ export class RegressionScenarios {
   private alarmCameraUids: string[] | undefined;
   private alarmLaneUid: string | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
+  private readonly resolvedAlarmEventIds = new Set<string>();
   private cameraRecordingLogStartedAt: string | undefined;
   private readonly retainedBackupExpectations = new Map<string, string>();
   private retainedMediaProofDeferred = false;
@@ -2557,11 +2559,15 @@ export class RegressionScenarios {
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
       const eventId = (await uuidValue.innerText()).trim();
       const url = new URL(page.url());
-      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId;
+      const alreadyResolved = this.resolvedAlarmEventIds.has(eventId);
+      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId &&
+        !alreadyResolved;
+      if (passed) this.resolvedAlarmEventIds.add(eventId);
       return {
         passed,
         value: passed ? eventId : undefined,
-        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}`,
+        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}; ` +
+          `new to this run=${!alreadyResolved}`,
         evidence: passed ? "" : await this.screenshotOnFailure(page, `${scenario}-${type}-uuid`),
       };
     });
@@ -2712,9 +2718,10 @@ export class RegressionScenarios {
   private async triggerAlarm(
     type: "gamma" | "neutron",
     scenario = "rpm-alarms",
-  ): Promise<number | undefined> {
+  ): Promise<AlarmTriggerIdentity | undefined> {
     await this.ensureAlarmMediaBaseline(scenario);
     const before = await this.emulator.waitForIdle(this.config.testRpmId);
+    const initiatedAtEpochMs = Date.now();
     await this.emulator.trigger(this.config.testRpmId, type === "gamma", type === "neutron");
     const active = await this.emulator.waitForStatus(
       this.config.testRpmId,
@@ -2729,10 +2736,14 @@ export class RegressionScenarios {
       active.occupancy_count > before.occupancy_count ? "correct" : "incorrect", 0,
     );
     await this.emulator.waitForIdle(this.config.testRpmId, this.config.eventTimeoutMs);
-    return active.occupancy_count;
+    return {occupancyCount: active.occupancy_count, initiatedAtEpochMs};
   }
 
-  private async findAlarmRow(page: Page, statusText: RegExp, occupancyCount: number): Promise<Locator> {
+  private async findAlarmRow(
+    page: Page,
+    statusText: RegExp,
+    trigger: AlarmTriggerIdentity,
+  ): Promise<Locator> {
     await this.goto(page, "/event-log");
     await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
     await this.applyLaneEventFilter(page);
@@ -2741,8 +2752,10 @@ export class RegressionScenarios {
       const count = await laneRows.count();
       for (let index = 0; index < count; index++) {
         const candidate = laneRows.nth(index);
-        const occupancy = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
-        if (occupancy.trim() === String(occupancyCount) && statusText.test(await candidate.innerText())) {
+        const occupancyCount = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
+        const startTime = await candidate.locator('[data-field="startTime"]').innerText().catch(() => "");
+        const text = await candidate.innerText();
+        if (alarmRowMatchesTrigger({occupancyCount, startTime, text}, statusText, trigger)) {
           return candidate;
         }
       }
@@ -2750,10 +2763,10 @@ export class RegressionScenarios {
     }, (candidate): candidate is Locator => candidate !== null, {
       timeoutMs: this.config.eventTimeoutMs,
       intervalMs: 1_000,
-      description: `${statusText} occupancy ${occupancyCount} for ${this.config.testLaneLabel}`,
+      description: `${statusText} occupancy ${trigger.occupancyCount} created after its trigger for ${this.config.testLaneLabel}`,
     });
     if (!row) throw new Error(
-      `No ${statusText} occupancy ${occupancyCount} found for ${this.config.testLaneLabel}`,
+      `No new ${statusText} occupancy ${trigger.occupancyCount} found for ${this.config.testLaneLabel}`,
     );
     return row;
   }
@@ -2761,7 +2774,7 @@ export class RegressionScenarios {
   private async alarms(): Promise<void> {
     if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
     const page = await this.browser.oscarPage();
-    const generated: Array<{type: "gamma" | "neutron"; occupancyCount: number}> = [];
+    const generated: Array<{type: "gamma" | "neutron"; trigger: AlarmTriggerIdentity}> = [];
     const quiet = this.emulator.quietConfig(this.originalRpmConfig);
     try {
       await this.ensureAlarmMediaBaseline("rpm-alarms");
@@ -2774,22 +2787,23 @@ export class RegressionScenarios {
       // resolving the events afterwards also proves that neither generation inherited the
       // other's authoritative camera path.
       for (const type of ["gamma", "neutron"] as const) {
-        const occupancyCount = await this.triggerAlarm(type);
-        if (occupancyCount === undefined) throw new Error(`${type} trigger returned no occupancy count`);
-        generated.push({type, occupancyCount});
+        const trigger = await this.triggerAlarm(type);
+        if (trigger === undefined) throw new Error(`${type} trigger returned no occupancy identity`);
+        generated.push({type, trigger});
       }
-      for (const {type, occupancyCount} of generated) {
+      for (const {type, trigger} of generated) {
+        const {occupancyCount} = trigger;
         const ingested = await this.check({
           scenario: "rpm-alarms", category: "event-ingestion", action: `ingest ${type} alarm`,
           target: this.config.testLaneLabel, expected: `Event Log shows a new ${type} event on the reserved lane`,
         }, async () => {
-          const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+          const row = await this.findAlarmRow(page, new RegExp(type, "i"), trigger);
           const text = await row.innerText();
           const passed = new RegExp(type, "i").test(text);
           return {passed, value: passed, observed: text};
         });
         if (!ingested) continue;
-        const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+        const row = await this.findAlarmRow(page, new RegExp(type, "i"), trigger);
         const eventId = await this.resolveAlarmEventUuid(page, row, type, occupancyCount, "rpm-alarms");
         if (eventId) await this.captureAlarmMedia(page, eventId, type, occupancyCount, "rpm-alarms");
       }
@@ -2897,9 +2911,10 @@ export class RegressionScenarios {
         metadata.expected, "UUID search input and submit controls detected", "correct", 0,
       );
 
-      const occupancyCount = await this.triggerAlarm("gamma", "event-uuid");
-      if (occupancyCount === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy count");
-      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      const trigger = await this.triggerAlarm("gamma", "event-uuid");
+      if (trigger === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy identity");
+      const {occupancyCount} = trigger;
+      const row = await this.findAlarmRow(page, /Gamma/i, trigger);
       await Promise.all([
         page.waitForURL(
           (url) => normalizePathname(url.pathname) === "/event-details",
@@ -2920,12 +2935,15 @@ export class RegressionScenarios {
         const validIdentity = isPublicObservationId(uuid);
         const canonical = current.searchParams.get("eventId") === uuid &&
           Boolean(current.searchParams.get("nodeId"));
-        const passed = validIdentity && canonical;
+        const alreadyResolved = this.resolvedAlarmEventIds.has(uuid);
+        const passed = validIdentity && canonical && !alreadyResolved;
+        if (passed) this.resolvedAlarmEventIds.add(uuid);
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "event-uuid-detail");
         return {
           passed,
-          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; nodeId=${current.searchParams.get("nodeId") ?? "missing"}`,
-          value: validIdentity ? uuid : undefined,
+          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; ` +
+            `nodeId=${current.searchParams.get("nodeId") ?? "missing"}; new to this run=${!alreadyResolved}`,
+          value: passed ? uuid : undefined,
           evidence,
         };
       });
@@ -3236,11 +3254,12 @@ export class RegressionScenarios {
   }
 
   private async adjudicationAndAlarmTransfer(): Promise<void> {
-    const occupancyCount = await this.triggerAlarm("gamma");
-    if (occupancyCount === undefined) throw new Error("gamma trigger returned no occupancy count");
+    const trigger = await this.triggerAlarm("gamma");
+    if (trigger === undefined) throw new Error("gamma trigger returned no occupancy identity");
+    const {occupancyCount} = trigger;
     const page = await this.browser.oscarPage();
     try {
-      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      const row = await this.findAlarmRow(page, /Gamma/i, trigger);
       await Promise.all([
         page.waitForURL(/\/event-details/, {waitUntil: "domcontentloaded"}),
         row.dblclick(),
@@ -3271,6 +3290,7 @@ export class RegressionScenarios {
         };
         const observationId = parsed.payload?.event?.observationId ?? "";
         const exportedOccupancyId = parsed.payload?.event?.occupancyId ?? "";
+        const alreadyResolved = this.resolvedAlarmEventIds.has(observationId);
         const schemaValid = parsed.payload?.schema === "org.oscar.alarm-transfer" &&
           parsed.payload.version === 1 &&
           parsed.payload.source?.laneId === this.config.testLaneLabel &&
@@ -3278,16 +3298,22 @@ export class RegressionScenarios {
           isPublicObservationId(observationId) &&
           parsed.integrity?.algorithm === "SHA-256" &&
           /^[a-f0-9]{64}$/i.test(parsed.integrity.digest ?? "") &&
-          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
+          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true &&
+          !alreadyResolved;
         const pngValid = qrBytes.length > 100 &&
           qrBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
         const expectedChartSeries: AlarmChartSeries[] = [];
         if ((parsed.payload?.series?.gamma?.exportedCount ?? 0) > 0) expectedChartSeries.push("gamma");
         if ((parsed.payload?.series?.neutron?.exportedCount ?? 0) > 0) expectedChartSeries.push("neutron");
+        const passed = bytes.length > 100 && schemaValid && pngValid;
+        if (passed) this.resolvedAlarmEventIds.add(observationId);
         return {
-          passed: bytes.length > 100 && schemaValid && pngValid,
-          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; schema/lane/occupancy/integrity valid=${schemaValid}; PNG valid=${pngValid}`,
-          value: {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries},
+          passed,
+          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; ` +
+            `schema/lane/occupancy/integrity/fresh UUID valid=${schemaValid}; PNG valid=${pngValid}`,
+          value: passed
+            ? {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries}
+            : undefined,
           evidence: join("downloads", basename(artifacts.qrImage)),
         };
       });

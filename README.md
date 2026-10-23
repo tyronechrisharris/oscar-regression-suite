@@ -135,6 +135,21 @@ chmod 600 .env
 
 Edit `.env` for the test deployment. Never commit it.
 
+After installing a new release into a versioned target directory, rebind the
+private runner configuration to the one running Compose release. The command is
+read-only unless `--apply` is supplied, uses strict host-key checking, verifies
+the release resolves back to the running OSCAR container, and never changes
+restore acknowledgements or secrets:
+
+```bash
+./scripts/rebind-active-release.sh --build-label 3.9.2-EXACT-ARTIFACT
+./scripts/rebind-active-release.sh --apply --build-label 3.9.2-EXACT-ARTIFACT
+```
+
+Review the preview before applying it. This explicit rebind preserves the
+storage acknowledgement as an operator interlock; regression never silently
+follows a newest directory or a symlink.
+
 Run the low-mutation smoke profile first (it does not inject RPM faults, but it
 does post the national-statistics command and create report bucket files):
 
