@@ -5,14 +5,38 @@ import {
   assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
+  DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
   DASHBOARD_HEALTH_MAX_IN_FLIGHT,
   expectedDashboardConnectionIds,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
+  guardDashboardHealthFixtureRoute,
   healthRowHasRpmConnectionState,
   parseHealthObservationBatch,
 } from "../src/dashboard-health.js";
+
+test("dashboard fixture route records a bounded fetch rejection without rethrowing", async () => {
+  assert.equal(DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS, 30_000);
+  const timeout = new Error("route.fetch timed out");
+  let observed: unknown;
+  let aborts = 0;
+  const completed = await guardDashboardHealthFixtureRoute(
+    async () => { throw timeout; },
+    (error) => { observed = error; },
+    async () => { aborts++; },
+  );
+  assert.equal(completed, false);
+  assert.equal(observed, timeout);
+  assert.equal(aborts, 1);
+
+  const abortFailureStillContained = await guardDashboardHealthFixtureRoute(
+    async () => { throw timeout; },
+    () => undefined,
+    async () => { throw new Error("request already closed"); },
+  );
+  assert.equal(abortFailureStillContained, false);
+});
 
 test("Status-of-Health RPM oracle cannot be satisfied by a camera state", () => {
   const reconnecting = "Lane50 Local Node RPM (Lane50 - RPM) · Offline " +

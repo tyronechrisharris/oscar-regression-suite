@@ -37,7 +37,9 @@ source review before the suite can certify that version.
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
-  stale-generation symptoms; alarm ingestion and full-database event filtering;
+  stale-generation symptoms; alarm ingestion and full-database lane/date event
+  filtering through authenticated count-and-page oracles, including the
+  Dashboard's unadjudicated-alarm predicate after generated alarms exist;
   exact generated public observation-ID-to-video association with one unique
   generation-qualified MP4 per authoritative OSH lane-camera UID, nonzero source
   objects, and browser-loaded MP4 metadata
@@ -134,6 +136,21 @@ chmod 600 .env
 ```
 
 Edit `.env` for the test deployment. Never commit it.
+
+After installing a new release into a versioned target directory, rebind the
+private runner configuration to the one running Compose release. The command is
+read-only unless `--apply` is supplied, uses strict host-key checking, verifies
+the release resolves back to the running OSCAR container, and never changes
+restore acknowledgements or secrets:
+
+```bash
+./scripts/rebind-active-release.sh --build-label 3.9.2-EXACT-ARTIFACT
+./scripts/rebind-active-release.sh --apply --build-label 3.9.2-EXACT-ARTIFACT
+```
+
+Review the preview before applying it. This explicit rebind preserves the
+storage acknowledgement as an operator interlock; regression never silently
+follows a newest directory or a symlink.
 
 Run the low-mutation smoke profile first (it does not inject RPM faults, but it
 does post the national-statistics command and create report bucket files):
@@ -288,11 +305,14 @@ smoke run, reports/national-statistics filters, and both OSCAR 3.9.2 storage gat
 Storage-health is non-destructive but not strictly read-only: its publisher
 contract creates and removes private temporary probe data, so the suite-wide
 remote lease is held. The full `storage-lifecycle` scenario uses a separately acknowledged disposable
-3.9.2 database, registers two synthetic copied observations, and refuses any
+3.9.2 database, registers four synthetic copied observations (three cold rows
+plus one current control), and refuses any
 cold purge whose plan includes data outside its unique fixture generation. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
-that disposable test deployment; the packaged and production age default stays
-seven days. It does not restore a backup. Daily-file publication verification requires an
+that disposable test deployment. The packaged production profile uses the same
+immediate asynchronous eligibility with a bounded five-minute query cadence,
+converts each source to five verified JPEGs, and preserves the original MP4 for
+the following 24-hour rollback grace. It does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture. `STORAGE_BACKUP_WORKFLOW=required` validates the
 selected product mode: disabled proves fail-closed non-mutation, while single
 proves one authenticated self-contained snapshot. See

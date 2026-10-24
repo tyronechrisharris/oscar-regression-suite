@@ -115,7 +115,12 @@ Each row is a point-in-time storage snapshot keyed by `runId`, `timestamp`, and
 `phase`. Database/table/index/WAL/temp sizes are bytes. Tuple and transaction
 counters come from PostgreSQL statistics. `observationInsertCalls`,
 `observationInsertRows`, and `observationRowsPerCall` expose whether batched
-ingest remains effective. Archive generation/row/byte, failure, parity, hold,
+ingest remains effective. `observationDeleteCalls`, `observationDeleteRows`,
+`observationRowsPerDeleteCall`, `legacySingletonObservationDeleteCalls`,
+`batchedObservationDeleteCalls`, `batchedObservationDeleteRows`, and
+`batchedObservationRowsPerDeleteCall` distinguish the retired one-row delete
+path from the guarded set-based purge. `statementTempBlocksWritten` exposes
+database-scoped temporary query I/O. Archive generation/row/byte, failure, parity, hold,
 verified-backup, journal, daily-file, retained-media, and backup-size fields
 support like-for-like release comparisons. Retained-media metadata reclamation
 is reported separately as `retainedMediaManifestFiles`,

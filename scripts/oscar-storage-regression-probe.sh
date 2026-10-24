@@ -168,6 +168,7 @@ WITH payload AS (
     AND media->>'objClass' = 'com.botts.impl.service.oscar.video.VideoRetentionConfig'
     AND json_typeof(db_config->'useBatch') = 'boolean' AND (db_config->>'useBatch')::boolean
     AND json_typeof(media->'enableFrameRetention') = 'boolean'
+    AND json_typeof(archive->'enabled') = 'boolean'
     AND json_typeof(archive->'deleteHotAfterArchive') = 'boolean'
     AND json_typeof(oscar->'delegateObservationLifecycleToDatabase') = 'boolean'
     AND json_typeof(daily->'rootDirectory') = 'string'
@@ -177,6 +178,7 @@ WITH payload AS (
     AND json_typeof(daily->'dailyFileObservationMode') = 'string'
     AND json_typeof(archive->'duckDbTemporaryDirectory') = 'string'
     AND json_typeof(archive->'intervalMinutes') = 'number' AND archive->>'intervalMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'hotRetentionDays') = 'number' AND archive->>'hotRetentionDays' ~ '^[0-9]+$'
     AND json_typeof(archive->'rollbackGraceDays') = 'number' AND archive->>'rollbackGraceDays' ~ '^[0-9]+$'
     AND json_typeof(archive->'duckDbMemoryLimitMegabytes') = 'number' AND archive->>'duckDbMemoryLimitMegabytes' ~ '^[0-9]+$'
     AND json_typeof(archive->'duckDbThreads') = 'number' AND archive->>'duckDbThreads' ~ '^[0-9]+$'
@@ -185,10 +187,18 @@ WITH payload AS (
     AND json_typeof(archive->'duckDbSessionAcquireTimeoutSeconds') = 'number' AND archive->>'duckDbSessionAcquireTimeoutSeconds' ~ '^[0-9]+$'
     AND json_typeof(media->'timeToRetention') = 'number' AND media->>'timeToRetention' ~ '^[0-9]+$'
     AND json_typeof(media->'videoQueryPeriod') = 'number' AND media->>'videoQueryPeriod' ~ '^[0-9]+$'
+    AND json_typeof(media->'maximumCatchUpHours') = 'number' AND media->>'maximumCatchUpHours' ~ '^[0-9]+$'
+    AND json_typeof(media->'lateArrivalOverlapHours') = 'number' AND media->>'lateArrivalOverlapHours' ~ '^[0-9]+$'
+    AND json_typeof(media->'lateArrivalScanPeriodMinutes') = 'number' AND media->>'lateArrivalScanPeriodMinutes' ~ '^[0-9]+$'
+    AND json_typeof(media->'lateArrivalCatchUpHours') = 'number' AND media->>'lateArrivalCatchUpHours' ~ '^[0-9]+$'
+    AND json_typeof(media->'reconciliationCatchUpHours') = 'number' AND media->>'reconciliationCatchUpHours' ~ '^[0-9]+$'
+    AND json_typeof(media->'reconciliationPeriodHours') = 'number' AND media->>'reconciliationPeriodHours' ~ '^[0-9]+$'
+    AND json_typeof(media->'occupancyStreamRefreshMinutes') = 'number' AND media->>'occupancyStreamRefreshMinutes' ~ '^[0-9]+$'
     AND json_typeof(media->'frameRetentionCount') = 'number' AND media->>'frameRetentionCount' ~ '^[0-9]+$'
     AND json_typeof(media->'jpegQuality') = 'number' AND media->>'jpegQuality' ~ '^[0-9]+$'
     AND json_typeof(media->'sourceRollbackGraceHours') = 'number' AND media->>'sourceRollbackGraceHours' ~ '^[0-9]+$'
     AND json_typeof(media->'metadataReclamationWorkLimit') = 'number' AND media->>'metadataReclamationWorkLimit' ~ '^[0-9]+$'
+    AND json_typeof(media->'maintenanceWorkLimit') = 'number' AND media->>'maintenanceWorkLimit' ~ '^[0-9]+$'
     AND json_typeof(daily->'fsyncIntervalMillis') = 'number' AND daily->>'fsyncIntervalMillis' ~ '^[0-9]+$'
     AND json_typeof(daily->'maxUnforcedRecords') = 'number' AND daily->>'maxUnforcedRecords' ~ '^[0-9]+$'
     AND json_typeof(daily->'maxUnforcedBytes') = 'number' AND daily->>'maxUnforcedBytes' ~ '^[0-9]+$'
@@ -196,21 +206,29 @@ WITH payload AS (
     AND json_typeof(daily->'maxSegmentAgeSeconds') = 'number' AND daily->>'maxSegmentAgeSeconds' ~ '^[0-9]+$'
     AND json_typeof(daily->'maxRecordBytes') = 'number' AND daily->>'maxRecordBytes' ~ '^[0-9]+$'
     AND json_typeof(daily->'sealedJournalRetentionDays') = 'number' AND daily->>'sealedJournalRetentionDays' ~ '^[0-9]+$'
+    AND json_typeof(daily->'requireBackupBeforeSealedJournalDeletion') = 'boolean'
     AND json_typeof(oscar->'dailyFilePurgeWorkLimit') = 'number' AND oscar->>'dailyFilePurgeWorkLimit' ~ '^[0-9]+$'
 )
 SELECT concat_ws('|',
-  archive->>'intervalMinutes', archive->>'rollbackGraceDays',
+  archive->>'intervalMinutes', archive->>'hotRetentionDays', archive->>'rollbackGraceDays',
   archive->>'duckDbMemoryLimitMegabytes', archive->>'duckDbThreads',
   archive->>'duckDbMaximumTemporaryMegabytes', archive->>'duckDbMaximumConcurrentSessions',
   archive->>'duckDbSessionAcquireTimeoutSeconds', archive->>'duckDbTemporaryDirectory',
-  media->>'timeToRetention', media->>'videoQueryPeriod', media->>'frameRetentionCount',
+  media->>'timeToRetention', media->>'videoQueryPeriod', media->>'maximumCatchUpHours',
+  media->>'lateArrivalOverlapHours', media->>'lateArrivalScanPeriodMinutes',
+  media->>'lateArrivalCatchUpHours', media->>'reconciliationCatchUpHours',
+  media->>'reconciliationPeriodHours', media->>'occupancyStreamRefreshMinutes',
+  media->>'frameRetentionCount',
   media->>'jpegQuality', media->>'sourceRollbackGraceHours', media->>'metadataReclamationWorkLimit',
+  media->>'maintenanceWorkLimit',
   media->>'enableFrameRetention', archive->>'deleteHotAfterArchive',
   daily->>'rootDirectory', daily->>'journalDirectory', daily->>'publicationDirectory',
   daily->>'zoneId', daily->>'dailyFileObservationMode', daily->>'fsyncIntervalMillis',
   daily->>'maxUnforcedRecords', daily->>'maxUnforcedBytes', daily->>'maxSegmentBytes',
   daily->>'maxSegmentAgeSeconds', daily->>'maxRecordBytes', daily->>'sealedJournalRetentionDays',
-  oscar->>'delegateObservationLifecycleToDatabase', oscar->>'dailyFilePurgeWorkLimit')
+  daily->>'requireBackupBeforeSealedJournalDeletion',
+  oscar->>'delegateObservationLifecycleToDatabase', oscar->>'dailyFilePurgeWorkLimit',
+  archive->>'enabled')
 FROM valid;
 SQL
   } | psql_admin --quiet --tuples-only --no-align | tail -n 1
@@ -264,7 +282,7 @@ archive_scratch_json() {
   compose exec -T oscar sh -eu -c '
     scratch=$1; archive=$2
     if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then
-      printf "{\"present\":false,\"realDirectory\":false,\"ownerUid\":null,\"ownerGid\":null,\"mode\":\"\",\"archiveDisjoint\":true,\"entryCount\":0}\n"
+      printf "{\"present\":false,\"realDirectory\":false,\"ownerUid\":null,\"ownerGid\":null,\"mode\":\"\",\"archiveDisjoint\":true,\"leaseFilePresent\":false,\"leaseFileRegular\":false,\"leaseFileOwnerUid\":null,\"leaseFileOwnerGid\":null,\"leaseFileMode\":\"\",\"entryCount\":0,\"unexpectedEntryCount\":0}\n"
       exit 0
     fi
     real_directory=false
@@ -272,9 +290,68 @@ archive_scratch_json() {
     owner=$(stat -c %u -- "$scratch" 2>/dev/null || printf -1)
     group=$(stat -c %g -- "$scratch" 2>/dev/null || printf -1)
     mode=$(stat -c %a -- "$scratch" 2>/dev/null || printf missing)
-    entries=0
+    lease="$scratch/.oscar-duckdb.lock"
+    lease_present=false; lease_regular=false
+    lease_owner=-1; lease_group=-1; lease_mode=missing
+    if [ -e "$lease" ] || [ -L "$lease" ]; then
+      lease_present=true
+      if [ -f "$lease" ] && [ ! -L "$lease" ]; then lease_regular=true; fi
+      lease_owner=$(stat -c %u -- "$lease" 2>/dev/null || printf -1)
+      lease_group=$(stat -c %g -- "$lease" 2>/dev/null || printf -1)
+      lease_mode=$(stat -c %a -- "$lease" 2>/dev/null || printf missing)
+    fi
+    entries=0; unexpected=0
     if [ "$real_directory" = true ]; then
-      entries=$(find "$scratch" -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d "[:space:]")
+      work=$(mktemp -d /tmp/oscar-scratch-health.XXXXXXXX)
+      chmod 700 "$work"
+      cleanup() { rm -rf -- "$work"; }
+      trap cleanup EXIT HUP INT TERM
+      find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
+      LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
+      find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
+      LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
+      inventory_stable=true
+      cmp -s "$work/first.sorted" "$work/second.sorted" || inventory_stable=false
+      classifier="$work/classifier.sh"
+      cat >"$classifier" <<\OSCAR_SCRATCH_CLASSIFIER
+root=$1
+lease=$2
+shift 2
+newline=$(printf "\nx")
+newline=${newline%x}
+carriage_return=$(printf "\rx")
+carriage_return=${carriage_return%x}
+for child do
+  if [ "$child" = "$lease" ]; then
+    printf "lease\n"
+    continue
+  fi
+  name=${child#"$root/"}
+  case "$name" in
+    *"$newline"*|*"$carriage_return"*) printf "unexpected\n"; continue ;;
+  esac
+  if printf "%s\n" "$name" |
+       grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" &&
+     [ -d "$child" ] && [ ! -L "$child" ]; then
+    real_child=$(realpath -e -- "$child" 2>/dev/null || true)
+    if [ -n "$real_child" ] && [ "$(dirname -- "$real_child")" = "$root" ]; then
+      printf "operation\n"
+      continue
+    fi
+  fi
+  printf "unexpected\n"
+done
+OSCAR_SCRATCH_CLASSIFIER
+      chmod 600 "$classifier"
+      if [ -s "$work/second.sorted" ]; then
+        xargs -0 -r sh -eu "$classifier" "$scratch" "$lease" \
+          <"$work/second.sorted" >"$work/classes"
+      else
+        : >"$work/classes"
+      fi
+      entries=$(grep -c "^operation$" "$work/classes" || true)
+      unexpected=$(grep -c "^unexpected$" "$work/classes" || true)
+      [ "$inventory_stable" = true ] || unexpected=$((unexpected+1))
     fi
     disjoint=false
     if [ "$real_directory" = true ] && [ -d "$archive" ] && [ ! -L "$archive" ]; then
@@ -284,9 +361,88 @@ archive_scratch_json() {
         case "$archive_real/" in "$scratch_real/"*) ;; *) disjoint=true ;; esac
       esac
     fi
-    printf "{\"present\":true,\"realDirectory\":%s,\"ownerUid\":%s,\"ownerGid\":%s,\"mode\":\"%s\",\"archiveDisjoint\":%s,\"entryCount\":%s}\n" \
-      "$real_directory" "$owner" "$group" "$mode" "$disjoint" "${entries:-0}"
+    printf "{\"present\":true,\"realDirectory\":%s,\"ownerUid\":%s,\"ownerGid\":%s,\"mode\":\"%s\",\"archiveDisjoint\":%s,\"leaseFilePresent\":%s,\"leaseFileRegular\":%s,\"leaseFileOwnerUid\":%s,\"leaseFileOwnerGid\":%s,\"leaseFileMode\":\"%s\",\"entryCount\":%s,\"unexpectedEntryCount\":%s}\n" \
+      "$real_directory" "$owner" "$group" "$mode" "$disjoint" \
+      "$lease_present" "$lease_regular" "$lease_owner" "$lease_group" "$lease_mode" \
+      "${entries:-0}" "${unexpected:-0}"
   ' scratch-health "$scratch_path" "$archive_path"
+}
+archive_scratch_inventory() {
+  compose exec -T oscar sh -eu -c '
+    root=/var/lib/oscar/duckdb-tmp
+    [ -d "$root" ] && [ ! -L "$root" ] || exit 20
+    real_root=$(realpath -e -- "$root")
+    [ "$real_root" = "$root" ] || exit 21
+    [ "$(stat -c %u -- "$root")" = 10001 ] && [ "$(stat -c %g -- "$root")" = 10001 ] &&
+      [ "$(stat -c %a -- "$root")" = 700 ] || exit 22
+    lease="$root/.oscar-duckdb.lock"
+    [ -f "$lease" ] && [ ! -L "$lease" ] || exit 23
+    [ "$(stat -c %u -- "$lease")" = 10001 ] && [ "$(stat -c %g -- "$lease")" = 10001 ] &&
+      [ "$(stat -c %a -- "$lease")" = 600 ] || exit 24
+    root_identity=$(stat -c %d:%i -- "$root")
+    lease_identity=$(stat -c %d:%i -- "$lease")
+    work=$(mktemp -d /tmp/oscar-scratch-inventory.XXXXXXXX)
+    chmod 700 "$work"
+    cleanup() { rm -rf -- "$work"; }
+    trap cleanup EXIT HUP INT TERM
+    find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
+    LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
+    find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
+    LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
+    cmp -s "$work/first.sorted" "$work/second.sorted" || exit 25
+    validator="$work/validator.sh"
+    cat >"$validator" <<\OSCAR_SCRATCH_CHILD
+root=$1
+lease=$2
+shift 2
+newline=$(printf "\nx")
+newline=${newline%x}
+carriage_return=$(printf "\rx")
+carriage_return=${carriage_return%x}
+for child do
+  [ "$child" != "$lease" ] || continue
+  name=${child#"$root/"}
+  case "$name" in
+    *"$newline"*|*"$carriage_return"*) exit 30 ;;
+  esac
+  printf "%s\n" "$name" |
+    grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" || exit 31
+  [ -d "$child" ] && [ ! -L "$child" ] || exit 32
+  real_child=$(realpath -e -- "$child")
+  [ "$(dirname -- "$real_child")" = "$root" ] || exit 33
+  printf "%s\n" "$name"
+done
+OSCAR_SCRATCH_CHILD
+    chmod 600 "$validator"
+    if [ -s "$work/second.sorted" ]; then
+      xargs -0 -r sh -eu "$validator" "$root" "$lease" \
+        <"$work/second.sorted" >"$work/operations"
+    else
+      : >"$work/operations"
+    fi
+    [ "$(stat -c %d:%i -- "$root")" = "$root_identity" ] &&
+      [ "$(stat -c %u:%g:%a -- "$root")" = 10001:10001:700 ] &&
+      [ "$(stat -c %d:%i -- "$lease")" = "$lease_identity" ] &&
+      [ "$(stat -c %u:%g:%a -- "$lease")" = 10001:10001:600 ] &&
+      [ -f "$lease" ] && [ ! -L "$lease" ] || exit 34
+    LC_ALL=C sort -u "$work/operations"
+  ' scratch-inventory
+}
+scratch_inventory_json() {
+  local inventory=$1 line count=0 first=true
+  [[ -f $inventory && ! -L $inventory ]] ||
+    fail 'DuckDB scratch inventory is not a regular file.'
+  printf '['
+  while IFS= read -r line; do
+    [[ $line =~ ^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+      fail 'DuckDB scratch inventory contains an unsafe identity.'
+    count=$((count+1)); ((count <= 512)) ||
+      fail 'DuckDB scratch inventory exceeds its 512-entry safety bound.'
+    $first || printf ','
+    first=false
+    printf '"%s"' "$line"
+  done <"$inventory"
+  printf ']'
 }
 media_metadata_health_json() {
   local checkpoint=/var/lib/oscar/files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json
@@ -327,14 +483,47 @@ media_metadata_health_json() {
     checkpoint_present=$1; checkpoint_valid=$2; checkpoint_schema=$3
     root=/var/lib/oscar/files/videos/retained-media/v1
     if [ ! -e "$root" ] && [ ! -L "$root" ]; then
-      printf "{\"rootPresent\":false,\"checkpointPresent\":false,\"checkpointValid\":false,\"checkpointSchemaVersion\":null,\"processedIndexFiles\":0,\"processedIndexBytes\":0,\"deletionIndexFiles\":0,\"deletionIndexBytes\":0,\"retainedManifestFiles\":0,\"retainedJpegFiles\":0,\"legacyProcessedMarkerFiles\":0,\"legacyDeletionTombstones\":0,\"partialArtifacts\":0,\"unsafeEntries\":0,\"indexFormatFailures\":0}\n"
+      printf "{\"rootPresent\":false,\"checkpointPresent\":false,\"checkpointValid\":false,\"checkpointSchemaVersion\":null,\"totalEntries\":0,\"regularFiles\":0,\"directories\":0,\"processedIndexFiles\":0,\"processedIndexBytes\":0,\"deletionIndexFiles\":0,\"deletionIndexBytes\":0,\"retainedManifestFiles\":0,\"retainedJpegFiles\":0,\"legacyProcessedMarkerFiles\":0,\"legacyDeletionTombstones\":0,\"partialArtifacts\":0,\"unsafeEntries\":0,\"indexFormatFailures\":0}\n"
       exit 0
     fi
     [ -d "$root" ] && [ ! -L "$root" ] || exit 20
-    total_entries=$(find "$root" -mindepth 1 -print | wc -l | tr -d "[:space:]")
-    [ "${total_entries:-0}" -le 100000 ] || exit 21
-    partials=$(find "$root" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
-    unsafe=$(find "$root" -type l -print | wc -l | tr -d "[:space:]")
+    inventory_file=$(mktemp /tmp/oscar-media-inventory.XXXXXX)
+    cleanup_inventory() { rm -f -- "$inventory_file"; }
+    trap cleanup_inventory EXIT HUP INT TERM
+    newline=$(printf "\nx"); newline=${newline%x}; tab=$(printf "\t")
+    find "$root" -xdev -mindepth 1 \( -name "*$newline*" -o -name "*$tab*" \) \
+      -print -quit >"$inventory_file"
+    [ ! -s "$inventory_file" ] || exit 21
+    find "$root" -xdev -mindepth 1 -printf "%y\t%P\n" >"$inventory_file"
+    inventory=$(awk -F "\t" "
+      BEGIN { total=0; regular=0; directories=0; manifests=0; jpegs=0;
+              legacy_processed=0; legacy_deleted=0; partials=0; unsafe=0 }
+      {
+        type=\$1; path=substr(\$0,index(\$0,\"\t\")+1); total++
+        if (type == \"f\") regular++
+        else if (type == \"d\") directories++
+        else unsafe++
+        if (path !~ /^[A-Za-z0-9._\/-]+$/) unsafe++
+        if (type == \"f\" && path ~ /(^|\/)[^\/]*[.](partial|tmp)([.-].*)?$/) partials++
+        if (type == \"f\" && path ~ /^events\/.+\/manifest[.]json$/) manifests++
+        if (type == \"f\" && path ~ /^events\/.+\/frame-0[1-5][.]jpg$/) jpegs++
+        if (type == \"f\" && path ~ /^retention-processed\/.+[.]json$/) legacy_processed++
+        if (type == \"f\" && path ~ /^events\/.+\/[.]deleted[.]json$/) legacy_deleted++
+      }
+      END { printf \"%d|%d|%d|%d|%d|%d|%d|%d|%d\", total, regular, directories,
+                   manifests, jpegs, legacy_processed, legacy_deleted, partials, unsafe }
+    " "$inventory_file")
+    rm -f -- "$inventory_file"
+    trap - EXIT HUP INT TERM
+    IFS="|" read -r total_entries regular_files directories manifests jpegs legacy_processed \
+      legacy_deleted partials unsafe inventory_extra <<EOF
+$inventory
+EOF
+    [ -z "${inventory_extra:-}" ] || exit 21
+    for count in "$total_entries" "$regular_files" "$directories" "$manifests" "$jpegs" \
+      "$legacy_processed" "$legacy_deleted" "$partials" "$unsafe"; do
+      printf "%s" "$count" | grep -Eq "^[0-9]+$" || exit 21
+    done
     processed_files=0; processed_bytes=0; deletion_files=0; deletion_bytes=0; format_failures=0
     processed_root="$root/retention-processed-index"
     if [ -e "$processed_root" ] || [ -L "$processed_root" ]; then
@@ -403,12 +592,9 @@ EOF
         unsafe=$((unsafe+unexpected+invalid_shards+unexpected_files+unexpected_members+unexpected_deep+invalid_locks))
       fi
     fi
-    legacy_processed=$(find "$root/retention-processed" -type f -name "*.json" 2>/dev/null | wc -l | tr -d "[:space:]")
-    legacy_deleted=$(find "$root/events" -type f -name ".deleted.json" 2>/dev/null | wc -l | tr -d "[:space:]")
-    manifests=$(find "$root/events" -type f -name "manifest.json" 2>/dev/null | wc -l | tr -d "[:space:]")
-    jpegs=$(find "$root/events" -type f -name "frame-0[1-5].jpg" 2>/dev/null | wc -l | tr -d "[:space:]")
-    printf "{\"rootPresent\":true,\"checkpointPresent\":%s,\"checkpointValid\":%s,\"checkpointSchemaVersion\":%s,\"processedIndexFiles\":%s,\"processedIndexBytes\":%s,\"deletionIndexFiles\":%s,\"deletionIndexBytes\":%s,\"retainedManifestFiles\":%s,\"retainedJpegFiles\":%s,\"legacyProcessedMarkerFiles\":%s,\"legacyDeletionTombstones\":%s,\"partialArtifacts\":%s,\"unsafeEntries\":%s,\"indexFormatFailures\":%s}\n" \
-      "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema" "$processed_files" "$processed_bytes" \
+    printf "{\"rootPresent\":true,\"checkpointPresent\":%s,\"checkpointValid\":%s,\"checkpointSchemaVersion\":%s,\"totalEntries\":%s,\"regularFiles\":%s,\"directories\":%s,\"processedIndexFiles\":%s,\"processedIndexBytes\":%s,\"deletionIndexFiles\":%s,\"deletionIndexBytes\":%s,\"retainedManifestFiles\":%s,\"retainedJpegFiles\":%s,\"legacyProcessedMarkerFiles\":%s,\"legacyDeletionTombstones\":%s,\"partialArtifacts\":%s,\"unsafeEntries\":%s,\"indexFormatFailures\":%s}\n" \
+      "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema" "$total_entries" "$regular_files" \
+      "$directories" "$processed_files" "$processed_bytes" \
       "$deletion_files" "$deletion_bytes" "${manifests:-0}" "${jpegs:-0}" "${legacy_processed:-0}" \
       "${legacy_deleted:-0}" "${partials:-0}" "${unsafe:-0}" "$format_failures"
   ' media-metadata-health "$checkpoint_present" "$checkpoint_valid" "$checkpoint_schema"
@@ -862,9 +1048,13 @@ ensure_fixture_table() {
   psql_admin --command "CREATE TABLE IF NOT EXISTS oscar_regression_fixture (
     run_id text PRIMARY KEY CHECK (run_id ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$'),
     cold_id bigint NOT NULL UNIQUE, hot_id bigint NOT NULL UNIQUE, datastream_id bigint NOT NULL,
+    cold_ids bigint[],
     cold_time timestamptz NOT NULL, hot_time timestamptz NOT NULL,
     generation_id uuid, created_at timestamptz NOT NULL DEFAULT now()
   );
+  ALTER TABLE oscar_regression_fixture ADD COLUMN IF NOT EXISTS cold_ids bigint[];
+  UPDATE oscar_regression_fixture SET cold_ids=ARRAY[cold_id] WHERE cold_ids IS NULL;
+  ALTER TABLE oscar_regression_fixture ALTER COLUMN cold_ids SET NOT NULL;
   CREATE TABLE IF NOT EXISTS oscar_regression_fixture_allocator (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     leased_high_water bigint NOT NULL CHECK (leased_high_water > 0)
@@ -902,32 +1092,142 @@ create_observation_fixture() {
         EXCLUDED.leased_high_water-1099511627778)+1099511627778
       WHERE greatest(oscar_regression_fixture_allocator.leased_high_water,
         EXCLUDED.leased_high_water-1099511627778) BETWEEN 0 AND 9223370937343148029
-      RETURNING leased_high_water cold_id,leased_high_water-1 hot_id),
+      RETURNING leased_high_water cold_id,leased_high_water-3 hot_id),
     collision_free AS MATERIALIZED (
       SELECT a.* FROM allocated a
-      WHERE NOT EXISTS (SELECT 1 FROM obs WHERE id IN (a.cold_id,a.hot_id))
+      WHERE NOT EXISTS (SELECT 1 FROM obs WHERE id BETWEEN a.hot_id AND a.cold_id)
         AND NOT EXISTS (SELECT 1 FROM oscar_regression_fixture
-          WHERE cold_id IN (a.cold_id,a.hot_id) OR hot_id IN (a.cold_id,a.hot_id))
+          WHERE cold_id BETWEEN a.hot_id AND a.cold_id OR hot_id BETWEEN a.hot_id AND a.cold_id)
         AND NOT EXISTS (SELECT 1 FROM oscar_archive_generation
-          WHERE a.cold_id BETWEEN min_id AND max_id OR a.hot_id BETWEEN min_id AND max_id)
+          WHERE int8range(min_id,max_id,'[]') && int8range(a.hot_id,a.cold_id,'[]'))
         AND NOT EXISTS (SELECT 1 FROM oscar_archive_id_block
-          WHERE a.cold_id BETWEEN min_id AND max_id OR a.hot_id BETWEEN min_id AND max_id)
+          WHERE int8range(min_id,max_id,'[]') && int8range(a.hot_id,a.cold_id,'[]'))
         AND NOT EXISTS (SELECT 1 FROM oscar_obs_overlay
-          WHERE observation_id IN (a.cold_id,a.hot_id))),
+          WHERE observation_id BETWEEN a.hot_id AND a.cold_id)),
     cold AS (INSERT INTO obs(id,datastreamid,foiid,phenomenontime,resulttime,result)
-      SELECT allocation.cold_id,source.datastreamid,source.foiid,$cold_time_sql,$cold_time_sql,source.result
-      FROM source CROSS JOIN collision_free allocation CROSS JOIN fixture_clock RETURNING *),
+      SELECT allocation.cold_id-series.value,source.datastreamid,source.foiid,
+        ($cold_time_sql)+series.value*interval '1 microsecond',
+        ($cold_time_sql)+series.value*interval '1 microsecond',source.result
+      FROM source CROSS JOIN collision_free allocation CROSS JOIN fixture_clock
+        CROSS JOIN generate_series(0,2) series(value) RETURNING *),
+    cold_set AS (SELECT max(id) cold_id,array_agg(id ORDER BY id DESC) cold_ids,
+        max(datastreamid) datastreamid,min(phenomenontime) phenomenontime FROM cold),
     hot AS (INSERT INTO obs(id,datastreamid,foiid,phenomenontime,resulttime,result)
       SELECT allocation.hot_id,source.datastreamid,source.foiid,$hot_time_sql,$hot_time_sql,source.result
       FROM source CROSS JOIN collision_free allocation CROSS JOIN fixture_clock RETURNING *),
-    registry AS (INSERT INTO oscar_regression_fixture(run_id,cold_id,hot_id,datastream_id,cold_time,hot_time)
-      SELECT '$run',cold.id,hot.id,cold.datastreamid,cold.phenomenontime,hot.phenomenontime
-      FROM cold,hot RETURNING *)
-    SELECT json_build_object('runId',run_id,'coldId',cold_id::text,'hotId',hot_id::text,
-      'datastreamId',datastream_id,'coldTime',cold_time,'hotTime',hot_time) FROM registry;")
+    registry AS (INSERT INTO oscar_regression_fixture(
+        run_id,cold_id,cold_ids,hot_id,datastream_id,cold_time,hot_time)
+      SELECT '$run',cold_set.cold_id,cold_set.cold_ids,hot.id,cold_set.datastreamid,
+        cold_set.phenomenontime,hot.phenomenontime FROM cold_set,hot RETURNING *)
+    SELECT json_build_object('runId',run_id,'coldId',cold_id::text,'coldRowCount',cardinality(cold_ids),
+      'hotId',hot_id::text,'datastreamId',datastream_id,'coldTime',cold_time,'hotTime',hot_time)
+      FROM registry;")
   [[ $fixture_json == \{* ]] ||
-    fail 'Could not allocate two collision-free test observation IDs below the signed BIGINT limit.'
+    fail 'Could not allocate four collision-free test observation IDs below the signed BIGINT limit.'
   printf '%s\n' "$fixture_json"
+}
+
+# Put lifecycle fixtures in a complete archive window strictly before every
+# window already known to this deployment. A two-hour margin keeps the
+# fixture's UTC-hour window disjoint even when the existing minimum is exactly
+# on an hour boundary. Keep the ordinary age-derived time as an upper bound so
+# an empty catalog still exercises the configured retention threshold.
+fixture_archive_time_sql() {
+  local retention=$1 clock_expression=$2
+  [[ $retention =~ ^[1-9][0-9]*$ ]] || fail 'Invalid fixture retention days.'
+  case $clock_expression in
+    fixture_clock.sampled_at|clock_timestamp\(\)) ;;
+    *) fail 'Invalid fixture clock expression.' ;;
+  esac
+  printf "(SELECT least(%s-make_interval(days=>%s+2),coalesce((SELECT min(window_start) FROM oscar_archive_generation),'infinity'::timestamptz),coalesce((SELECT min(window_start) FROM oscar_archive_job),'infinity'::timestamptz))-interval '2 hours')" \
+    "$clock_expression" "$retention"
+}
+
+archive_maintenance_idle_json() {
+  local config_path=$1 scratch_entries=$2
+  [[ $scratch_entries =~ ^[0-9]+$ ]] || fail 'Invalid archive scratch entry count.'
+  {
+    cat <<'SQL'
+\set ON_ERROR_STOP on
+CREATE TEMP TABLE oscar_idle_config_input (sequence bigserial, line text NOT NULL);
+\copy oscar_idle_config_input(line) FROM STDIN
+SQL
+    compose exec -T oscar base64 "$config_path"
+    printf '\\.\n\\set scratch_entries %s\n' "$scratch_entries"
+    cat <<'SQL'
+WITH payload AS (
+  SELECT convert_from(decode(string_agg(line, '' ORDER BY sequence), 'base64'), 'UTF8') AS text
+  FROM oscar_idle_config_input
+), document AS (
+  SELECT text::json AS raw FROM payload WHERE left(ltrim(text), 1) = '['
+), items AS (
+  SELECT item AS raw
+  FROM document, LATERAL json_array_elements(raw) item
+), candidates AS (
+  SELECT raw
+  FROM items
+  WHERE json_typeof(raw) = 'object'
+    AND raw->>'objClass' = 'org.sensorhub.impl.database.system.SystemDriverDatabaseConfig'
+), selected AS (
+  SELECT raw->'dbConfig'->'archive' AS archive
+  FROM candidates
+  WHERE (SELECT count(*) FROM candidates) = 1
+    AND NOT EXISTS (SELECT key FROM json_each(raw) GROUP BY key HAVING count(*) <> 1)
+    AND json_typeof(raw->'dbConfig') = 'object'
+    AND NOT EXISTS (SELECT key FROM json_each(raw->'dbConfig') GROUP BY key HAVING count(*) <> 1)
+    AND raw->'dbConfig'->>'objClass' =
+      'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig'
+), config AS (
+  SELECT archive,
+    (archive->>'hotRetentionDays')::integer AS hot_retention_days,
+    (archive->>'rollbackGraceDays')::integer AS rollback_grace_days,
+    ARRAY(SELECT value #>> '{}' FROM json_array_elements(archive->'outputNames') value) AS output_names
+  FROM selected
+  WHERE json_typeof(archive) = 'object'
+    AND NOT EXISTS (SELECT key FROM json_each(archive) GROUP BY key HAVING count(*) <> 1)
+    AND archive->>'objClass' = 'org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig'
+    AND json_typeof(archive->'hotRetentionDays') = 'number'
+    AND archive->>'hotRetentionDays' ~ '^[1-9][0-9]*$'
+    AND json_typeof(archive->'rollbackGraceDays') = 'number'
+    AND archive->>'rollbackGraceDays' ~ '^[1-9][0-9]*$'
+    AND json_typeof(archive->'outputNames') = 'array'
+    AND json_array_length(archive->'outputNames') BETWEEN 1 AND 64
+    AND NOT EXISTS (
+      SELECT 1 FROM json_array_elements(archive->'outputNames') value
+      WHERE json_typeof(value) <> 'string' OR length(value #>> '{}') = 0)
+    AND json_array_length(archive->'outputNames') = (
+      SELECT count(DISTINCT value #>> '{}') FROM json_array_elements(archive->'outputNames') value)
+), state AS (
+  SELECT
+    (SELECT count(*) FROM oscar_archive_job WHERE state='EXPORTING') exporting_jobs,
+    (SELECT count(*) FROM oscar_archive_job failed
+      WHERE failed.state='FAILED' AND NOT EXISTS (
+        SELECT 1 FROM oscar_archive_job newer
+        WHERE newer.store_key=failed.store_key AND newer.id_scope=failed.id_scope
+          AND newer.profile=failed.profile AND newer.window_start=failed.window_start
+          AND newer.window_end=failed.window_end AND newer.revision>failed.revision)) latest_failed_jobs,
+    (SELECT count(*) FROM oscar_archive_generation g, config c
+      WHERE g.state='ACTIVE' AND g.parity_verified
+        AND g.activated_at<=now()-make_interval(days=>c.rollback_grace_days)
+        AND EXISTS (SELECT 1 FROM obs o WHERE o.archivegenerationid=g.id)) eligible_hot_deletes,
+    (SELECT count(*) FROM (
+      SELECT 1 FROM obs o JOIN obs_datastreams d ON d.id=o.datastreamid, config c
+      WHERE o.archivegenerationid IS NULL
+        AND o.phenomenontime<now()-make_interval(days=>c.hot_retention_days)
+        AND d.data->>'outputName'=ANY(c.output_names)
+      LIMIT 1) candidate) eligible_unowned_rows,
+    (SELECT count(*) FROM config) config_rows
+)
+SELECT json_build_object(
+  'idle',config_rows=1 AND exporting_jobs=0 AND latest_failed_jobs=0
+    AND eligible_hot_deletes=0 AND eligible_unowned_rows=0 AND :scratch_entries::bigint=0,
+  'exportingJobs',exporting_jobs,
+  'latestFailedJobs',latest_failed_jobs,
+  'eligibleHotDeleteGenerations',eligible_hot_deletes,
+  'eligibleUnownedRows',eligible_unowned_rows,
+  'scratchEntries',:scratch_entries::bigint) FROM state;
+SQL
+  } | psql_admin --quiet --tuples-only --no-align | tail -n 1
 }
 
 case $action in
@@ -1437,13 +1737,43 @@ case $action in
       fail 'The live OSCAR config failed structural JSON extraction.'
     [[ -n $config_fields ]] ||
       fail 'The live OSCAR config does not contain exactly one correctly typed storage module set.'
-    IFS='|' read -r interval grace duck_memory duck_threads duck_temp_limit duck_max_sessions \
-      duck_acquire_timeout duck_temp_dir media_retention media_query_period media_frame_count \
-      media_jpeg_quality media_source_grace media_metadata_work media_enabled delete_hot \
+    IFS='|' read -r interval hot_retention grace duck_memory duck_threads duck_temp_limit duck_max_sessions \
+      duck_acquire_timeout duck_temp_dir media_retention media_query_period media_maximum_catch_up \
+      media_late_arrival_overlap media_late_arrival_scan_period media_late_arrival_catch_up \
+      media_reconciliation_catch_up media_reconciliation_period media_stream_refresh media_frame_count \
+      media_jpeg_quality media_source_grace media_metadata_work media_maintenance_work \
+      media_enabled delete_hot \
       daily_root daily_journal daily_publication daily_zone daily_mode daily_fsync daily_records \
       daily_unforced_bytes daily_segment_bytes daily_segment_age daily_record_bytes daily_retention \
-      lifecycle_delegated daily_purge_work unexpected_config_field <<<"$config_fields"
+      daily_require_backup lifecycle_delegated daily_purge_work archive_enabled unexpected_config_field <<<"$config_fields"
     [[ -z ${unexpected_config_field:-} ]] || fail 'The structural OSCAR config result is ambiguous.'
+    packaged_config_fields=$(platform_config_fields /opt/oscar/config.json) ||
+      fail 'The packaged OSCAR default config failed structural JSON extraction.'
+    IFS='|' read -r -a packaged_config <<<"$packaged_config_fields"
+    [[ ${#packaged_config[@]} -eq 41 ]] ||
+      fail 'The packaged OSCAR default config result is ambiguous.'
+    packaged_archive_interval=${packaged_config[0]}
+    packaged_hot_retention=${packaged_config[1]}
+    packaged_grace=${packaged_config[2]}
+    packaged_media_retention=${packaged_config[9]}
+    packaged_media_query_period=${packaged_config[10]}
+    packaged_media_maximum_catch_up=${packaged_config[11]}
+    packaged_media_late_arrival_overlap=${packaged_config[12]}
+    packaged_media_late_arrival_scan_period=${packaged_config[13]}
+    packaged_media_late_arrival_catch_up=${packaged_config[14]}
+    packaged_media_reconciliation_catch_up=${packaged_config[15]}
+    packaged_media_reconciliation_period=${packaged_config[16]}
+    packaged_media_stream_refresh=${packaged_config[17]}
+    packaged_media_frame_count=${packaged_config[18]}
+    packaged_media_jpeg_quality=${packaged_config[19]}
+    packaged_media_source_grace=${packaged_config[20]}
+    packaged_media_metadata_work=${packaged_config[21]}
+    packaged_media_maintenance_work=${packaged_config[22]}
+    packaged_media_enabled=${packaged_config[23]}
+    packaged_delete_hot=${packaged_config[24]}
+    packaged_daily_retention=${packaged_config[36]}
+    packaged_daily_require_backup=${packaged_config[37]}
+    packaged_archive_enabled=${packaged_config[40]}
     for value in "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode"; do
       safe_json_text "$value"
     done
@@ -1471,9 +1801,12 @@ case $action in
     for value in "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized" "$duck_temp_dir"; do safe_json_text "$value"; done
     archive_scratch=$(archive_scratch_json "$duck_temp_dir" /var/lib/oscar/archive)
     batch_evidence=$(psql_admin --quiet --tuples-only --no-align --command "
-      WITH rewritten AS (
+      WITH current_db AS (
+        SELECT oid AS dbid FROM pg_database WHERE datname = current_database()
+      ), rewritten AS (
         SELECT coalesce(sum(calls),0)::bigint calls,coalesce(sum(rows),0)::bigint rows
-        FROM pg_stat_statements
+        FROM pg_stat_statements statements
+        JOIN current_db USING (dbid)
         WHERE query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+(public[.])?obs[[:space:]]*[(]'
           AND query ~ '[)][[:space:]]*,[[:space:]]*[(]')
       SELECT calls||'|'||rows FROM rewritten;" | tail -n 1)
@@ -1526,21 +1859,35 @@ case $action in
       "$checksums" "$([[ $installed == t ]] && echo true || echo false)" "$([[ $preloaded == t ]] && echo true || echo false)" "$schema" "$schema_checksum"
     printf '"archiveMarker":{"present":%s,"exact":%s,"format":"%s","version":"%s","dataChecksums":"%s","initializedAt":"%s"},' \
       "$marker_present" "$marker_exact" "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"
-    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveIntervalMinutes":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
-      "$batch" "$batch_calls" "$batch_rows" "$journal" "${interval:-null}" "$delete_hot" "${grace:-null}"
+    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveEnabled":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
+      "$batch" "$batch_calls" "$batch_rows" "$journal" "$archive_enabled" "${interval:-null}" "${hot_retention:-null}" "$delete_hot" "${grace:-null}"
+    printf '"packagedDefaults":{"archiveEnabled":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"rollbackGraceDays":%s,"deleteHotAfterArchive":%s,"videoRetentionDays":%s,"videoQueryPeriodMinutes":%s,"maximumCatchUpHours":%s,"lateArrivalOverlapHours":%s,"lateArrivalScanPeriodMinutes":%s,"lateArrivalCatchUpHours":%s,"reconciliationCatchUpHours":%s,"reconciliationPeriodHours":%s,"occupancyStreamRefreshMinutes":%s,"retainedFrameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s,"maintenanceWorkLimit":%s,"frameRetentionEnabled":%s,"sealedJournalRetentionDays":%s,"requireBackupBeforeSealedJournalDeletion":%s},' \
+      "$packaged_archive_enabled" "$packaged_archive_interval" "$packaged_hot_retention" "$packaged_grace" "$packaged_delete_hot" \
+      "$packaged_media_retention" "$packaged_media_query_period" "$packaged_media_maximum_catch_up" \
+      "$packaged_media_late_arrival_overlap" "$packaged_media_late_arrival_scan_period" \
+      "$packaged_media_late_arrival_catch_up" "$packaged_media_reconciliation_catch_up" \
+      "$packaged_media_reconciliation_period" "$packaged_media_stream_refresh" \
+      "$packaged_media_frame_count" "$packaged_media_jpeg_quality" \
+      "$packaged_media_source_grace" "$packaged_media_metadata_work" \
+      "$packaged_media_maintenance_work" "$packaged_media_enabled" \
+      "$packaged_daily_retention" "$packaged_daily_require_backup"
     printf '"archiveResources":{"memoryLimitMegabytes":%s,"threads":%s,"maximumTemporaryMegabytes":%s,"maximumConcurrentSessions":%s,"sessionAcquireTimeoutSeconds":%s,"temporaryDirectory":"%s"},' \
       "${duck_memory:-null}" "${duck_threads:-null}" "${duck_temp_limit:-null}" \
       "${duck_max_sessions:-null}" "${duck_acquire_timeout:-null}" "$duck_temp_dir"
     printf '"archiveScratch":%s,' "$archive_scratch"
-    printf '"dailyJournal":{"rootDirectory":"%s","journalDirectory":"%s","publicationDirectory":"%s","zoneId":"%s","observationMode":"%s","fsyncIntervalMillis":%s,"maxUnforcedRecords":%s,"maxUnforcedBytes":%s,"maxSegmentBytes":%s,"maxSegmentAgeSeconds":%s,"maxRecordBytes":%s,"sealedJournalRetentionDays":%s,"observationLifecycleDelegated":%s,"purgeWorkLimit":%s},' \
+    printf '"dailyJournal":{"rootDirectory":"%s","journalDirectory":"%s","publicationDirectory":"%s","zoneId":"%s","observationMode":"%s","fsyncIntervalMillis":%s,"maxUnforcedRecords":%s,"maxUnforcedBytes":%s,"maxSegmentBytes":%s,"maxSegmentAgeSeconds":%s,"maxRecordBytes":%s,"sealedJournalRetentionDays":%s,"requireBackupBeforeSealedJournalDeletion":%s,"observationLifecycleDelegated":%s,"purgeWorkLimit":%s},' \
       "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode" \
       "${daily_fsync:-null}" "${daily_records:-null}" "${daily_unforced_bytes:-null}" \
       "${daily_segment_bytes:-null}" "${daily_segment_age:-null}" "${daily_record_bytes:-null}" \
-      "${daily_retention:-null}" "$lifecycle_delegated" "${daily_purge_work:-null}"
-    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"frameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s}}\n' \
+      "${daily_retention:-null}" "$daily_require_backup" "$lifecycle_delegated" "${daily_purge_work:-null}"
+    printf '"videoRetention":{"enabled":%s,"timeToRetentionDays":%s,"queryPeriodMinutes":%s,"maximumCatchUpHours":%s,"lateArrivalOverlapHours":%s,"lateArrivalScanPeriodMinutes":%s,"lateArrivalCatchUpHours":%s,"reconciliationCatchUpHours":%s,"reconciliationPeriodHours":%s,"occupancyStreamRefreshMinutes":%s,"frameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s,"maintenanceWorkLimit":%s}}\n' \
       "$media_enabled" "${media_retention:-null}" "${media_query_period:-null}" \
+      "${media_maximum_catch_up:-null}" "${media_late_arrival_overlap:-null}" \
+      "${media_late_arrival_scan_period:-null}" "${media_late_arrival_catch_up:-null}" \
+      "${media_reconciliation_catch_up:-null}" "${media_reconciliation_period:-null}" \
+      "${media_stream_refresh:-null}" \
       "${media_frame_count:-null}" "${media_jpeg_quality:-null}" "${media_source_grace:-null}" \
-      "${media_metadata_work:-null}"
+      "${media_metadata_work:-null}" "${media_maintenance_work:-null}"
     ;;
 
   archive-scratch-health)
@@ -1569,7 +1916,7 @@ case $action in
     work=$(mktemp -d /tmp/oscar-regression-disabled-backup.XXXXXXXX)
     cleanup_disabled_backup_check() { rm -rf -- "$work"; }
     trap cleanup_disabled_backup_check EXIT
-    expected_message='OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <absolute-secondary-drive-path> before using backup, verification, pruning, or restore.'
+    expected_message='OSCAR backups are disabled. Re-run upgrade with --backup-mode single --backup-dir <safe-absolute-backup-path> before using backup, verification, pruning, or restore.'
     commands_rejected=true
     index=0
     while IFS= read -r command; do
@@ -1652,7 +1999,20 @@ COMMANDS
         coalesce(pg_relation_size('obs'::regclass),0) obs_heap),
     stats AS (SELECT temp_bytes,xact_commit,xact_rollback,tup_inserted,tup_updated,tup_deleted FROM pg_stat_database WHERE datname=current_database()),
     wal AS (SELECT wal_bytes::numeric wal_bytes FROM pg_stat_wal),
-    statements AS (SELECT coalesce(sum(calls),0) calls,coalesce(sum(rows),0) rows FROM pg_stat_statements WHERE query ~* '^\\s*insert\\s+into\\s+(public\\.)?obs'),
+    current_db AS (SELECT oid FROM pg_database WHERE datname=current_database()),
+    statements AS (SELECT coalesce(sum(calls),0) calls,coalesce(sum(rows),0) rows
+      FROM pg_stat_statements,current_db WHERE dbid=current_db.oid
+        AND query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+(public[.])?obs([[:space:]]|[(])'),
+    statement_io AS (SELECT coalesce(sum(temp_blks_written),0) temp_blocks,
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'),0) delete_calls,
+        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'),0) delete_rows,
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'
+          AND query ~* 'id[[:space:]]*=[[:space:]]*[$][0-9]+' AND query !~* 'any[[:space:]]*[(]'),0) singleton_delete_calls,
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'
+          AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_calls,
+        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'
+          AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_rows
+      FROM pg_stat_statements,current_db WHERE dbid=current_db.oid),
     catalog AS (SELECT count(*) FILTER(WHERE state='ACTIVE') active,count(*) FILTER(WHERE state='SEALED') sealed,coalesce(sum(row_count),0) rows FROM oscar_archive_generation),
     jobs AS (SELECT count(*) FILTER(WHERE state='FAILED') failed FROM oscar_archive_job),
     parity AS (SELECT count(*) FILTER(WHERE status<>'PASSED') failed FROM oscar_archive_verification WHERE verification_type='PARITY'),
@@ -1664,6 +2024,15 @@ COMMANDS
       'transactionCommits',stats.xact_commit,'transactionRollbacks',stats.xact_rollback,
       'observationInsertCalls',statements.calls,'observationInsertRows',statements.rows,
       'observationRowsPerCall',CASE WHEN statements.calls=0 THEN NULL ELSE statements.rows/statements.calls END,
+      'statementTempBlocksWritten',statement_io.temp_blocks,
+      'observationDeleteCalls',statement_io.delete_calls,'observationDeleteRows',statement_io.delete_rows,
+      'observationRowsPerDeleteCall',CASE WHEN statement_io.delete_calls=0 THEN NULL
+        ELSE statement_io.delete_rows/statement_io.delete_calls END,
+      'legacySingletonObservationDeleteCalls',statement_io.singleton_delete_calls,
+      'batchedObservationDeleteCalls',statement_io.batch_delete_calls,
+      'batchedObservationDeleteRows',statement_io.batch_delete_rows,
+      'batchedObservationRowsPerDeleteCall',CASE WHEN statement_io.batch_delete_calls=0 THEN NULL
+        ELSE statement_io.batch_delete_rows/statement_io.batch_delete_calls END,
       'activeArchiveGenerations',catalog.active,'sealedArchiveGenerations',catalog.sealed,'archiveRows',catalog.rows,
       'archiveBytes',$archive_bytes,'failedArchiveJobs',jobs.failed,'failedParityReceipts',parity.failed,
       'activeHolds',holds.active,'verifiedBackups',backups.verified,'journalBytes',${journal_bytes:-0},
@@ -1673,7 +2042,7 @@ COMMANDS
       'deletionIndexFiles',$deletion_indexes,'deletionIndexBytes',$deletion_index_bytes,
       'legacyProcessedMarkerFiles',$legacy_markers,'legacyDeletionTombstones',$legacy_tombstones,
       'mediaMetadataCheckpointBytes',$metadata_checkpoint_bytes,'backupBytes',$backup_bytes)
-    FROM db,stats,wal,statements,catalog,jobs,parity,holds,backups;"
+    FROM db,stats,wal,statements,statement_io,catalog,jobs,parity,holds,backups;"
     ;;
 
   archive-health)
@@ -1735,16 +2104,17 @@ COMMANDS
         SELECT convert_from(decode('$journal_metadata','base64'),'UTF8') AS text),
       doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source)
       SELECT (jsonb_typeof(value)='object'
-        AND (SELECT count(*) FROM json_object_keys(raw))=2
-        AND value ?& ARRAY['schemaVersion','zoneId']
+        AND (SELECT count(*) FROM json_object_keys(raw))=3
+        AND value ?& ARRAY['schemaVersion','zoneId','lifecycleIndexVersion']
         AND value->'schemaVersion'='1'::jsonb
+        AND value->'lifecycleIndexVersion'='1'::jsonb
         AND jsonb_typeof(value->'zoneId')='string'
         AND length(value->>'zoneId') BETWEEN 1 AND 128)::text
         ||'|'||coalesce(value->>'zoneId','') FROM doc;")
     IFS='|' read -r journal_metadata_valid journal_zone <<<"$journal_metadata_result"
     [[ $journal_metadata_valid == true &&
        $journal_zone =~ ^[A-Za-z0-9._+/-]{1,128}$ ]] ||
-      fail 'Daily-file journal metadata is not the exact schema-1 configured-zone contract.'
+      fail 'Daily-file journal metadata is not the exact schema-1 configured-zone lifecycle-index contract.'
     journal_today=$(scalar "SELECT to_char(current_timestamp AT TIME ZONE '$journal_zone','YYYY-MM-DD');")
     [[ $journal_today =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
       fail 'Could not resolve the current daily-file date in the configured journal zone.'
@@ -1999,6 +2369,13 @@ COMMANDS
     segments_before=$(wc -l <"$before_inventory" | tr -d '[:space:]')
     [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 512 ]] ||
       fail 'Pre-restart segment inventory is empty or exceeds its bound.'
+    scratch_before=$restart_work/scratch-before.txt
+    if ! archive_scratch_inventory >"$scratch_before"; then
+      fail 'Could not capture the validated pre-restart DuckDB scratch inventory.'
+    fi
+    scratch_before_count=$(wc -l <"$scratch_before" | tr -d '[:space:]')
+    [[ $scratch_before_count =~ ^[0-9]+$ && $scratch_before_count -le 512 ]] ||
+      fail 'Pre-restart DuckDB scratch inventory exceeds its bound.'
     restart_started=$(date --iso-8601=seconds)
     restart_log=$restart_work/supported-restart.log
     if ! sudo bash oscar.sh restart >"$restart_log" 2>&1; then
@@ -2011,6 +2388,18 @@ COMMANDS
       [[ $state == *healthy* ]] && { healthy=true; break; }
       sleep 2
     done
+    scratch_after=$restart_work/scratch-after.txt
+    if ! archive_scratch_inventory >"$scratch_after"; then
+      fail 'Could not capture the validated post-restart DuckDB scratch inventory.'
+    fi
+    scratch_after_count=$(wc -l <"$scratch_after" | tr -d '[:space:]')
+    [[ $scratch_after_count =~ ^[0-9]+$ && $scratch_after_count -le 512 ]] ||
+      fail 'Post-restart DuckDB scratch inventory exceeds its bound.'
+    stale_scratch=$restart_work/scratch-stale.txt
+    comm -12 "$scratch_before" "$scratch_after" >"$stale_scratch"
+    stale_scratch_count=$(wc -l <"$stale_scratch" | tr -d '[:space:]')
+    [[ $stale_scratch_count =~ ^[0-9]+$ && $stale_scratch_count -le 512 ]] ||
+      fail 'Restart-surviving DuckDB scratch inventory exceeds its bound.'
     segments_preserved=0; segment_failures=0; segments_verified=0
     mapfile -t before_rows <"$before_inventory"
     for before_row in "${before_rows[@]}"; do
@@ -2073,8 +2462,13 @@ COMMANDS
     recovery_errors=$(grep -Eic 'daily.?file.*(corrupt|recovery failed|checksum mismatch)' "$restart_service_log" || true)
     shutdown_errors=$(grep -Eic '(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry).*(error|failed|timed out|timeout|administrator command)|(error|failed|timed out|timeout|administrator command).*(BasicEventHandler|DataStreamTransactionHandler|DatabasePurger|ModuleRegistry)' "$restart_service_log" || true)
     camera_recording_errors=$(grep -Eic 'Timed out waiting for camera .* command; quarantining its queue|Camera .* command queue is quarantined|Timed out waiting for video files for occupancy generation|returned a stale or mismatched saved-video result for occupancy generation|Camera .* failed to close occupancy generation|Failed to finish matched camera recording generation' "$restart_service_log" || true)
-    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s}\n' \
-      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors"
+    scratch_before_json=$(scratch_inventory_json "$scratch_before")
+    scratch_after_json=$(scratch_inventory_json "$scratch_after")
+    stale_scratch_json=$(scratch_inventory_json "$stale_scratch")
+    printf '{"healthy":%s,"segmentsChecked":%s,"segmentsPreserved":%s,"segmentFailures":%s,"partialFiles":%s,"recoveryErrors":%s,"shutdownErrors":%s,"cameraRecordingErrors":%s,"scratchBeforeRestartCount":%s,"scratchAfterRestartCount":%s,"staleScratchAfterRestartCount":%s,"scratchBeforeRestart":%s,"scratchAfterRestart":%s,"staleScratchAfterRestart":%s}\n' \
+      "$healthy" "$segments_before" "$segments_preserved" "$segment_failures" "${partial:-0}" "$recovery_errors" "$shutdown_errors" "$camera_recording_errors" \
+      "$scratch_before_count" "$scratch_after_count" "$stale_scratch_count" \
+      "$scratch_before_json" "$scratch_after_json" "$stale_scratch_json"
     cleanup_journal_restart
     trap - EXIT
     ;;
@@ -2084,8 +2478,9 @@ COMMANDS
     [[ $retention =~ ^[1-9][0-9]*$ ]] || fail 'Invalid retention days.'
     ensure_fixture_table
     [[ $(scalar "SELECT count(*) FROM oscar_regression_fixture WHERE run_id='$run';") == 0 ]] || fail 'Fixture already exists.'
+    fixture_cold_time=$(fixture_archive_time_sql "$retention" fixture_clock.sampled_at)
     create_observation_fixture "$run" \
-      "fixture_clock.sampled_at-make_interval(days=>$retention+2)" \
+      "$fixture_cold_time" \
       "fixture_clock.sampled_at-interval '1 minute'"
     ;;
 
@@ -2111,8 +2506,8 @@ COMMANDS
       fi
       rm -rf -- "$race_work"
       if [[ $race_fixture_created == true && $race_success != true ]]; then
-        psql_admin --command "WITH f AS (DELETE FROM oscar_regression_fixture WHERE run_id='$run' RETURNING cold_id,hot_id)
-          DELETE FROM obs WHERE id IN (SELECT cold_id FROM f UNION ALL SELECT hot_id FROM f);" >/dev/null 2>&1 || true
+        psql_admin --command "WITH f AS (DELETE FROM oscar_regression_fixture WHERE run_id='$run' RETURNING cold_ids,hot_id)
+          DELETE FROM obs o USING f WHERE o.id=ANY(f.cold_ids) OR o.id=f.hot_id;" >/dev/null 2>&1 || true
       fi
     }
     trap cleanup_activation_race EXIT
@@ -2157,14 +2552,21 @@ COMMANDS
       END \$\$;
       CREATE TRIGGER $trigger_name BEFORE UPDATE OF archivegenerationid ON obs FOR EACH STATEMENT
         EXECUTE FUNCTION $function_name();" >/dev/null
+    fixture_cold_time=$(fixture_archive_time_sql "$retention" 'clock_timestamp()')
     chilled=$(scalar "WITH boundary AS (
-        SELECT now()-make_interval(days=>$retention+2) archived_at),
-      changed AS (UPDATE obs o SET phenomenontime=boundary.archived_at,resulttime=boundary.archived_at
-        FROM boundary WHERE o.id=$cold_id AND o.archivegenerationid IS NULL RETURNING o.phenomenontime)
-      UPDATE oscar_regression_fixture f SET cold_time=changed.phenomenontime FROM changed
-        WHERE f.run_id='$run' AND f.cold_id=$cold_id RETURNING 1;")
-    [[ $chilled == 1 ]] || fail 'Could not move the protected fixture row into the archive window.'
-    fixture_json=$(json_query "SELECT json_build_object('runId',run_id,'coldId',cold_id::text,'hotId',hot_id::text,
+        SELECT $fixture_cold_time archived_at),
+      changed AS (UPDATE obs o SET
+        phenomenontime=boundary.archived_at+(f.cold_id-o.id)*interval '1 microsecond',
+        resulttime=boundary.archived_at+(f.cold_id-o.id)*interval '1 microsecond'
+        FROM boundary,oscar_regression_fixture f
+        WHERE f.run_id='$run' AND o.id=ANY(f.cold_ids) AND o.archivegenerationid IS NULL
+        RETURNING o.phenomenontime),
+      recorded AS (UPDATE oscar_regression_fixture f SET cold_time=(SELECT min(phenomenontime) FROM changed)
+        WHERE f.run_id='$run' AND (SELECT count(*) FROM changed)=3 RETURNING 1)
+      SELECT count(*) FROM recorded;")
+    [[ $chilled == 1 ]] || fail 'Could not move all protected fixture rows into the archive window.'
+    fixture_json=$(json_query "SELECT json_build_object('runId',run_id,'coldId',cold_id::text,
+        'coldRowCount',cardinality(cold_ids),'hotId',hot_id::text,
         'datastreamId',datastream_id,'coldTime',cold_time,'hotTime',hot_time)
       FROM oscar_regression_fixture WHERE run_id='$run';")
     deadline=$((SECONDS+180)); activation_blocked=false
@@ -2186,9 +2588,9 @@ COMMANDS
       rejected=$(scalar "SELECT count(*) FROM oscar_archive_job j,oscar_regression_fixture f
         WHERE f.run_id='$run' AND j.window_start<=f.cold_time AND j.window_end>f.cold_time
           AND j.state='FAILED' AND j.updated_at>='$race_started'::timestamptz;")
-      unmarked=$(scalar "SELECT count(*) FROM obs o JOIN oscar_regression_fixture f ON o.id=f.cold_id
+      unmarked=$(scalar "SELECT count(*) FROM obs o JOIN oscar_regression_fixture f ON o.id=ANY(f.cold_ids)
         WHERE f.run_id='$run' AND o.archivegenerationid IS NULL;")
-      [[ $rejected =~ ^[1-9][0-9]*$ && $unmarked == 1 ]] && { stale_rejected=true; break; }
+      [[ $rejected =~ ^[1-9][0-9]*$ && $unmarked == 3 ]] && { stale_rejected=true; break; }
       sleep 1
     done
     $stale_rejected || fail 'The stale archive export was not rejected with its exact source row left unmarked.'
@@ -2197,6 +2599,30 @@ COMMANDS
     trap - EXIT
     printf '%s' "${fixture_json%?}"
     printf ',"activationBlocked":true,"sourceMutated":true,"staleActivationRejected":true,"staleRowUnmarked":true}\n'
+    ;;
+
+  archive-maintenance-idle)
+    (($# == 0)) || fail 'Archive maintenance idle accepts no arguments.'
+    scratch_inventory=$(archive_scratch_inventory) ||
+      fail 'DuckDB scratch root, permanent lease, or operation inventory is unsafe.'
+    if [[ -z $scratch_inventory ]]; then
+      scratch_entries=0
+    else
+      scratch_entries=$(grep -c . <<<"$scratch_inventory")
+    fi
+    [[ $scratch_entries =~ ^[0-9]+$ ]] ||
+      fail 'DuckDB scratch idle probe returned a nonnumeric count.'
+    config=/var/lib/oscar/config.json
+    compose exec -T oscar sh -eu -c '
+      path=$1
+      test -f "$path" && test ! -L "$path"
+      size=$(stat -c %s -- "$path")
+      test "$size" -gt 0 && test "$size" -le 16777216
+    ' archive-maintenance-config "$config" ||
+      fail 'The live OSCAR config is unsafe for the archive maintenance idle probe.'
+    idle_json=$(archive_maintenance_idle_json "$config" "$scratch_entries")
+    [[ -n $idle_json ]] || fail 'Could not derive one deployed archive configuration for the idle probe.'
+    printf '%s\n' "$idle_json"
     ;;
 
   fixture-status)
@@ -2210,13 +2636,18 @@ COMMANDS
       'parityVerified',coalesce((SELECT parity_verified FROM g),false),'generationRows',coalesce((SELECT row_count FROM g),0),
       'generationMinId',(SELECT min_id::text FROM g),'generationMaxId',(SELECT max_id::text FROM g),
       'markedRows',coalesce((SELECT count(*) FROM obs o,g WHERE o.archivegenerationid=g.id),0),
-      'fixtureColdMarked',coalesce((SELECT o.archivegenerationid=g.id FROM obs o,f,g WHERE o.id=f.cold_id),false),
+      'fixtureColdMarked',coalesce((SELECT count(*) FROM obs o,g
+        WHERE o.id IN (SELECT unnest(cold_ids) FROM f) AND o.archivegenerationid=g.id),0)
+        =coalesce((SELECT cardinality(cold_ids) FROM f),-1),
       'fixtureHotUnmarked',coalesce((SELECT o.archivegenerationid IS NULL FROM obs o,f WHERE o.id=f.hot_id),false),
-      'exactRowOwnership',coalesce((SELECT g.row_count=1 AND g.min_id=f.cold_id AND g.max_id=f.cold_id
-        AND (SELECT count(*) FROM obs o WHERE o.archivegenerationid=g.id)=1
-        AND (SELECT o.archivegenerationid=g.id FROM obs o WHERE o.id=f.cold_id)
+      'exactRowOwnership',coalesce((SELECT g.row_count=cardinality(f.cold_ids)
+        AND g.min_id=(SELECT min(id) FROM unnest(f.cold_ids) ids(id))
+        AND g.max_id=(SELECT max(id) FROM unnest(f.cold_ids) ids(id))
+        AND (SELECT count(*) FROM obs o WHERE o.archivegenerationid=g.id)=cardinality(f.cold_ids)
+        AND (SELECT count(*)=cardinality(f.cold_ids) FROM obs o
+          WHERE o.id=ANY(f.cold_ids) AND o.archivegenerationid=g.id)
         AND (SELECT o.archivegenerationid IS NULL FROM obs o WHERE o.id=f.hot_id) FROM f,g),false),
-      'coldHotPresent',EXISTS(SELECT 1 FROM obs WHERE id=(SELECT cold_id FROM f)),
+      'coldHotPresent',EXISTS(SELECT 1 FROM obs o,f WHERE o.id=ANY(f.cold_ids)),
       'hotPresent',EXISTS(SELECT 1 FROM obs WHERE id=(SELECT hot_id FROM f))) ;"
     ;;
 
@@ -2225,8 +2656,9 @@ COMMANDS
     changed=$(scalar "WITH target AS (SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run'),
       exact AS (SELECT g.id FROM oscar_archive_generation g JOIN target t ON t.generation_id=g.id
         JOIN oscar_regression_fixture f ON f.run_id='$run'
-        WHERE g.state='ACTIVE' AND g.parity_verified AND g.row_count=1
-          AND g.min_id=f.cold_id AND g.max_id=f.cold_id),
+        WHERE g.state='ACTIVE' AND g.parity_verified AND g.row_count=cardinality(f.cold_ids)
+          AND g.min_id=(SELECT min(id) FROM unnest(f.cold_ids) ids(id))
+          AND g.max_id=(SELECT max(id) FROM unnest(f.cold_ids) ids(id))),
       changed AS (UPDATE oscar_archive_generation g SET activated_at=now()-interval '100 years' FROM exact e WHERE g.id=e.id RETURNING 1)
       SELECT count(*) FROM changed;")
     [[ $changed == 1 ]] || fail 'Fixture generation is not uniquely ACTIVE and parity verified.'
@@ -2886,7 +3318,7 @@ COMMANDS
     set -e
     prune_retired=false
     if [[ $prune_status -ne 0 ]] &&
-       grep -Fq 'backup-prune is retired in single-backup mode' "$prune_log" &&
+       grep -Fq 'OSCAR backup-prune is retired. Create a new verified single snapshot to atomically replace CURRENT' "$prune_log" &&
        [[ $(tree_fingerprint "$backup_dir") == "$before_prune" ]]; then
       prune_retired=true
     fi
@@ -3085,8 +3517,9 @@ COMMANDS
       ORDER BY h.id;")
     # Only registered hot/cold rows are touched. Catalog evidence from a purged
     # generation is deliberately retained for auditability.
-    deleted=$(scalar "WITH f AS (DELETE FROM oscar_regression_fixture WHERE run_id='$run' RETURNING cold_id,hot_id),
-      d AS (DELETE FROM obs o USING f WHERE o.id IN (f.cold_id,f.hot_id) RETURNING 1) SELECT count(*) FROM d;")
+    deleted=$(scalar "WITH f AS (DELETE FROM oscar_regression_fixture WHERE run_id='$run' RETURNING cold_ids,hot_id),
+      d AS (DELETE FROM obs o USING f WHERE o.id=ANY(f.cold_ids) OR o.id=f.hot_id RETURNING 1)
+      SELECT count(*) FROM d;")
     printf '{"fixtureRowsDeleted":%s}\n' "$deleted"
     ;;
 

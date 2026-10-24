@@ -58,6 +58,8 @@ esac
     const commands = readFileSync(log, "utf8").trim().split(/\r?\n/);
     assert.equal(commands.length, 6);
     assert.match(commands[0]!, /oscar-storage-binding.*\/opt\/oscar-test/);
+    assert.match(commands[0]!, /com\.docker\.compose\.project\.working_dir/);
+    assert.match(commands[0]!, /com\.docker\.compose\.project\.config_files/);
     assert.match(commands[1]!, /mktemp -d \/tmp\/oscar-storage-regression/);
     assert.match(commands[2]!, /alarm-media-baseline.*run_cleanup_test/);
     assert.match(commands[3]!, /oscar-storage-binding.*\/opt\/oscar-test/);
@@ -172,7 +174,7 @@ exit 0
         "viewer.test.invalid|tester@test.invalid|/opt/oscar-test|DISPOSABLE-STORAGE",
       storageProbeTimeoutMs: 10_000,
     } as SuiteConfig, "binding_refusal_test");
-    await assert.rejects(client.runJson("platform"), /missing, linked, noncanonical, or changed/);
+    await assert.rejects(client.runJson("platform"), /not the uniquely running Compose release/);
     assert.match(readFileSync(sshLog, "utf8"), /oscar-storage-binding/);
     assert.throws(() => readFileSync(scpLog, "utf8"), /ENOENT/);
   } finally {

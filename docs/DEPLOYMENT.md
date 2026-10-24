@@ -31,6 +31,16 @@ Copy `.env.example` to `.env`, populate it outside Git, and set mode `0600`.
 On an NVM-based noninteractive SSH session, put the desired Node binary on
 `PATH`; `scripts/run-regression.sh` also locates the newest installed NVM Node.
 
+For a later clean-directory upgrade, use
+`scripts/rebind-active-release.sh --build-label LABEL` to preview the uniquely
+running Compose release, then repeat it with `--apply`. The helper validates the
+remote canonical non-symlink directory and exact running application container,
+and atomically updates only `OSCAR_RELEASE_DIR`, `OSCAR_STORAGE_TARGET_ACK`, and
+`OSCAR_BUILD_LABEL`. It refuses a runner armed with restore acknowledgements.
+This is intentionally explicit: choosing the lexically newest directory would
+not prove that it is active, and silently moving a destructive acknowledgement
+would weaken the regression safety boundary.
+
 Provision every canonical 50-lane regression build with
 `fixtures/oscar-50-lane-config.csv`. Keep `OSCAR_LANE_CONFIG_PATH` pointed to the
 same tracked file so the UI assertions are derived from the deployed source of

@@ -1,7 +1,7 @@
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
-import type {Locator, Page, Request} from "playwright";
+import type {Locator, Page, Request, Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
@@ -19,14 +19,24 @@ import {
   assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
+  DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
   DASHBOARD_HEALTH_MAX_IN_FLIGHT,
   expectedDashboardConnectionIds,
   healthRowHasRpmConnectionState,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
+  guardDashboardHealthFixtureRoute,
   parseHealthObservationBatch,
 } from "./dashboard-health.js";
+import {
+  ADVANCED_DATE_FILTER_MAX_BYTES,
+  assessAdvancedDateFilterResponses,
+  buildAdvancedDateFilterProbeUrls,
+  deriveExclusiveDateCutoff,
+  hasDashboardAlarmPredicate,
+  isEventObservationPageUrl,
+} from "./event-filter-oracle.js";
 import {
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
@@ -44,8 +54,10 @@ import {navigateWithBoundedRetry} from "./navigation.js";
 import {RunReporter} from "./reporter.js";
 import {StorageProbeClient} from "./storage-probe.js";
 import {
+  archiveScratchRestartIsSafe,
   archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratchRestart,
   assessArchiveScratch,
   assessJpeg,
   assessMediaMetadataHealth,
@@ -63,12 +75,34 @@ import {
   storageMetricFromProbe,
 } from "./storage-oracles.js";
 import {isPublicObservationId} from "./public-observation-id.js";
+import {alarmRowMatchesTrigger, type AlarmTriggerIdentity} from "./alarm-trigger.js";
 import {
   assessDailyJournalStatus,
   type DailyJournalStatus,
 } from "./daily-journal-oracle.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
+import {
+  assertNationalRefreshCompletedControl,
+  assertFreshNationalStatisticsObservation,
+  assertNationalRefreshPendingControl,
+  assessExactNationalStatisticsObservation,
+  assessLatestNationalStatisticsObservation,
+  assessNationalStatisticsCommandStatus,
+  assessNationalStatisticsCommandSubmission,
+  classifyNationalStatisticsViewerObservationResponse,
+  isNationalRefreshCompletedControl,
+  NATIONAL_REFRESH_CONTROL_SELECTOR,
+  NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS,
+  NATIONAL_STATISTICS_FIELDS,
+  NATIONAL_STATISTICS_OBSERVED_PROPERTY,
+  nationalStatisticsEqual,
+  parseRenderedNationalStatistics,
+  type NationalStatisticsCommandProgress,
+  type NationalStatisticsField,
+  type NationalStatisticsObservation,
+  type NationalRefreshControlState,
+} from "./national-statistics.js";
 
 interface ProbeResult<T = undefined> {
   passed: boolean;
@@ -107,6 +141,20 @@ function parseBoundedJson(response: BoundedFetchResult, context: string): unknow
   if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
   if (response.contentType !== "application/json") {
     throw new Error(`${context} returned ${response.contentType || "no content type"}, not application/json`);
+  }
+  const bytes = Buffer.from(response.bodyBase64, "base64");
+  if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
+  try {
+    return JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(bytes));
+  } catch (error) {
+    throw new Error(`${context} returned invalid bounded JSON`, {cause: error});
+  }
+}
+
+function parseBoundedEventApiJson(response: BoundedFetchResult, context: string): unknown {
+  if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
+  if (response.contentType !== "application/json" && response.contentType !== "application/om+json") {
+    throw new Error(`${context} returned ${response.contentType || "no content type"}, not an OSCAR JSON media type`);
   }
   const bytes = Buffer.from(response.bodyBase64, "base64");
   if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
@@ -180,10 +228,18 @@ const REGRESSION_MEDIA_RETENTION = {
   enabled: true,
   timeToRetentionDays: 0,
   queryPeriodMinutes: 1,
+  maximumCatchUpHours: 6,
+  lateArrivalOverlapHours: 24,
+  lateArrivalScanPeriodMinutes: 360,
+  lateArrivalCatchUpHours: 2,
+  reconciliationCatchUpHours: 24,
+  reconciliationPeriodHours: 24,
+  occupancyStreamRefreshMinutes: 15,
   frameCount: 5,
   jpegQuality: 85,
   sourceRollbackGraceHours: 24,
   metadataReclamationWorkLimit: 200,
+  maintenanceWorkLimit: 200,
 } as const;
 
 const REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS = 180;
@@ -195,6 +251,29 @@ const REGRESSION_ARCHIVE_RESOURCES = {
   maximumConcurrentSessions: 2,
   sessionAcquireTimeoutSeconds: 30,
   temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
+} as const;
+
+const SHIPPING_STORAGE_POLICY = {
+  archiveEnabled: true,
+  archiveIntervalMinutes: 60,
+  hotRetentionDays: 2,
+  rollbackGraceDays: 1,
+  deleteHotAfterArchive: true,
+  videoRetentionDays: 0,
+  videoQueryPeriodMinutes: 5,
+  maximumCatchUpHours: 6,
+  lateArrivalOverlapHours: 24,
+  lateArrivalScanPeriodMinutes: 360,
+  lateArrivalCatchUpHours: 2,
+  reconciliationCatchUpHours: 24,
+  reconciliationPeriodHours: 24,
+  occupancyStreamRefreshMinutes: 15,
+  retainedFrameCount: 5,
+  jpegQuality: 85,
+  sourceRollbackGraceHours: 24,
+  metadataReclamationWorkLimit: 200,
+  maintenanceWorkLimit: 200,
+  frameRetentionEnabled: true,
 } as const;
 
 function isVisible(locator: Locator): Promise<boolean> {
@@ -211,6 +290,7 @@ export class RegressionScenarios {
   private alarmCameraUids: string[] | undefined;
   private alarmLaneUid: string | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
+  private readonly resolvedAlarmEventIds = new Set<string>();
   private cameraRecordingLogStartedAt: string | undefined;
   private readonly retainedBackupExpectations = new Map<string, string>();
   private retainedMediaProofDeferred = false;
@@ -670,29 +750,152 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "map-national-servers", category: "national", action: "refresh national statistics",
-        target: "/national-view", expected: "statistics refresh completes and renders the local node row",
+        target: "/national-view",
+        expected: "the refresh command reaches a successful durable terminal status and its exact new observation renders in the local node row",
       }, async () => {
+        const baselineResponsePromise = page.waitForResponse((response) => {
+          if (response.request().method() !== "GET") return false;
+          const url = new URL(response.url());
+          return /\/observations\/?$/.test(url.pathname) &&
+            url.searchParams.get("resultTime") === "latest" &&
+            url.searchParams.get("observedProperty") === NATIONAL_STATISTICS_OBSERVED_PROPERTY;
+        }, {timeout: this.config.eventTimeoutMs});
         await this.goto(page, "/national-view");
-        const refresh = page.getByRole("button", {name: "Refresh Statistics"});
-        await refresh.waitFor();
+        const baselineResponse = await baselineResponsePromise;
+        if (!baselineResponse.ok()) {
+          throw new Error(`National statistics baseline returned HTTP ${baselineResponse.status()}`);
+        }
+        const baseline = assessLatestNationalStatisticsObservation(await baselineResponse.json());
+        const refreshControl = page.locator(NATIONAL_REFRESH_CONTROL_SELECTOR);
+        await refreshControl.waitFor();
+        if (await refreshControl.count() !== 1) {
+          throw new Error("National statistics page must expose exactly one stable refresh control");
+        }
+        const readRefreshControl = (): Promise<NationalRefreshControlState> =>
+          refreshControl.evaluate((element) => ({
+            enabled: !(element as HTMLButtonElement).disabled,
+            ariaBusy: element.getAttribute("aria-busy"),
+          }));
         const commandResponse = page.waitForResponse(
           (response) => response.request().method() === "POST" &&
             /\/controlstreams\/[^/]+\/commands/.test(new URL(response.url()).pathname),
           {timeout: this.config.eventTimeoutMs},
         );
-        await refresh.click();
-        const response = await commandResponse;
-        await poll(
-          () => refresh.isEnabled(),
-          (enabled) => enabled,
-          {timeoutMs: 90_000, intervalMs: 1_000, description: "national statistics refresh to complete"},
-        );
-        const body = await page.locator("body").innerText();
-        const hasNode = /Local Node/i.test(body);
-        return {
-          passed: response.ok() && hasNode,
-          observed: `command HTTP ${response.status()}; Local Node rendered=${hasNode}`,
+        const exactUiObservationIds = new Set<string>();
+        const exactUiObservationFailures: string[] = [];
+        const captureExactUiObservation = (response: Response) => {
+          const classified = classifyNationalStatisticsViewerObservationResponse(
+            response.request().method(),
+            response.url(),
+            response.status(),
+            baselineResponse.url(),
+          );
+          if (!classified) return;
+          if (classified.successful) {
+            exactUiObservationIds.add(classified.observationId);
+          } else {
+            exactUiObservationFailures.push(
+              `${classified.observationId}: HTTP ${classified.status}`,
+            );
+          }
         };
+        page.on("response", captureExactUiObservation);
+        const requestStartedAt = Date.now();
+        try {
+          await page.getByRole("button", {name: "Refresh Statistics"}).click();
+          const response = await commandResponse;
+          if (!response.ok()) {
+            throw new Error(`National statistics command returned HTTP ${response.status()}`);
+          }
+
+          let progress: NationalStatisticsCommandProgress =
+            assessNationalStatisticsCommandSubmission(await response.json());
+          const commandsUrl = new URL(response.url());
+          const statusUrl = new URL(commandsUrl);
+          statusUrl.pathname = `${commandsUrl.pathname.replace(/\/+$/, "")}/${encodeURIComponent(progress.commandId)}/status`;
+          statusUrl.search = "format=application/json&offset=0&limit=100";
+
+          const completionDeadline = requestStartedAt + NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS;
+          while (progress.state !== "complete") {
+            assertNationalRefreshPendingControl(progress, await readRefreshControl());
+            if (Date.now() >= completionDeadline) {
+              throw new Error(
+                `National statistics command ${progress.commandId} did not reach a successful terminal status within ` +
+                `${NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS / 60_000} minutes`,
+              );
+            }
+            await sleep(2_000);
+            const statusResponse = await page.context().request.get(statusUrl.toString());
+            try {
+              if (!statusResponse.ok()) {
+                throw new Error(`National statistics command status returned HTTP ${statusResponse.status()}`);
+              }
+              progress = assessNationalStatisticsCommandStatus(
+                await statusResponse.json(),
+                progress.commandId,
+              );
+            } finally {
+              await statusResponse.dispose();
+            }
+          }
+
+          const observationId = progress.observationId;
+          if (!observationId) {
+            throw new Error(`National statistics command ${progress.commandId} omitted its observation result`);
+          }
+          const observationUrl = new URL(baselineResponse.url());
+          observationUrl.search = "";
+          observationUrl.pathname = `${observationUrl.pathname.replace(/\/+$/, "")}/${encodeURIComponent(observationId)}`;
+          const exactResponse = await page.context().request.get(observationUrl.toString());
+          let refreshed: NationalStatisticsObservation;
+          try {
+            if (!exactResponse.ok()) {
+              throw new Error(`Exact national statistics observation returned HTTP ${exactResponse.status()}`);
+            }
+            refreshed = assessExactNationalStatisticsObservation(await exactResponse.json(), observationId);
+          } finally {
+            await exactResponse.dispose();
+          }
+          assertFreshNationalStatisticsObservation(baseline, refreshed);
+
+          const rendered = await poll(async () => {
+            const localRow = page.locator(".MuiDataGrid-row").filter({
+              has: page.locator('[data-field="site"]', {hasText: "Local Node"}),
+            }).first();
+            await localRow.waitFor({timeout: this.config.uiTimeoutMs});
+            const values = {} as Record<NationalStatisticsField, string>;
+            for (const field of NATIONAL_STATISTICS_FIELDS) {
+              values[field] = await localRow.locator(`[data-field="${field}"]`).innerText();
+            }
+            const statistics = parseRenderedNationalStatistics(values);
+            return {
+              statistics,
+              exactObservationRequestedByViewer: exactUiObservationIds.has(observationId),
+              refreshControl: await readRefreshControl(),
+              viewerFetchFailures: [...exactUiObservationFailures],
+            };
+          }, candidate => candidate.exactObservationRequestedByViewer &&
+              isNationalRefreshCompletedControl(candidate.refreshControl) &&
+              nationalStatisticsEqual(candidate.statistics, refreshed.statistics), {
+            timeoutMs: this.config.eventTimeoutMs,
+            intervalMs: 250,
+            description: `Viewer to render exact national statistics observation ${observationId}`,
+          });
+
+          assertNationalRefreshCompletedControl(rendered.refreshControl);
+          const passed = rendered.exactObservationRequestedByViewer &&
+              nationalStatisticsEqual(rendered.statistics, refreshed.statistics);
+          return {
+            passed,
+            observed: `command HTTP ${response.status()}; command=${progress.commandId}; ` +
+              `terminal=${progress.statusCode}; legacy accepted result=${progress.legacyAcceptedResult}; ` +
+              `baseline=${baseline?.id ?? "none"}; refreshed=${refreshed.id}; exact Viewer fetch=` +
+              `${rendered.exactObservationRequestedByViewer}; Viewer fetch failures=` +
+              `${JSON.stringify(rendered.viewerFetchFailures)}; rendered=${JSON.stringify(rendered.statistics)}`,
+          };
+        } finally {
+          page.off("response", captureExactUiObservation);
+        }
       });
 
       await this.check({
@@ -926,6 +1129,7 @@ export class RegressionScenarios {
     let probeEnabled = true;
     let currentHealthRequests = 0;
     let peakHealthRequests = 0;
+    let fixtureRouteFailure: unknown;
     const trackedRequests = new Set<Request>();
     const batches: Array<{streamIds: string[]; limit: number | null}> = [];
 
@@ -963,16 +1167,35 @@ export class RegressionScenarios {
         return;
       }
 
-      const response = await route.fetch();
-      const payload: unknown = await response.json();
-      if (fixtureMode === "mixed") {
-        const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
-        mixedConnectionObservations += summary.matched;
-        mixedOfflineObservations += summary.offlineMatched;
-      } else {
-        forcedConnectionObservations += forceConnectionObservationsOffline(payload);
-      }
-      await route.fulfill({response, json: payload});
+      await guardDashboardHealthFixtureRoute(async () => {
+        const response = await route.fetch({timeout: DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS});
+        const payload: unknown = await response.json();
+        if (fixtureMode === "mixed") {
+          const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
+          mixedConnectionObservations += summary.matched;
+          mixedOfflineObservations += summary.offlineMatched;
+        } else {
+          forcedConnectionObservations += forceConnectionObservationsOffline(payload);
+        }
+        await route.fulfill({response, json: payload});
+      }, (error) => {
+        if (fixtureRouteFailure !== undefined) return;
+        fixtureRouteFailure = error;
+        const observed = `intercepted latest-observation request failed: ${describeError(error)}`;
+        this.reporter.error("dashboard-health", "fixture-route", observed);
+        this.reporter.outcome(
+          "dashboard-health",
+          "dashboard-health",
+          "complete bounded fixture observation request",
+          route.request().url(),
+          `the intercepted request completes within ${DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS} ms`,
+          observed,
+          "incorrect",
+          DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
+          "",
+          describeError(error),
+        );
+      }, () => route.abort("timedout"));
     });
 
     try {
@@ -1411,6 +1634,72 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
+  private waitForEventObservationPage(
+    page: Page,
+    expected: "event-log" | "dashboard-alarms",
+  ): Promise<Response> {
+    return page.waitForResponse(response => {
+      if (response.request().method() !== "GET" || response.status() < 200 || response.status() >= 300 ||
+          !isEventObservationPageUrl(response.url(), this.config.oscarBaseUrl)) return false;
+      const sourceFilter = new URL(response.url()).searchParams.get("filter") ?? "";
+      return expected === "dashboard-alarms"
+        ? hasDashboardAlarmPredicate(response.url())
+        : sourceFilter === "";
+    }, {timeout: this.config.eventTimeoutMs});
+  }
+
+  private async advancedDateFilterApiOracle(
+    page: Page,
+    sourceResponse: Response,
+    requireDashboardAlarmPredicate: boolean,
+  ): Promise<ProbeResult> {
+    const sourcePayload = await sourceResponse.json();
+    const cutoff = deriveExclusiveDateCutoff(sourcePayload);
+    const urls = buildAdvancedDateFilterProbeUrls(
+      sourceResponse.url(),
+      this.config.oscarBaseUrl,
+      cutoff,
+    );
+    if (requireDashboardAlarmPredicate && !hasDashboardAlarmPredicate(sourceResponse.url())) {
+      throw new Error("Dashboard date-filter source omitted its unadjudicated alarm predicate");
+    }
+
+    const [countResponse, pageResponse] = await Promise.all([
+      page.evaluate(boundedFetch, {
+        url: urls.countUrl,
+        maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES,
+        decodeImage: false,
+      }),
+      page.evaluate(boundedFetch, {
+        url: urls.pageUrl,
+        maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES,
+        decodeImage: false,
+      }),
+    ]);
+    const countPayload = countResponse.ok
+      ? parseBoundedEventApiJson(countResponse, "advanced date-filter count")
+      : null;
+    const pagePayload = pageResponse.ok
+      ? parseBoundedEventApiJson(pageResponse, "advanced date-filter page")
+      : null;
+    const assessment = assessAdvancedDateFilterResponses(
+      countResponse.status,
+      countPayload,
+      pageResponse.status,
+      pagePayload,
+      urls.cutoff,
+    );
+    return {
+      passed: assessment.passed,
+      observed: `count HTTP=${countResponse.status}; page HTTP=${pageResponse.status}; ` +
+        `count=${assessment.count ?? "invalid"}; page items=${assessment.pageItems}; ` +
+        `before cutoff=${assessment.beforeCutoff}/${assessment.validStartTimes}; ` +
+        `datastreams=${urls.datastreamCount}; cutoff=${urls.cutoff}; ` +
+        `source predicate=${urls.sourceFilter ? "present" : "none"}; ` +
+        `reason=${assessment.reason || "none"}`,
+    };
+  }
+
   private async eventFiltering(): Promise<void> {
     const page = await this.browser.oscarPage();
     try {
@@ -1424,6 +1713,16 @@ export class RegressionScenarios {
         await rows.first().waitFor({timeout: this.config.eventTimeoutMs});
         const count = await rows.count();
         return {passed: count > 0, observed: `${count} visible rows`};
+      });
+      await this.check({
+        scenario: "event-filtering", category: "events", action: "apply read-only start-time filter",
+        target: "Event Log authenticated observations API",
+        expected: "a known nonempty occupancy page yields HTTP 200 for count and page, a positive count, and only start times before the exclusive cutoff",
+      }, async () => {
+        const sourcePromise = this.waitForEventObservationPage(page, "event-log");
+        await this.goto(page, "/event-log");
+        const sourceResponse = await sourcePromise;
+        return this.advancedDateFilterApiOracle(page, sourceResponse, false);
       });
       await this.check({
         scenario: "event-filtering", category: "events", action: "apply full-database lane filter",
@@ -2526,11 +2825,15 @@ export class RegressionScenarios {
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
       const eventId = (await uuidValue.innerText()).trim();
       const url = new URL(page.url());
-      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId;
+      const alreadyResolved = this.resolvedAlarmEventIds.has(eventId);
+      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId &&
+        !alreadyResolved;
+      if (passed) this.resolvedAlarmEventIds.add(eventId);
       return {
         passed,
         value: passed ? eventId : undefined,
-        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}`,
+        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}; ` +
+          `new to this run=${!alreadyResolved}`,
         evidence: passed ? "" : await this.screenshotOnFailure(page, `${scenario}-${type}-uuid`),
       };
     });
@@ -2681,9 +2984,10 @@ export class RegressionScenarios {
   private async triggerAlarm(
     type: "gamma" | "neutron",
     scenario = "rpm-alarms",
-  ): Promise<number | undefined> {
+  ): Promise<AlarmTriggerIdentity | undefined> {
     await this.ensureAlarmMediaBaseline(scenario);
     const before = await this.emulator.waitForIdle(this.config.testRpmId);
+    const initiatedAtEpochMs = Date.now();
     await this.emulator.trigger(this.config.testRpmId, type === "gamma", type === "neutron");
     const active = await this.emulator.waitForStatus(
       this.config.testRpmId,
@@ -2698,10 +3002,14 @@ export class RegressionScenarios {
       active.occupancy_count > before.occupancy_count ? "correct" : "incorrect", 0,
     );
     await this.emulator.waitForIdle(this.config.testRpmId, this.config.eventTimeoutMs);
-    return active.occupancy_count;
+    return {occupancyCount: active.occupancy_count, initiatedAtEpochMs};
   }
 
-  private async findAlarmRow(page: Page, statusText: RegExp, occupancyCount: number): Promise<Locator> {
+  private async findAlarmRow(
+    page: Page,
+    statusText: RegExp,
+    trigger: AlarmTriggerIdentity,
+  ): Promise<Locator> {
     await this.goto(page, "/event-log");
     await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
     await this.applyLaneEventFilter(page);
@@ -2710,8 +3018,10 @@ export class RegressionScenarios {
       const count = await laneRows.count();
       for (let index = 0; index < count; index++) {
         const candidate = laneRows.nth(index);
-        const occupancy = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
-        if (occupancy.trim() === String(occupancyCount) && statusText.test(await candidate.innerText())) {
+        const occupancyCount = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
+        const startTime = await candidate.locator('[data-field="startTime"]').innerText().catch(() => "");
+        const text = await candidate.innerText();
+        if (alarmRowMatchesTrigger({occupancyCount, startTime, text}, statusText, trigger)) {
           return candidate;
         }
       }
@@ -2719,18 +3029,31 @@ export class RegressionScenarios {
     }, (candidate): candidate is Locator => candidate !== null, {
       timeoutMs: this.config.eventTimeoutMs,
       intervalMs: 1_000,
-      description: `${statusText} occupancy ${occupancyCount} for ${this.config.testLaneLabel}`,
+      description: `${statusText} occupancy ${trigger.occupancyCount} created after its trigger for ${this.config.testLaneLabel}`,
     });
     if (!row) throw new Error(
-      `No ${statusText} occupancy ${occupancyCount} found for ${this.config.testLaneLabel}`,
+      `No new ${statusText} occupancy ${trigger.occupancyCount} found for ${this.config.testLaneLabel}`,
     );
     return row;
+  }
+
+  private async verifyDashboardAlarmDateFilter(page: Page): Promise<void> {
+    await this.check({
+      scenario: "rpm-alarms", category: "events", action: "apply Dashboard alarm start-time filter",
+      target: "Dashboard authenticated observations API",
+      expected: "after generated alarms exist, the Dashboard's unadjudicated alarm predicate plus an exclusive start-time cutoff returns HTTP 200, a positive count, and only matching rows",
+    }, async () => {
+      const sourcePromise = this.waitForEventObservationPage(page, "dashboard-alarms");
+      await this.goto(page, "/");
+      const sourceResponse = await sourcePromise;
+      return this.advancedDateFilterApiOracle(page, sourceResponse, true);
+    });
   }
 
   private async alarms(): Promise<void> {
     if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
     const page = await this.browser.oscarPage();
-    const generated: Array<{type: "gamma" | "neutron"; occupancyCount: number}> = [];
+    const generated: Array<{type: "gamma" | "neutron"; trigger: AlarmTriggerIdentity}> = [];
     const quiet = this.emulator.quietConfig(this.originalRpmConfig);
     try {
       await this.ensureAlarmMediaBaseline("rpm-alarms");
@@ -2743,25 +3066,27 @@ export class RegressionScenarios {
       // resolving the events afterwards also proves that neither generation inherited the
       // other's authoritative camera path.
       for (const type of ["gamma", "neutron"] as const) {
-        const occupancyCount = await this.triggerAlarm(type);
-        if (occupancyCount === undefined) throw new Error(`${type} trigger returned no occupancy count`);
-        generated.push({type, occupancyCount});
+        const trigger = await this.triggerAlarm(type);
+        if (trigger === undefined) throw new Error(`${type} trigger returned no occupancy identity`);
+        generated.push({type, trigger});
       }
-      for (const {type, occupancyCount} of generated) {
+      for (const {type, trigger} of generated) {
+        const {occupancyCount} = trigger;
         const ingested = await this.check({
           scenario: "rpm-alarms", category: "event-ingestion", action: `ingest ${type} alarm`,
           target: this.config.testLaneLabel, expected: `Event Log shows a new ${type} event on the reserved lane`,
         }, async () => {
-          const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+          const row = await this.findAlarmRow(page, new RegExp(type, "i"), trigger);
           const text = await row.innerText();
           const passed = new RegExp(type, "i").test(text);
           return {passed, value: passed, observed: text};
         });
         if (!ingested) continue;
-        const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+        const row = await this.findAlarmRow(page, new RegExp(type, "i"), trigger);
         const eventId = await this.resolveAlarmEventUuid(page, row, type, occupancyCount, "rpm-alarms");
         if (eventId) await this.captureAlarmMedia(page, eventId, type, occupancyCount, "rpm-alarms");
       }
+      await this.verifyDashboardAlarmDateFilter(page);
       if (this.alarmMediaProbe && this.cameraRecordingLogStartedAt) {
         await this.check({
           scenario: "rpm-alarms",
@@ -2866,9 +3191,10 @@ export class RegressionScenarios {
         metadata.expected, "UUID search input and submit controls detected", "correct", 0,
       );
 
-      const occupancyCount = await this.triggerAlarm("gamma", "event-uuid");
-      if (occupancyCount === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy count");
-      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      const trigger = await this.triggerAlarm("gamma", "event-uuid");
+      if (trigger === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy identity");
+      const {occupancyCount} = trigger;
+      const row = await this.findAlarmRow(page, /Gamma/i, trigger);
       await Promise.all([
         page.waitForURL(
           (url) => normalizePathname(url.pathname) === "/event-details",
@@ -2889,12 +3215,15 @@ export class RegressionScenarios {
         const validIdentity = isPublicObservationId(uuid);
         const canonical = current.searchParams.get("eventId") === uuid &&
           Boolean(current.searchParams.get("nodeId"));
-        const passed = validIdentity && canonical;
+        const alreadyResolved = this.resolvedAlarmEventIds.has(uuid);
+        const passed = validIdentity && canonical && !alreadyResolved;
+        if (passed) this.resolvedAlarmEventIds.add(uuid);
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "event-uuid-detail");
         return {
           passed,
-          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; nodeId=${current.searchParams.get("nodeId") ?? "missing"}`,
-          value: validIdentity ? uuid : undefined,
+          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; ` +
+            `nodeId=${current.searchParams.get("nodeId") ?? "missing"}; new to this run=${!alreadyResolved}`,
+          value: passed ? uuid : undefined,
           evidence,
         };
       });
@@ -3205,11 +3534,12 @@ export class RegressionScenarios {
   }
 
   private async adjudicationAndAlarmTransfer(): Promise<void> {
-    const occupancyCount = await this.triggerAlarm("gamma");
-    if (occupancyCount === undefined) throw new Error("gamma trigger returned no occupancy count");
+    const trigger = await this.triggerAlarm("gamma");
+    if (trigger === undefined) throw new Error("gamma trigger returned no occupancy identity");
+    const {occupancyCount} = trigger;
     const page = await this.browser.oscarPage();
     try {
-      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      const row = await this.findAlarmRow(page, /Gamma/i, trigger);
       await Promise.all([
         page.waitForURL(/\/event-details/, {waitUntil: "domcontentloaded"}),
         row.dblclick(),
@@ -3240,6 +3570,7 @@ export class RegressionScenarios {
         };
         const observationId = parsed.payload?.event?.observationId ?? "";
         const exportedOccupancyId = parsed.payload?.event?.occupancyId ?? "";
+        const alreadyResolved = this.resolvedAlarmEventIds.has(observationId);
         const schemaValid = parsed.payload?.schema === "org.oscar.alarm-transfer" &&
           parsed.payload.version === 1 &&
           parsed.payload.source?.laneId === this.config.testLaneLabel &&
@@ -3247,16 +3578,22 @@ export class RegressionScenarios {
           isPublicObservationId(observationId) &&
           parsed.integrity?.algorithm === "SHA-256" &&
           /^[a-f0-9]{64}$/i.test(parsed.integrity.digest ?? "") &&
-          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
+          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true &&
+          !alreadyResolved;
         const pngValid = qrBytes.length > 100 &&
           qrBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
         const expectedChartSeries: AlarmChartSeries[] = [];
         if ((parsed.payload?.series?.gamma?.exportedCount ?? 0) > 0) expectedChartSeries.push("gamma");
         if ((parsed.payload?.series?.neutron?.exportedCount ?? 0) > 0) expectedChartSeries.push("neutron");
+        const passed = bytes.length > 100 && schemaValid && pngValid;
+        if (passed) this.resolvedAlarmEventIds.add(observationId);
         return {
-          passed: bytes.length > 100 && schemaValid && pngValid,
-          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; schema/lane/occupancy/integrity valid=${schemaValid}; PNG valid=${pngValid}`,
-          value: {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries},
+          passed,
+          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; ` +
+            `schema/lane/occupancy/integrity/fresh UUID valid=${schemaValid}; PNG valid=${pngValid}`,
+          value: passed
+            ? {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries}
+            : undefined,
           evidence: join("downloads", basename(artifacts.qrImage)),
         };
       });
@@ -3852,7 +4189,13 @@ export class RegressionScenarios {
           value.pgStatStatementsInstalled && value.pgStatStatementsPreloaded &&
           value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
           value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM && value.batchRewriteConfigured &&
-          value.dailyJournalConfigured &&
+          value.archiveEnabled === true &&
+          value.dailyJournalConfigured && value.deleteHotAfterArchive === true &&
+          value.rollbackGraceDays === 1 &&
+          value.archiveIntervalMinutes === 1 &&
+          value.hotRetentionDays === this.config.storageHotRetentionDays &&
+          Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
+            value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
           resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
           resources.threads === REGRESSION_ARCHIVE_RESOURCES.threads &&
           resources.maximumTemporaryMegabytes ===
@@ -3896,15 +4239,15 @@ export class RegressionScenarios {
       await this.check({
         scenario: "storage-health", category: "cold-archive", action: "verify bounded DuckDB scratch hygiene",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "the configured scratch root is absent or a private archive-disjoint empty runtime directory",
+        expected: "the private archive-disjoint scratch root contains its exact 0600 lease and no operation or unexpected entries",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, false),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "DuckDB scratch to become empty between bounded operations"},
+            description: "DuckDB scratch to retain only its safe lease between bounded operations"},
         );
-        const clean = archiveScratchIsSafe(value, false);
+        const clean = archiveScratchIsSafe(value);
         return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
 
@@ -3913,9 +4256,15 @@ export class RegressionScenarios {
         target: "retained-media/v1",
         expected: "checkpoint schema 2 and compact hourly/deletion indexes are structurally valid, with no legacy markers, tombstones, partials, or unsafe entries",
       }, async () => {
-        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
+        const requirePopulated = Boolean(this.config.storageRetainedEventId);
+        const value = await poll(
+          async () => assessMediaMetadataHealth(await probe.runJson("media-metadata-health")),
+          candidate => mediaMetadataHealthIsSafe(candidate, requirePopulated),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "retained-media metadata to reach an atomic clean boundary"},
+        );
         return {
-          passed: mediaMetadataHealthIsSafe(value, Boolean(this.config.storageRetainedEventId)),
+          passed: mediaMetadataHealthIsSafe(value, requirePopulated),
           observed: JSON.stringify(value),
         };
       });
@@ -3977,11 +4326,6 @@ export class RegressionScenarios {
           });
         } finally { await page.close(); }
       }
-      if (platform?.deleteHotAfterArchive === true && this.config.profile === "smoke") {
-        this.reporter.error("storage-health", "configuration",
-          "deleteHotAfterArchive is enabled on a smoke-only target; require a successful lifecycle/restore qualification before production rollout",
-          "", "warning");
-      }
     } finally { await probe.cleanup(); }
   }
 
@@ -3993,6 +4337,7 @@ export class RegressionScenarios {
     let apiPage: Page | undefined;
     let directJournalLaneUid: string | undefined;
     let directJournalAfterAppend: DirectJournalLaneState | undefined;
+    let expectedAuthorizedHotDeleteSingletonCalls = 0;
     try {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
@@ -4003,7 +4348,9 @@ export class RegressionScenarios {
         const passed = storagePlatformHasExactReleaseIdentity(
           platform, this.config.storageExpectedRelease, this.config.storageBackupMode,
         ) &&
-            platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
+            platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
+            platform.rollbackGraceDays === 1 &&
+            platform.hotRetentionDays === this.config.storageHotRetentionDays &&
             platform.archiveIntervalMinutes === 1 &&
             platform.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
             platform.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
@@ -4019,11 +4366,23 @@ export class RegressionScenarios {
             media.enabled === REGRESSION_MEDIA_RETENTION.enabled &&
             media.timeToRetentionDays === REGRESSION_MEDIA_RETENTION.timeToRetentionDays &&
             media.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION.queryPeriodMinutes &&
+            media.maximumCatchUpHours === REGRESSION_MEDIA_RETENTION.maximumCatchUpHours &&
+            media.lateArrivalOverlapHours === REGRESSION_MEDIA_RETENTION.lateArrivalOverlapHours &&
+            media.lateArrivalScanPeriodMinutes ===
+              REGRESSION_MEDIA_RETENTION.lateArrivalScanPeriodMinutes &&
+            media.lateArrivalCatchUpHours === REGRESSION_MEDIA_RETENTION.lateArrivalCatchUpHours &&
+            media.reconciliationCatchUpHours ===
+              REGRESSION_MEDIA_RETENTION.reconciliationCatchUpHours &&
+            media.reconciliationPeriodHours ===
+              REGRESSION_MEDIA_RETENTION.reconciliationPeriodHours &&
+            media.occupancyStreamRefreshMinutes ===
+              REGRESSION_MEDIA_RETENTION.occupancyStreamRefreshMinutes &&
             media.frameCount === REGRESSION_MEDIA_RETENTION.frameCount &&
             media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality &&
             media.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION.sourceRollbackGraceHours &&
             media.metadataReclamationWorkLimit ===
-              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit;
+              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit &&
+            media.maintenanceWorkLimit === REGRESSION_MEDIA_RETENTION.maintenanceWorkLimit;
         return {
           passed,
           value: passed,
@@ -4084,15 +4443,15 @@ export class RegressionScenarios {
         scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify clean DuckDB scratch before fixture mutation",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "the configured private archive-disjoint scratch root is empty between archive operations",
+        expected: "the private archive-disjoint scratch root contains only its exact safe lease between archive operations",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, false),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "pre-lifecycle DuckDB scratch to become empty"},
+            description: "pre-lifecycle DuckDB scratch to retain only its safe lease"},
         );
-        const clean = archiveScratchIsSafe(value, false);
+        const clean = archiveScratchIsSafe(value);
         return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
       if (!scratchAccepted) {
@@ -4184,13 +4543,22 @@ export class RegressionScenarios {
         target: "retained-media/v1",
         expected: "generated five-frame media has schema-2 checkpoint state and compact hourly processed indexes with no legacy or unsafe metadata",
       }, async () => {
-        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
         const requirePopulated = this.generatedAlarmMedia.size > 0;
+        const value = await poll(
+          async () => assessMediaMetadataHealth(await probe.runJson("media-metadata-health")),
+          candidate => mediaMetadataHealthIsSafe(candidate, requirePopulated),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "retained-media metadata to reach an atomic clean boundary"},
+        );
         return {passed: mediaMetadataHealthIsSafe(value, requirePopulated), observed: JSON.stringify(value)};
       });
-      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
+      const lifecycleBefore = storageMetricFromProbe(
+        "storage-lifecycle-before",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(lifecycleBefore);
       fixtureCreateAttempted = true;
-      const fixture = await probe.runJson<{coldId: string; hotId: string; datastreamId: number;
+      const fixture = await probe.runJson<{coldId: string; coldRowCount: number; hotId: string; datastreamId: number;
         coldTime: string; hotTime: string; activationBlocked: boolean; sourceMutated: boolean;
         staleActivationRejected: boolean; staleRowUnmarked: boolean}>(
           "fixture-create-race", [fixtureRun, String(this.config.storageHotRetentionDays)]);
@@ -4208,16 +4576,19 @@ export class RegressionScenarios {
           fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
           "fixture-status", [fixtureRun]),
         value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
-          value.parityVerified && value.generationRows === 1 && value.markedRows === 1 &&
+          value.parityVerified && value.generationRows === fixture.coldRowCount &&
+          value.markedRows === fixture.coldRowCount &&
           value.fixtureColdMarked && value.fixtureHotUnmarked && value.exactRowOwnership),
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "the retried exact source row to enter one parity-verified archive generation"},
+          description: "the retried exact source row set to enter one parity-verified archive generation"},
       );
       await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
         target: String(fixture.coldId),
-        expected: "only the exact exported cold row is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
+        expected: "only the exact exported three-row cold fixture is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
           passed: Boolean(archived.generationId && archived.parityVerified && archived.exactRowOwnership &&
-            archived.markedRows === 1 && archived.generationMinId === fixture.coldId &&
+            fixture.coldRowCount === 3 && archived.generationRows === fixture.coldRowCount &&
+            archived.markedRows === fixture.coldRowCount &&
+            archived.generationMinId === (BigInt(fixture.coldId) - 2n).toString() &&
             archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
         }));
       const exportDisruptionPhase = "storage-lifecycle-export-disruption";
@@ -4249,6 +4620,44 @@ export class RegressionScenarios {
       const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
       const hotPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.hotId));
       const streamPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.datastreamId));
+      const maintenanceIdle = await this.check({
+        scenario: "storage-lifecycle", category: "performance",
+        action: "isolate fixture hot-delete accounting",
+        target: this.config.targetHost,
+        expected: "three clean samples spanning a maintenance/delete interval prove no export, failed retry, eligible unowned row, eligible hot delete, or DuckDB scratch work before the fixture baseline",
+      }, async () => {
+        type ArchiveIdle = {idle: boolean; exportingJobs: number; latestFailedJobs: number;
+          eligibleHotDeleteGenerations: number; eligibleUnownedRows: number; scratchEntries: number};
+        let idleSince = 0;
+        let stableSamples = 0;
+        const value = await poll(async () => {
+          const current = await probe.runJson<ArchiveIdle>("archive-maintenance-idle");
+          if (current.idle && current.exportingJobs === 0 && current.latestFailedJobs === 0 &&
+              current.eligibleHotDeleteGenerations === 0 && current.eligibleUnownedRows === 0 &&
+              current.scratchEntries === 0) {
+            if (stableSamples === 0) idleSince = Date.now();
+            stableSamples++;
+          } else {
+            idleSince = 0;
+            stableSamples = 0;
+          }
+          return {...current, stableSamples, stableForMs: idleSince ? Date.now() - idleSince : 0};
+        }, state => state.idle && state.stableSamples >= 3 && state.stableForMs >= 65_000, {
+          timeoutMs: this.config.storageArchiveTimeoutMs,
+          intervalMs: 35_000,
+          description: "pre-existing archive maintenance to remain idle across a maintenance/delete interval",
+        });
+        const passed = value.idle && value.stableSamples >= 3 && value.stableForMs >= 65_000;
+        return {passed, value: passed, observed: JSON.stringify(value)};
+      });
+      if (!maintenanceIdle) {
+        throw new Error("Fixture hot-delete accounting refused while pre-existing archive maintenance remained active");
+      }
+      const archiveDeleteBefore = storageMetricFromProbe(
+        "storage-lifecycle-before-multirow-hot-delete",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(archiveDeleteBefore);
       await probe.runJson("fixture-accelerate", [fixtureRun]);
       const sealed = await poll(
         () => probe.runJson<{generationState: string | null; coldHotPresent: boolean; hotPresent: boolean}>(
@@ -4257,6 +4666,28 @@ export class RegressionScenarios {
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
           description: "parity-verified fixture generation to seal and delete only its cold hot-store row"},
       );
+      const archiveDeleteAfter = storageMetricFromProbe(
+        "storage-lifecycle-after-multirow-hot-delete",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(archiveDeleteAfter);
+      await this.check({scenario: "storage-lifecycle", category: "performance",
+        action: "verify one guarded multi-row PostgreSQL purge",
+        target: archived.generationId ?? "fixture generation",
+        expected: "the exact three-row fixture is removed by one id=ANY guarded delete with no singleton delete"}, async () => {
+        const metricDelta = (field: keyof typeof archiveDeleteBefore): number | null => {
+          const before = archiveDeleteBefore[field];
+          const after = archiveDeleteAfter[field];
+          return typeof before === "number" && typeof after === "number" ? after - before : null;
+        };
+        const batchCalls = metricDelta("batchedObservationDeleteCalls");
+        const batchRows = metricDelta("batchedObservationDeleteRows");
+        const singletonCalls = metricDelta("legacySingletonObservationDeleteCalls");
+        const passed = fixture.coldRowCount === 3 && !sealed.coldHotPresent &&
+          batchCalls === 1 && batchRows === fixture.coldRowCount && singletonCalls === 0;
+        return {passed, observed: JSON.stringify({batchCalls, batchRows, singletonCalls,
+          coldRowCount: fixture.coldRowCount, coldHotPresent: sealed.coldHotPresent})};
+      });
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query cold event by ID",
         target: coldPublicId, expected: "the cold observation remains queryable after its PostgreSQL row is removed"}, async () => {
         const response = await request.get(this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(coldPublicId)}`));
@@ -4326,11 +4757,16 @@ export class RegressionScenarios {
         );
         if (!release.released) throw new Error("Disposable HOT_EXACT hold was not released");
       }
+      const authorizedHotDeleteBefore = storageMetricFromProbe(
+        "storage-lifecycle-before-authorized-hot-delete",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(authorizedHotDeleteBefore);
       await this.check({
         scenario: "storage-lifecycle", category: "retention",
         action: "delete hot observation after hold release",
         target: hotPublicId,
-        expected: "the same authenticated delete succeeds only after release and the observation is no longer queryable",
+        expected: "the same authenticated delete succeeds only after release, becomes unqueryable, and accounts for exactly one singleton SQL delete",
       }, async () => {
         const deletion = await request.delete(
           this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
@@ -4343,9 +4779,27 @@ export class RegressionScenarios {
         );
         const queryStatus = missing.status();
         await missing.dispose();
+        expectedAuthorizedHotDeleteSingletonCalls = deleted && queryStatus === 404 ? 1 : 0;
+        const authorizedHotDeleteAfter = storageMetricFromProbe(
+          "storage-lifecycle-after-authorized-hot-delete",
+          await probe.runJson("snapshot"),
+        );
+        this.reporter.storageMetric(authorizedHotDeleteAfter);
+        const beforeSingletonCalls = authorizedHotDeleteBefore.legacySingletonObservationDeleteCalls;
+        const afterSingletonCalls = authorizedHotDeleteAfter.legacySingletonObservationDeleteCalls;
+        const authorizedHotDeleteSingletonCalls =
+          typeof beforeSingletonCalls === "number" && typeof afterSingletonCalls === "number"
+            ? afterSingletonCalls - beforeSingletonCalls
+            : null;
         return {
-          passed: deleted && queryStatus === 404,
-          observed: `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
+          passed: expectedAuthorizedHotDeleteSingletonCalls === 1 &&
+            authorizedHotDeleteSingletonCalls === expectedAuthorizedHotDeleteSingletonCalls,
+          observed: JSON.stringify({
+            deleteStatus: deletionStatus,
+            followUpGetStatus: queryStatus,
+            expectedAuthorizedHotDeleteSingletonCalls,
+            authorizedHotDeleteSingletonCalls,
+          }),
         };
       });
       const purgeDisruptionPhase = "storage-lifecycle-purge-disruption";
@@ -4383,15 +4837,15 @@ export class RegressionScenarios {
         scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify DuckDB operation scratch cleanup",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "archive/export/query/count/delete sessions leave the private archive-disjoint scratch root empty",
+        expected: "archive/export/query/count/delete sessions remove every operation directory while preserving the exact safe lease",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, true),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "post-lifecycle DuckDB scratch to become empty"},
+            description: "post-lifecycle DuckDB scratch to retain only its safe lease"},
         );
-        return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
+        return {passed: archiveScratchIsSafe(value), observed: JSON.stringify(value)};
       });
       const lifecycleRestartPhase = "storage-lifecycle-restart-disruption";
       // Finish any interval sample that captured the steady-state phase before allowing the
@@ -4412,7 +4866,14 @@ export class RegressionScenarios {
           recoveryErrors: number;
           shutdownErrors: number;
           cameraRecordingErrors: number;
+          scratchBeforeRestartCount: number;
+          scratchAfterRestartCount: number;
+          staleScratchAfterRestartCount: number;
+          scratchBeforeRestart: string[];
+          scratchAfterRestart: string[];
+          staleScratchAfterRestart: string[];
         }>("journal-restart", [directJournalLaneUid!]);
+        const scratchRestart = assessArchiveScratchRestart(value);
         const lane = await probe.runJson<DirectJournalLaneState>(
           "journal-lane-state",
           [directJournalLaneUid!],
@@ -4426,8 +4887,10 @@ export class RegressionScenarios {
           value.segmentFailures === 0;
           return {passed: value.healthy && exactRestartPreservation &&
             value.partialFiles === 0 && value.recoveryErrors === 0 &&
-            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
-          observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
+            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable &&
+            archiveScratchRestartIsSafe(scratchRestart),
+          observed: JSON.stringify({restart: value, scratchRestart, lane,
+            preRestart: directJournalAfterAppend})};
         });
       } finally {
         this.metrics.setPhase("storage-lifecycle-post-restart");
@@ -4453,7 +4916,7 @@ export class RegressionScenarios {
               stableMetadataSamples = signature === stableMetadataSignature
                 ? stableMetadataSamples + 1 : 1;
               stableMetadataSignature = signature;
-              return value.processedIndexFiles > 0 && stableMetadataSamples >= 3;
+              return mediaMetadataHealthIsSafe(value, true) && stableMetadataSamples >= 3;
             },
             {timeoutMs: 120_000, intervalMs: 2_000,
               description: "retained-media indexes to repopulate and stabilize after restart"},
@@ -4514,7 +4977,44 @@ export class RegressionScenarios {
       }
       await apiPage.close();
       apiPage = undefined;
-      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-after", await probe.runJson("snapshot")));
+      const lifecycleAfter = storageMetricFromProbe(
+        "storage-lifecycle-after",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(lifecycleAfter);
+      await this.check({
+        scenario: "storage-lifecycle",
+        category: "performance",
+        action: "verify bounded database work amplification",
+        target: "PostgreSQL observation lifecycle",
+        expected: "the lifecycle adds only its exactly measured authorized hot-row API delete, no unaccounted singleton deletes, and at most 512 MiB of PostgreSQL temporary data",
+      }, async () => {
+        const delta = (field: keyof typeof lifecycleBefore): number | null => {
+          const before = lifecycleBefore[field];
+          const after = lifecycleAfter[field];
+          return typeof before === "number" && typeof after === "number" ? after - before : null;
+        };
+        const tempBytes = delta("tempBytes");
+        const tempBlocks = delta("statementTempBlocksWritten");
+        const singletonDeletes = delta("legacySingletonObservationDeleteCalls");
+        const unaccountedSingletonDeletes = singletonDeletes === null
+          ? null
+          : singletonDeletes - expectedAuthorizedHotDeleteSingletonCalls;
+        const countersMonotonic = [tempBytes, tempBlocks, singletonDeletes,
+          unaccountedSingletonDeletes]
+          .every(value => value !== null && value >= 0);
+        const passed = countersMonotonic && tempBytes! <= 512 * 1024 * 1024 &&
+          tempBlocks! <= 65_536 &&
+          expectedAuthorizedHotDeleteSingletonCalls === 1 &&
+          singletonDeletes === expectedAuthorizedHotDeleteSingletonCalls &&
+          unaccountedSingletonDeletes === 0;
+        return {passed, observed: JSON.stringify({
+          tempBytes, statementTempBlocksWritten: tempBlocks,
+          legacySingletonObservationDeleteCalls: singletonDeletes,
+          expectedAuthorizedHotDeleteSingletonCalls,
+          unaccountedSingletonDeletes,
+        })};
+      });
     } finally {
       if (apiPage) await apiPage.close().catch(() => undefined);
       if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>

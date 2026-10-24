@@ -39,21 +39,27 @@ The binding is revalidated before every action. The probe itself runs from a
 fresh mode-0700 private workspace and removes it on completion. These checks are
 interlocks, not authorization.
 
-It copies two existing test observations into uniquely registered fixture rows.
+It copies one existing test observation into four uniquely registered synthetic fixture rows:
+three contiguous cold candidates and one hot/current control row.
 Cold deletion is refused unless the dry-run plan contains exactly the one
-registered fixture generation. Backup creation/verification may prune older
-verified backups according to the target's configured count; restore is never
-attempted. Do not enable this path on production or a target containing data
+registered fixture generation. In optional `single` backup mode, backup creation
+and verification may replace the one previously committed snapshot only after
+the new snapshot is authenticated and atomically published; restore is never
+attempted by this workflow. Do not enable this path on production or a target containing data
 that must be preserved.
 
 The same disposable target must explicitly use `timeToRetention=0`,
-`videoQueryPeriod=1`, `enableFrameRetention=true`, `frameRetentionCount=5`, and
+`videoQueryPeriod=1`, `maximumCatchUpHours=6`, `lateArrivalOverlapHours=24`,
+`lateArrivalScanPeriodMinutes=360`, `lateArrivalCatchUpHours=2`,
+`reconciliationCatchUpHours=24`, `reconciliationPeriodHours=24`,
+`occupancyStreamRefreshMinutes=15`, `enableFrameRetention=true`, `frameRetentionCount=5`, and
 `jpegQuality=85`, `sourceRollbackGraceHours=24`, and
-`metadataReclamationWorkLimit=200` for the generated-alarm
+`maintenanceWorkLimit=200`, and `metadataReclamationWorkLimit=200` for the generated-alarm
 media check. The suite verifies those
 live values before it polls or creates the archive fixture; it never edits the
 configuration. The 24-hour source grace keeps the exact generated MP4s available
-for the final forensic comparison. OSCAR's packaged and production age default remains seven days.
+for the final forensic comparison. OSCAR's packaged production age default is one day,
+followed by the same 24-hour source rollback grace.
 Never copy the zero-day test setting into production.
 
 A required lifecycle cannot certify a target without retained-media evidence.
