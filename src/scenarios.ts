@@ -30,6 +30,14 @@ import {
   parseHealthObservationBatch,
 } from "./dashboard-health.js";
 import {
+  ADVANCED_DATE_FILTER_MAX_BYTES,
+  assessAdvancedDateFilterResponses,
+  buildAdvancedDateFilterProbeUrls,
+  deriveExclusiveDateCutoff,
+  hasDashboardAlarmPredicate,
+  isEventObservationPageUrl,
+} from "./event-filter-oracle.js";
+import {
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
   importedAlarmChartsRendered,
@@ -133,6 +141,20 @@ function parseBoundedJson(response: BoundedFetchResult, context: string): unknow
   if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
   if (response.contentType !== "application/json") {
     throw new Error(`${context} returned ${response.contentType || "no content type"}, not application/json`);
+  }
+  const bytes = Buffer.from(response.bodyBase64, "base64");
+  if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
+  try {
+    return JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(bytes));
+  } catch (error) {
+    throw new Error(`${context} returned invalid bounded JSON`, {cause: error});
+  }
+}
+
+function parseBoundedEventApiJson(response: BoundedFetchResult, context: string): unknown {
+  if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
+  if (response.contentType !== "application/json" && response.contentType !== "application/om+json") {
+    throw new Error(`${context} returned ${response.contentType || "no content type"}, not an OSCAR JSON media type`);
   }
   const bytes = Buffer.from(response.bodyBase64, "base64");
   if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
@@ -1612,6 +1634,72 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
+  private waitForEventObservationPage(
+    page: Page,
+    expected: "event-log" | "dashboard-alarms",
+  ): Promise<Response> {
+    return page.waitForResponse(response => {
+      if (response.request().method() !== "GET" || response.status() < 200 || response.status() >= 300 ||
+          !isEventObservationPageUrl(response.url(), this.config.oscarBaseUrl)) return false;
+      const sourceFilter = new URL(response.url()).searchParams.get("filter") ?? "";
+      return expected === "dashboard-alarms"
+        ? hasDashboardAlarmPredicate(response.url())
+        : sourceFilter === "";
+    }, {timeout: this.config.eventTimeoutMs});
+  }
+
+  private async advancedDateFilterApiOracle(
+    page: Page,
+    sourceResponse: Response,
+    requireDashboardAlarmPredicate: boolean,
+  ): Promise<ProbeResult> {
+    const sourcePayload = await sourceResponse.json();
+    const cutoff = deriveExclusiveDateCutoff(sourcePayload);
+    const urls = buildAdvancedDateFilterProbeUrls(
+      sourceResponse.url(),
+      this.config.oscarBaseUrl,
+      cutoff,
+    );
+    if (requireDashboardAlarmPredicate && !hasDashboardAlarmPredicate(sourceResponse.url())) {
+      throw new Error("Dashboard date-filter source omitted its unadjudicated alarm predicate");
+    }
+
+    const [countResponse, pageResponse] = await Promise.all([
+      page.evaluate(boundedFetch, {
+        url: urls.countUrl,
+        maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES,
+        decodeImage: false,
+      }),
+      page.evaluate(boundedFetch, {
+        url: urls.pageUrl,
+        maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES,
+        decodeImage: false,
+      }),
+    ]);
+    const countPayload = countResponse.ok
+      ? parseBoundedEventApiJson(countResponse, "advanced date-filter count")
+      : null;
+    const pagePayload = pageResponse.ok
+      ? parseBoundedEventApiJson(pageResponse, "advanced date-filter page")
+      : null;
+    const assessment = assessAdvancedDateFilterResponses(
+      countResponse.status,
+      countPayload,
+      pageResponse.status,
+      pagePayload,
+      urls.cutoff,
+    );
+    return {
+      passed: assessment.passed,
+      observed: `count HTTP=${countResponse.status}; page HTTP=${pageResponse.status}; ` +
+        `count=${assessment.count ?? "invalid"}; page items=${assessment.pageItems}; ` +
+        `before cutoff=${assessment.beforeCutoff}/${assessment.validStartTimes}; ` +
+        `datastreams=${urls.datastreamCount}; cutoff=${urls.cutoff}; ` +
+        `source predicate=${urls.sourceFilter ? "present" : "none"}; ` +
+        `reason=${assessment.reason || "none"}`,
+    };
+  }
+
   private async eventFiltering(): Promise<void> {
     const page = await this.browser.oscarPage();
     try {
@@ -1625,6 +1713,16 @@ export class RegressionScenarios {
         await rows.first().waitFor({timeout: this.config.eventTimeoutMs});
         const count = await rows.count();
         return {passed: count > 0, observed: `${count} visible rows`};
+      });
+      await this.check({
+        scenario: "event-filtering", category: "events", action: "apply read-only start-time filter",
+        target: "Event Log authenticated observations API",
+        expected: "a known nonempty occupancy page yields HTTP 200 for count and page, a positive count, and only start times before the exclusive cutoff",
+      }, async () => {
+        const sourcePromise = this.waitForEventObservationPage(page, "event-log");
+        await this.goto(page, "/event-log");
+        const sourceResponse = await sourcePromise;
+        return this.advancedDateFilterApiOracle(page, sourceResponse, false);
       });
       await this.check({
         scenario: "event-filtering", category: "events", action: "apply full-database lane filter",
@@ -2939,6 +3037,19 @@ export class RegressionScenarios {
     return row;
   }
 
+  private async verifyDashboardAlarmDateFilter(page: Page): Promise<void> {
+    await this.check({
+      scenario: "rpm-alarms", category: "events", action: "apply Dashboard alarm start-time filter",
+      target: "Dashboard authenticated observations API",
+      expected: "after generated alarms exist, the Dashboard's unadjudicated alarm predicate plus an exclusive start-time cutoff returns HTTP 200, a positive count, and only matching rows",
+    }, async () => {
+      const sourcePromise = this.waitForEventObservationPage(page, "dashboard-alarms");
+      await this.goto(page, "/");
+      const sourceResponse = await sourcePromise;
+      return this.advancedDateFilterApiOracle(page, sourceResponse, true);
+    });
+  }
+
   private async alarms(): Promise<void> {
     if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
     const page = await this.browser.oscarPage();
@@ -2975,6 +3086,7 @@ export class RegressionScenarios {
         const eventId = await this.resolveAlarmEventUuid(page, row, type, occupancyCount, "rpm-alarms");
         if (eventId) await this.captureAlarmMedia(page, eventId, type, occupancyCount, "rpm-alarms");
       }
+      await this.verifyDashboardAlarmDateFilter(page);
       if (this.alarmMediaProbe && this.cameraRecordingLogStartedAt) {
         await this.check({
           scenario: "rpm-alarms",

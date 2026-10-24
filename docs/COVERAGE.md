@@ -17,7 +17,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Dashboard health | expected lane/RPM/per-camera indicator inventory; every emulator RPM explicitly reports `tamper_fault=false` while connected; every lane resolves with no Tamper Unknown/Active indicator; every exact expected connection-chip identity resolves to an accessible live Online state within 45 seconds; one selected camera Offline while every other component stays Online; deterministic all-Offline and completed Unknown reconciliation; all five exact Unknown fault labels; live recovery; keyboard lane navigation; health batches of at most 10 streams with at most two requests in flight | smoke | read-only emulator state plus browser response fixtures |
 | Lane detail | charts and event table render; after real Dashboard navigation, live Gamma and Neutron datasets each paint their chart-specific plot color outside the legend region | smoke | HLS start/stop commands |
 | Video | decoded dimensions, ready state, and advancing playback time | smoke | HLS start/stop commands |
-| Events | rows load and Advanced Filter returns only the requested lane | smoke | none |
+| Events | rows load; Advanced Filter returns only the requested lane; an authenticated, bounded count-and-page oracle derives an exclusive cutoff from a known nonempty occupancy page and requires a positive count plus only earlier `startTime` values; after generated alarms exist, the same oracle retains the Dashboard's unadjudicated gamma/neutron predicate | both | none beyond the full profile's already-generated alarm data |
 | Operational views | fixture-derived exact Dashboard card/RPM/camera membership and Status of Health lane sets for east/west/north/south/pedestrian/entrance/exit; Dashboard-to-Health query persistence; invalid, unassigned, and duplicate parameters fail closed | smoke | none |
 | Reports | site, one-lane lane, alarm, alarm/occupancy, and health PDFs | smoke | report bucket writes |
 | Alarm import | malformed payload is rejected visibly | smoke | none |
@@ -108,6 +108,15 @@ verify real Dashboard transitions and recovery.
 the component and HLS checks, it waits for red Gamma and blue Neutron pixels in
 the central Chart.js plot regions. Legend pixels are excluded, so an empty chart
 container or threshold-only Gamma chart cannot pass.
+
+`event-filtering` captures the Event Log's actual authenticated occupancy query,
+derives a cutoff one millisecond after a returned event, and independently calls
+both the count and bounded page endpoints with `startTime < cutoff`. It requires
+HTTP success, a positive count, and every returned start time to precede the
+exclusive cutoff. The full `rpm-alarms` scenario repeats this after its generated
+alarms exist while preserving the Dashboard predicate for gamma/neutron alarms
+whose adjudication count is zero. Credentials remain inside the Playwright
+authenticated context and are never placed in URLs, reports, or command lines.
 
 `event-uuid` is capability-gated with `EVENT_UUID_WORKFLOW`. Its default `auto`
 mode skips cleanly on older Viewer builds; use `required` for builds that claim

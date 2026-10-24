@@ -37,7 +37,9 @@ source review before the suite can certify that version.
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
-  stale-generation symptoms; alarm ingestion and full-database event filtering;
+  stale-generation symptoms; alarm ingestion and full-database lane/date event
+  filtering through authenticated count-and-page oracles, including the
+  Dashboard's unadjudicated-alarm predicate after generated alarms exist;
   exact generated public observation-ID-to-video association with one unique
   generation-qualified MP4 per authoritative OSH lane-camera UID, nonzero source
   objects, and browser-loaded MP4 metadata
