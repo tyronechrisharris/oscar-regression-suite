@@ -309,10 +309,16 @@ remote lease is held. The full `storage-lifecycle` scenario uses a separately ac
 plus one current control), and refuses any
 cold purge whose plan includes data outside its unique fixture generation. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
-that disposable test deployment. The packaged production profile uses the same
-immediate asynchronous eligibility with a bounded five-minute query cadence,
-converts each source to five verified JPEGs, and preserves the original MP4 for
-the following 24-hour rollback grace. It does not restore a backup. Daily-file publication verification requires an
+that disposable test deployment. The packaged production profile uses immediate
+asynchronous five-JPEG eligibility with a bounded five-minute query cadence and
+preserves the original MP4 until at least 24 hours after verified publication.
+Its observation archive is explicitly `PARQUET_PRIMARY`: exactly five immutable
+detector outputs enter aligned completed-hour generations after a five-minute
+delay, with a five-minute worker interval, 2/2/2 export/verification/deletion
+caps, and at least three days of hot overlap from generation activation. Mutable
+occupancy/alarm/adjudication data remains PostgreSQL-backed, and the fresh-schema
+gate verifies the broad generic payload GIN is absent while required workflow and
+lifecycle indexes remain. It does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture. `STORAGE_BACKUP_WORKFLOW=required` validates the
 selected product mode: disabled proves fail-closed non-mutation, while single
 proves one authenticated self-contained snapshot. See

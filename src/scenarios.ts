@@ -253,11 +253,34 @@ const REGRESSION_ARCHIVE_RESOURCES = {
   temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
 } as const;
 
+const PARQUET_PRIMARY_OUTPUT_NAMES = [
+  "gammaCounts",
+  "gammaThreshold",
+  "neutronCounts",
+  "setupGamma",
+  "setupNeutron",
+] as const;
+
+const REGRESSION_ARCHIVE_POLICY = {
+  storageMode: "PARQUET_PRIMARY",
+  parquetPrimaryArchiveDelayMinutes: 1,
+  archiveIntervalMinutes: 1,
+  rollbackGraceDays: 1,
+  maximumGenerationsPerCycle: 2,
+  maximumVerificationsPerCycle: 2,
+  maximumDeletionsPerCycle: 2,
+} as const;
+
 const SHIPPING_STORAGE_POLICY = {
   archiveEnabled: true,
-  archiveIntervalMinutes: 60,
+  storageMode: "PARQUET_PRIMARY",
+  parquetPrimaryArchiveDelayMinutes: 5,
+  archiveIntervalMinutes: 5,
   hotRetentionDays: 2,
-  rollbackGraceDays: 1,
+  rollbackGraceDays: 3,
+  maximumGenerationsPerCycle: 2,
+  maximumVerificationsPerCycle: 2,
+  maximumDeletionsPerCycle: 2,
   deleteHotAfterArchive: true,
   videoRetentionDays: 0,
   videoQueryPeriodMinutes: 5,
@@ -4183,6 +4206,7 @@ export class RegressionScenarios {
         const value = assessStoragePlatform(await probe.runJson("platform"));
         const release = this.config.storageExpectedRelease;
         const resources = value.archiveResources;
+        const indexes = value.observationIndexes;
         const passed = storagePlatformHasExactReleaseIdentity(
           value, release, this.config.storageBackupMode,
         ) && value.dataChecksums === "on" &&
@@ -4191,11 +4215,17 @@ export class RegressionScenarios {
           value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM && value.batchRewriteConfigured &&
           value.archiveEnabled === true &&
           value.dailyJournalConfigured && value.deleteHotAfterArchive === true &&
-          value.rollbackGraceDays === 1 &&
-          value.archiveIntervalMinutes === 1 &&
+          Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
+            value[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
           value.hotRetentionDays === this.config.storageHotRetentionDays &&
           Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
             value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
+          JSON.stringify(value.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+          JSON.stringify(value.packagedDefaults.outputNames) ===
+            JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+          indexes.genericPayloadGinAbsent && indexes.requiredCount === 14 &&
+          indexes.requiredPresent === indexes.requiredCount && indexes.missingNames.length === 0 &&
+          indexes.eventPathGinExact && indexes.numericEventIndexesExact &&
           resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
           resources.threads === REGRESSION_ARCHIVE_RESOURCES.threads &&
           resources.maximumTemporaryMegabytes ===
@@ -4342,16 +4372,23 @@ export class RegressionScenarios {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
-        expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, one-day archive profile, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
+        expected: "the exact OSCAR 3.9.2 release, fresh PARQUET_PRIMARY schema, accelerated completed-hour archive profile, lean observation indexes, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
         const media = platform.videoRetention;
         const resources = platform.archiveResources;
         const passed = storagePlatformHasExactReleaseIdentity(
           platform, this.config.storageExpectedRelease, this.config.storageBackupMode,
         ) &&
             platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
-            platform.rollbackGraceDays === 1 &&
+            Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
+              platform[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
             platform.hotRetentionDays === this.config.storageHotRetentionDays &&
-            platform.archiveIntervalMinutes === 1 &&
+            JSON.stringify(platform.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+            platform.observationIndexes.genericPayloadGinAbsent &&
+            platform.observationIndexes.requiredPresent ===
+              platform.observationIndexes.requiredCount &&
+            platform.observationIndexes.missingNames.length === 0 &&
+            platform.observationIndexes.eventPathGinExact &&
+            platform.observationIndexes.numericEventIndexesExact &&
             platform.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
             platform.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
             resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
@@ -4572,20 +4609,24 @@ export class RegressionScenarios {
       const archived = await poll(
         () => probe.runJson<{generationId: string | null; generationState: string | null;
           parityVerified: boolean; generationRows: number; generationMinId: string | null;
-          generationMaxId: string | null; markedRows: number; fixtureColdMarked: boolean;
+          generationMaxId: string | null; windowStart: string | null; windowEnd: string | null;
+          completedHourWindow: boolean; fixtureWithinWindow: boolean;
+          markedRows: number; fixtureColdMarked: boolean;
           fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
           "fixture-status", [fixtureRun]),
         value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
           value.parityVerified && value.generationRows === fixture.coldRowCount &&
           value.markedRows === fixture.coldRowCount &&
+          value.completedHourWindow && value.fixtureWithinWindow &&
           value.fixtureColdMarked && value.fixtureHotUnmarked && value.exactRowOwnership),
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
           description: "the retried exact source row set to enter one parity-verified archive generation"},
       );
       await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
         target: String(fixture.coldId),
-        expected: "only the exact exported three-row cold fixture is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
+        expected: "only the exact exported three-row cold fixture is marked into one completed-UTC-hour ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
           passed: Boolean(archived.generationId && archived.parityVerified && archived.exactRowOwnership &&
+            archived.completedHourWindow && archived.fixtureWithinWindow &&
             fixture.coldRowCount === 3 && archived.generationRows === fixture.coldRowCount &&
             archived.markedRows === fixture.coldRowCount &&
             archived.generationMinId === (BigInt(fixture.coldId) - 2n).toString() &&

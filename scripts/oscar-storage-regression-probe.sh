@@ -169,6 +169,7 @@ WITH payload AS (
     AND json_typeof(db_config->'useBatch') = 'boolean' AND (db_config->>'useBatch')::boolean
     AND json_typeof(media->'enableFrameRetention') = 'boolean'
     AND json_typeof(archive->'enabled') = 'boolean'
+    AND json_typeof(archive->'storageMode') = 'string'
     AND json_typeof(archive->'deleteHotAfterArchive') = 'boolean'
     AND json_typeof(oscar->'delegateObservationLifecycleToDatabase') = 'boolean'
     AND json_typeof(daily->'rootDirectory') = 'string'
@@ -180,6 +181,22 @@ WITH payload AS (
     AND json_typeof(archive->'intervalMinutes') = 'number' AND archive->>'intervalMinutes' ~ '^[0-9]+$'
     AND json_typeof(archive->'hotRetentionDays') = 'number' AND archive->>'hotRetentionDays' ~ '^[0-9]+$'
     AND json_typeof(archive->'rollbackGraceDays') = 'number' AND archive->>'rollbackGraceDays' ~ '^[0-9]+$'
+    AND json_typeof(archive->'parquetPrimaryArchiveDelayMinutes') = 'number'
+      AND archive->>'parquetPrimaryArchiveDelayMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'maximumGenerationsPerCycle') = 'number'
+      AND archive->>'maximumGenerationsPerCycle' ~ '^[0-9]+$'
+    AND json_typeof(archive->'maximumVerificationsPerCycle') = 'number'
+      AND archive->>'maximumVerificationsPerCycle' ~ '^[0-9]+$'
+    AND json_typeof(archive->'maximumDeletionsPerCycle') = 'number'
+      AND archive->>'maximumDeletionsPerCycle' ~ '^[0-9]+$'
+    AND json_typeof(archive->'outputNames') = 'array'
+    AND json_array_length(archive->'outputNames') BETWEEN 1 AND 64
+    AND NOT EXISTS (
+      SELECT 1 FROM json_array_elements(archive->'outputNames') value
+      WHERE json_typeof(value) <> 'string'
+        OR value #>> '{}' !~ '^[A-Za-z][A-Za-z0-9._-]{0,127}$')
+    AND json_array_length(archive->'outputNames') = (
+      SELECT count(DISTINCT value #>> '{}') FROM json_array_elements(archive->'outputNames') value)
     AND json_typeof(archive->'duckDbMemoryLimitMegabytes') = 'number' AND archive->>'duckDbMemoryLimitMegabytes' ~ '^[0-9]+$'
     AND json_typeof(archive->'duckDbThreads') = 'number' AND archive->>'duckDbThreads' ~ '^[0-9]+$'
     AND json_typeof(archive->'duckDbMaximumTemporaryMegabytes') = 'number' AND archive->>'duckDbMaximumTemporaryMegabytes' ~ '^[0-9]+$'
@@ -228,7 +245,9 @@ SELECT concat_ws('|',
   daily->>'maxSegmentAgeSeconds', daily->>'maxRecordBytes', daily->>'sealedJournalRetentionDays',
   daily->>'requireBackupBeforeSealedJournalDeletion',
   oscar->>'delegateObservationLifecycleToDatabase', oscar->>'dailyFilePurgeWorkLimit',
-  archive->>'enabled')
+  archive->>'enabled', archive->>'storageMode', archive->>'parquetPrimaryArchiveDelayMinutes',
+  archive->>'maximumGenerationsPerCycle', archive->>'maximumVerificationsPerCycle',
+  archive->>'maximumDeletionsPerCycle', (archive->'outputNames')::text)
 FROM valid;
 SQL
   } | psql_admin --quiet --tuples-only --no-align | tail -n 1
@@ -1179,15 +1198,16 @@ WITH payload AS (
       'org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig'
 ), config AS (
   SELECT archive,
-    (archive->>'hotRetentionDays')::integer AS hot_retention_days,
+    (archive->>'parquetPrimaryArchiveDelayMinutes')::integer AS primary_archive_delay_minutes,
     (archive->>'rollbackGraceDays')::integer AS rollback_grace_days,
     ARRAY(SELECT value #>> '{}' FROM json_array_elements(archive->'outputNames') value) AS output_names
   FROM selected
   WHERE json_typeof(archive) = 'object'
     AND NOT EXISTS (SELECT key FROM json_each(archive) GROUP BY key HAVING count(*) <> 1)
     AND archive->>'objClass' = 'org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig'
-    AND json_typeof(archive->'hotRetentionDays') = 'number'
-    AND archive->>'hotRetentionDays' ~ '^[1-9][0-9]*$'
+    AND archive->>'storageMode' = 'PARQUET_PRIMARY'
+    AND json_typeof(archive->'parquetPrimaryArchiveDelayMinutes') = 'number'
+    AND archive->>'parquetPrimaryArchiveDelayMinutes' ~ '^[1-9][0-9]*$'
     AND json_typeof(archive->'rollbackGraceDays') = 'number'
     AND archive->>'rollbackGraceDays' ~ '^[1-9][0-9]*$'
     AND json_typeof(archive->'outputNames') = 'array'
@@ -1213,7 +1233,7 @@ WITH payload AS (
     (SELECT count(*) FROM (
       SELECT 1 FROM obs o JOIN obs_datastreams d ON d.id=o.datastreamid, config c
       WHERE o.archivegenerationid IS NULL
-        AND o.phenomenontime<now()-make_interval(days=>c.hot_retention_days)
+        AND o.phenomenontime<date_trunc('hour',now()-make_interval(mins=>c.primary_archive_delay_minutes))
         AND d.data->>'outputName'=ANY(c.output_names)
       LIMIT 1) candidate) eligible_unowned_rows,
     (SELECT count(*) FROM config) config_rows
@@ -1745,12 +1765,14 @@ case $action in
       media_enabled delete_hot \
       daily_root daily_journal daily_publication daily_zone daily_mode daily_fsync daily_records \
       daily_unforced_bytes daily_segment_bytes daily_segment_age daily_record_bytes daily_retention \
-      daily_require_backup lifecycle_delegated daily_purge_work archive_enabled unexpected_config_field <<<"$config_fields"
+      daily_require_backup lifecycle_delegated daily_purge_work archive_enabled storage_mode \
+      primary_archive_delay max_generations max_verifications max_deletions output_names_json \
+      unexpected_config_field <<<"$config_fields"
     [[ -z ${unexpected_config_field:-} ]] || fail 'The structural OSCAR config result is ambiguous.'
     packaged_config_fields=$(platform_config_fields /opt/oscar/config.json) ||
       fail 'The packaged OSCAR default config failed structural JSON extraction.'
     IFS='|' read -r -a packaged_config <<<"$packaged_config_fields"
-    [[ ${#packaged_config[@]} -eq 41 ]] ||
+    [[ ${#packaged_config[@]} -eq 47 ]] ||
       fail 'The packaged OSCAR default config result is ambiguous.'
     packaged_archive_interval=${packaged_config[0]}
     packaged_hot_retention=${packaged_config[1]}
@@ -1774,7 +1796,14 @@ case $action in
     packaged_daily_retention=${packaged_config[36]}
     packaged_daily_require_backup=${packaged_config[37]}
     packaged_archive_enabled=${packaged_config[40]}
-    for value in "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode"; do
+    packaged_storage_mode=${packaged_config[41]}
+    packaged_primary_archive_delay=${packaged_config[42]}
+    packaged_max_generations=${packaged_config[43]}
+    packaged_max_verifications=${packaged_config[44]}
+    packaged_max_deletions=${packaged_config[45]}
+    packaged_output_names_json=${packaged_config[46]}
+    for value in "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode" \
+      "$storage_mode" "$packaged_storage_mode"; do
       safe_json_text "$value"
     done
     schema=$(scalar "SELECT coalesce(max(version),0) FROM oscar_storage_schema_version;")
@@ -1815,6 +1844,36 @@ case $action in
       fail 'Could not obtain bounded PostgreSQL batch-rewrite execution evidence.'
     batch=false
     if [[ $batch_calls -gt 0 && $batch_rows -gt $batch_calls ]]; then batch=true; fi
+    observation_indexes=$(json_query "
+      WITH required(indexname) AS (VALUES
+        ('obs_pkey'),('obs_unique_constraint_v2'),('obs_datastream_idx'),
+        ('obs_phenomenon_time_idx'),('obs_datastream_id_phenomenon_time_idx'),
+        ('obs_result_time_idx'),('obs_datastream_id_result_time_idx'),('obs_foi_idx'),
+        ('obs_unarchived_time_idx'),('obs_archive_generation_idx'),
+        ('obs_result_path_ops_idx'),('obs_result_occupancy_count_idx'),
+        ('obs_result_max_gamma_idx'),('obs_result_max_neutron_idx')
+      ), actual AS (
+        SELECT indexname,lower(indexdef) indexdef FROM pg_indexes
+        WHERE schemaname=current_schema() AND tablename='obs'
+      ), missing AS (
+        SELECT required.indexname FROM required LEFT JOIN actual USING(indexname)
+        WHERE actual.indexname IS NULL ORDER BY required.indexname
+      )
+      SELECT json_build_object(
+        'genericPayloadGinAbsent',NOT EXISTS(SELECT 1 FROM actual WHERE indexname='obs_data_idx'),
+        'requiredCount',(SELECT count(*) FROM required),
+        'requiredPresent',(SELECT count(*) FROM required JOIN actual USING(indexname)),
+        'missingNames',coalesce((SELECT json_agg(indexname) FROM missing),'[]'::json),
+        'eventPathGinExact',EXISTS(SELECT 1 FROM actual WHERE indexname='obs_result_path_ops_idx'
+          AND indexdef LIKE '%using gin (result jsonb_path_ops)%'),
+        'numericEventIndexesExact',3=(SELECT count(*) FROM actual
+          WHERE indexname IN ('obs_result_occupancy_count_idx','obs_result_max_gamma_idx',
+            'obs_result_max_neutron_idx')
+            AND indexdef LIKE '%datastreamid%' AND indexdef LIKE '%::numeric%'
+            AND indexdef LIKE '%where (jsonb_typeof(%')
+      );")
+    [[ $observation_indexes == \{* ]] ||
+      fail 'Could not verify the fresh PARQUET_PRIMARY observation index catalog.'
     journal=true
     printf '{"expectedRelease":"%s","configuredRelease":"%s","templateRelease":"%s","deploymentId":"%s","backupMode":"%s",' \
       "$expected_release" "$configured_release" "$template_release" "$deployment_id" "$backup_mode"
@@ -1859,10 +1918,16 @@ case $action in
       "$checksums" "$([[ $installed == t ]] && echo true || echo false)" "$([[ $preloaded == t ]] && echo true || echo false)" "$schema" "$schema_checksum"
     printf '"archiveMarker":{"present":%s,"exact":%s,"format":"%s","version":"%s","dataChecksums":"%s","initializedAt":"%s"},' \
       "$marker_present" "$marker_exact" "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"
-    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveEnabled":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,' \
-      "$batch" "$batch_calls" "$batch_rows" "$journal" "$archive_enabled" "${interval:-null}" "${hot_retention:-null}" "$delete_hot" "${grace:-null}"
-    printf '"packagedDefaults":{"archiveEnabled":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"rollbackGraceDays":%s,"deleteHotAfterArchive":%s,"videoRetentionDays":%s,"videoQueryPeriodMinutes":%s,"maximumCatchUpHours":%s,"lateArrivalOverlapHours":%s,"lateArrivalScanPeriodMinutes":%s,"lateArrivalCatchUpHours":%s,"reconciliationCatchUpHours":%s,"reconciliationPeriodHours":%s,"occupancyStreamRefreshMinutes":%s,"retainedFrameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s,"maintenanceWorkLimit":%s,"frameRetentionEnabled":%s,"sealedJournalRetentionDays":%s,"requireBackupBeforeSealedJournalDeletion":%s},' \
-      "$packaged_archive_enabled" "$packaged_archive_interval" "$packaged_hot_retention" "$packaged_grace" "$packaged_delete_hot" \
+    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveEnabled":%s,"storageMode":"%s","parquetPrimaryArchiveDelayMinutes":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,"maximumGenerationsPerCycle":%s,"maximumVerificationsPerCycle":%s,"maximumDeletionsPerCycle":%s,"outputNames":%s,"observationIndexes":%s,' \
+      "$batch" "$batch_calls" "$batch_rows" "$journal" "$archive_enabled" "$storage_mode" \
+      "${primary_archive_delay:-null}" "${interval:-null}" "${hot_retention:-null}" "$delete_hot" \
+      "${grace:-null}" "${max_generations:-null}" "${max_verifications:-null}" \
+      "${max_deletions:-null}" "$output_names_json" "$observation_indexes"
+    printf '"packagedDefaults":{"archiveEnabled":%s,"storageMode":"%s","parquetPrimaryArchiveDelayMinutes":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"rollbackGraceDays":%s,"maximumGenerationsPerCycle":%s,"maximumVerificationsPerCycle":%s,"maximumDeletionsPerCycle":%s,"outputNames":%s,"deleteHotAfterArchive":%s,"videoRetentionDays":%s,"videoQueryPeriodMinutes":%s,"maximumCatchUpHours":%s,"lateArrivalOverlapHours":%s,"lateArrivalScanPeriodMinutes":%s,"lateArrivalCatchUpHours":%s,"reconciliationCatchUpHours":%s,"reconciliationPeriodHours":%s,"occupancyStreamRefreshMinutes":%s,"retainedFrameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s,"maintenanceWorkLimit":%s,"frameRetentionEnabled":%s,"sealedJournalRetentionDays":%s,"requireBackupBeforeSealedJournalDeletion":%s},' \
+      "$packaged_archive_enabled" "$packaged_storage_mode" "$packaged_primary_archive_delay" \
+      "$packaged_archive_interval" "$packaged_hot_retention" "$packaged_grace" \
+      "$packaged_max_generations" "$packaged_max_verifications" "$packaged_max_deletions" \
+      "$packaged_output_names_json" "$packaged_delete_hot" \
       "$packaged_media_retention" "$packaged_media_query_period" "$packaged_media_maximum_catch_up" \
       "$packaged_media_late_arrival_overlap" "$packaged_media_late_arrival_scan_period" \
       "$packaged_media_late_arrival_catch_up" "$packaged_media_reconciliation_catch_up" \
@@ -2635,6 +2700,11 @@ COMMANDS
     SELECT json_build_object('exists',EXISTS(SELECT 1 FROM f),'generationId',(SELECT id FROM g),'generationState',(SELECT state FROM g),
       'parityVerified',coalesce((SELECT parity_verified FROM g),false),'generationRows',coalesce((SELECT row_count FROM g),0),
       'generationMinId',(SELECT min_id::text FROM g),'generationMaxId',(SELECT max_id::text FROM g),
+      'windowStart',(SELECT window_start FROM g),'windowEnd',(SELECT window_end FROM g),
+      'completedHourWindow',coalesce((SELECT window_start=date_trunc('hour',window_start)
+        AND window_end=window_start+interval '1 hour' FROM g),false),
+      'fixtureWithinWindow',coalesce((SELECT f.cold_time>=g.window_start
+        AND f.cold_time<g.window_end FROM f,g),false),
       'markedRows',coalesce((SELECT count(*) FROM obs o,g WHERE o.archivegenerationid=g.id),0),
       'fixtureColdMarked',coalesce((SELECT count(*) FROM obs o,g
         WHERE o.id IN (SELECT unnest(cold_ids) FROM f) AND o.archivegenerationid=g.id),0)

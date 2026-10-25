@@ -536,15 +536,35 @@ export interface StoragePlatformProbe {
   batchRewriteObservedRows: number;
   dailyJournalConfigured: boolean;
   archiveEnabled: boolean | null;
+  storageMode: string;
+  parquetPrimaryArchiveDelayMinutes: number | null;
   archiveIntervalMinutes: number | null;
   hotRetentionDays: number | null;
   deleteHotAfterArchive: boolean | null;
   rollbackGraceDays: number | null;
+  maximumGenerationsPerCycle: number | null;
+  maximumVerificationsPerCycle: number | null;
+  maximumDeletionsPerCycle: number | null;
+  outputNames: string[];
+  observationIndexes: {
+    genericPayloadGinAbsent: boolean;
+    requiredCount: number;
+    requiredPresent: number;
+    missingNames: string[];
+    eventPathGinExact: boolean;
+    numericEventIndexesExact: boolean;
+  };
   packagedDefaults: {
     archiveEnabled: boolean | null;
+    storageMode: string;
+    parquetPrimaryArchiveDelayMinutes: number | null;
     archiveIntervalMinutes: number | null;
     hotRetentionDays: number | null;
     rollbackGraceDays: number | null;
+    maximumGenerationsPerCycle: number | null;
+    maximumVerificationsPerCycle: number | null;
+    maximumDeletionsPerCycle: number | null;
+    outputNames: string[];
     deleteHotAfterArchive: boolean | null;
     videoRetentionDays: number | null;
     videoQueryPeriodMinutes: number | null;
@@ -726,11 +746,14 @@ function helperIdentity(value: unknown, field: string): StorageHelperIdentity {
   };
 }
 
-function stringArray(value: unknown, field: string): string[] {
-  if (!Array.isArray(value) || value.some(item => typeof item !== "string")) {
-    throw new Error(`${field} must be an array of strings`);
+function stringArray(value: unknown, field: string, maximum = 64): string[] {
+  if (!Array.isArray(value) || value.length > maximum ||
+      value.some(item => typeof item !== "string" || !item.trim())) {
+    throw new Error(`${field} must be an array of at most ${maximum} non-empty strings`);
   }
-  return value as string[];
+  const result = value as string[];
+  if (new Set(result).size !== result.length) throw new Error(`${field} contains duplicates`);
+  return result;
 }
 
 function imageIdentity(value: unknown, field: string): StorageImageIdentity {
@@ -928,19 +951,43 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
     ),
     dailyJournalConfigured: probe.dailyJournalConfigured === true,
     archiveEnabled: typeof probe.archiveEnabled === "boolean" ? probe.archiveEnabled : null,
+    storageMode: text(probe.storageMode, "storageMode"),
+    parquetPrimaryArchiveDelayMinutes: nullableNumber(probe.parquetPrimaryArchiveDelayMinutes),
     archiveIntervalMinutes: nullableNumber(probe.archiveIntervalMinutes),
     hotRetentionDays: nullableNumber(probe.hotRetentionDays),
     deleteHotAfterArchive: typeof probe.deleteHotAfterArchive === "boolean"
       ? probe.deleteHotAfterArchive : null,
     rollbackGraceDays: nullableNumber(probe.rollbackGraceDays),
+    maximumGenerationsPerCycle: nullableNumber(probe.maximumGenerationsPerCycle),
+    maximumVerificationsPerCycle: nullableNumber(probe.maximumVerificationsPerCycle),
+    maximumDeletionsPerCycle: nullableNumber(probe.maximumDeletionsPerCycle),
+    outputNames: stringArray(probe.outputNames, "outputNames"),
+    observationIndexes: (() => {
+      const indexes = object(probe.observationIndexes, "observationIndexes");
+      return {
+        genericPayloadGinAbsent: indexes.genericPayloadGinAbsent === true,
+        requiredCount: integer(indexes.requiredCount, "observationIndexes.requiredCount", 1),
+        requiredPresent: integer(indexes.requiredPresent, "observationIndexes.requiredPresent"),
+        missingNames: stringArray(indexes.missingNames, "observationIndexes.missingNames"),
+        eventPathGinExact: indexes.eventPathGinExact === true,
+        numericEventIndexesExact: indexes.numericEventIndexesExact === true,
+      };
+    })(),
     packagedDefaults: (() => {
       const defaults = object(probe.packagedDefaults, "packagedDefaults");
       return {
         archiveEnabled: typeof defaults.archiveEnabled === "boolean"
           ? defaults.archiveEnabled : null,
+        storageMode: text(defaults.storageMode, "packagedDefaults.storageMode"),
+        parquetPrimaryArchiveDelayMinutes:
+          nullableNumber(defaults.parquetPrimaryArchiveDelayMinutes),
         archiveIntervalMinutes: nullableNumber(defaults.archiveIntervalMinutes),
         hotRetentionDays: nullableNumber(defaults.hotRetentionDays),
         rollbackGraceDays: nullableNumber(defaults.rollbackGraceDays),
+        maximumGenerationsPerCycle: nullableNumber(defaults.maximumGenerationsPerCycle),
+        maximumVerificationsPerCycle: nullableNumber(defaults.maximumVerificationsPerCycle),
+        maximumDeletionsPerCycle: nullableNumber(defaults.maximumDeletionsPerCycle),
+        outputNames: stringArray(defaults.outputNames, "packagedDefaults.outputNames"),
         deleteHotAfterArchive: typeof defaults.deleteHotAfterArchive === "boolean"
           ? defaults.deleteHotAfterArchive : null,
         videoRetentionDays: nullableNumber(defaults.videoRetentionDays),

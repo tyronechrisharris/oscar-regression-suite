@@ -93,6 +93,12 @@ function structuralStorageFixtureAccepted(value: unknown): boolean {
     typeof media.enableFrameRetention === "boolean" &&
     typeof media.frameRetentionCount === "number" &&
     typeof db.useBatch === "boolean" && db.useBatch === true &&
+    archive.storageMode === "PARQUET_PRIMARY" &&
+    typeof archive.parquetPrimaryArchiveDelayMinutes === "number" &&
+    typeof archive.maximumGenerationsPerCycle === "number" &&
+    typeof archive.maximumVerificationsPerCycle === "number" &&
+    typeof archive.maximumDeletionsPerCycle === "number" &&
+    Array.isArray(archive.outputNames) && archive.outputNames.length === 5 &&
     typeof archive.hotRetentionDays === "number" &&
     typeof archive.deleteHotAfterArchive === "boolean" &&
     typeof daily[0]!.maxSegmentBytes === "number";
@@ -446,7 +452,11 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
     "duckDbMemoryLimitMegabytes", "duckDbThreads", "duckDbMaximumTemporaryMegabytes",
     "duckDbMaximumConcurrentSessions", "duckDbSessionAcquireTimeoutSeconds",
     "duckDbTemporaryDirectory", "archiveResources", "schemaChecksum", "archiveScratch",
-    "archiveEnabled", "hotRetentionDays", "packagedDefaults", "/opt/oscar/config.json",
+    "archiveEnabled", "storageMode", "PARQUET_PRIMARY", "parquetPrimaryArchiveDelayMinutes",
+    "maximumGenerationsPerCycle", "maximumVerificationsPerCycle", "maximumDeletionsPerCycle",
+    "outputNames", "observationIndexes", "genericPayloadGinAbsent", "obs_data_idx",
+    "obs_result_path_ops_idx", "numericEventIndexesExact",
+    "hotRetentionDays", "packagedDefaults", "/opt/oscar/config.json",
     "dailyJournal", "rootDirectory", "journalDirectory", "publicationDirectory",
     "dailyFileObservationMode", "fsyncIntervalMillis", "maxUnforcedRecords", "maxUnforcedBytes",
     "maxSegmentBytes", "maxSegmentAgeSeconds", "maxRecordBytes", "sealedJournalRetentionDays",
@@ -467,7 +477,11 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
   const database = {objClass: "org.sensorhub.impl.database.system.SystemDriverDatabaseConfig",
     moduleClass: "org.sensorhub.impl.database.system.SystemDriverDatabase",
     dbConfig: {objClass: "org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig",
-      useBatch: true, archive: {hotRetentionDays: 2, deleteHotAfterArchive: true}}};
+      useBatch: true, archive: {storageMode: "PARQUET_PRIMARY",
+        parquetPrimaryArchiveDelayMinutes: 5, maximumGenerationsPerCycle: 2,
+        maximumVerificationsPerCycle: 2, maximumDeletionsPerCycle: 2,
+        outputNames: ["gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"],
+        hotRetentionDays: 2, deleteHotAfterArchive: true}}};
   const valid = [daily, oscar, database];
   assert.equal(structuralStorageFixtureAccepted(valid), true);
   assert.equal(structuralStorageFixtureAccepted([
@@ -495,6 +509,28 @@ test("archive health aggregates generations independently from archive objects",
   assert.match(block, /archivePartialArtifacts/);
   assert.match(block, /walPartialArtifacts/);
   assert.equal(block.match(/'activeHolds'/g)?.length, 1, "archive-health JSON must contain activeHolds once");
+});
+
+test("storage gates require the shipped Parquet-primary policy and fresh index catalog", () => {
+  const storageStart = scenarios.indexOf("private async storageHealth");
+  const storageEnd = scenarios.indexOf("private async storageRestoreDrill", storageStart);
+  const block = scenarios.slice(storageStart, storageEnd);
+  for (const required of [
+    'storageMode: "PARQUET_PRIMARY"',
+    "parquetPrimaryArchiveDelayMinutes: 5",
+    "archiveIntervalMinutes: 5",
+    "rollbackGraceDays: 3",
+    "maximumGenerationsPerCycle: 2",
+    "maximumVerificationsPerCycle: 2",
+    "maximumDeletionsPerCycle: 2",
+    '"gammaCounts"', '"gammaThreshold"', '"neutronCounts"', '"setupGamma"', '"setupNeutron"',
+    "REGRESSION_ARCHIVE_POLICY", "PARQUET_PRIMARY_OUTPUT_NAMES",
+    "genericPayloadGinAbsent", "requiredPresent === indexes.requiredCount",
+    "eventPathGinExact", "numericEventIndexesExact", "completedHourWindow", "fixtureWithinWindow",
+  ]) assert.ok(block.includes(required) || scenarios.includes(required),
+    `missing Parquet-primary release gate: ${required}`);
+  assert.doesNotMatch(block, /archiveIntervalMinutes:\s*60/);
+  assert.doesNotMatch(block, /rollbackGraceDays:\s*1[\s\S]{0,100}SHIPPING_STORAGE_POLICY/);
 });
 
 test("journal status validates exact bounded v1 manifests and direct lane state", () => {
@@ -1143,9 +1179,10 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
   ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
   const idle = probe.slice(probe.indexOf("archive_maintenance_idle_json()"), probe.indexOf("case $action in"));
   for (const required of [
-    "hotRetentionDays", "rollbackGraceDays", "outputNames", "eligible_unowned_rows",
+    "storageMode", "PARQUET_PRIMARY", "parquetPrimaryArchiveDelayMinutes",
+    "rollbackGraceDays", "outputNames", "eligible_unowned_rows",
     "JOIN obs_datastreams d", "o.archivegenerationid IS NULL", "LIMIT 1",
-    "make_interval(days=>c.hot_retention_days)",
+    "date_trunc('hour',now()-make_interval(mins=>c.primary_archive_delay_minutes))",
     "make_interval(days=>c.rollback_grace_days)",
   ]) assert.ok(idle.includes(required), `missing bounded deployed-config idle contract: ${required}`);
   const holdCreate = block.indexOf('"fixture-hot-hold-create"');

@@ -136,25 +136,44 @@ linked, or non-regular `oscar.sh`. The exact Viewer host, SSH target, and
 canonical release path are rechecked before every probe action. Probe files and
 command captures use a fresh mode-0700 private workspace with mode-0600 files.
 
-The target must use the regression-only accelerated archive profile:
-`hotRetentionDays=1`, `intervalMinutes=1`, `rollbackGraceDays=1`, and
-`deleteHotAfterArchive=true`; set `STORAGE_HOT_RETENTION_DAYS=1` so the live
-expectation matches. Never copy the one-day archive eligibility or one-minute
-scheduler interval into production. The platform gate separately reads
-`/opt/oscar/config.json` and requires the shipping policy: two-day archive
-eligibility, one-day rollback grace, verified hot-row deletion enabled, and
-immediate asynchronous five-JPEG media eligibility with a 24-hour source-video
-rollback grace. The archive eligibility plus grace makes the
-normal hot-row deletion boundary approximately 72 hours.
+The target must use a fresh database and the regression-only accelerated archive
+profile: `storageMode=PARQUET_PRIMARY`,
+`parquetPrimaryArchiveDelayMinutes=1`, `intervalMinutes=1`,
+`maximumGenerationsPerCycle=2`, `maximumVerificationsPerCycle=2`,
+`maximumDeletionsPerCycle=2`, `rollbackGraceDays=1`, and
+`deleteHotAfterArchive=true`. Its exact allowlist is `gammaCounts`,
+`gammaThreshold`, `neutronCounts`, `setupGamma`, and `setupNeutron`; mutable
+occupancy/alarm/adjudication outputs are intentionally not Parquet-primary. Set
+`STORAGE_HOT_RETENTION_DAYS=1` so the compatibility field matches the live test
+configuration, but do not interpret that field as primary-mode eligibility.
+The accelerated worker still exports completed UTC-hour windows; it does not
+create one Parquet object per observation or acknowledge writes directly to
+Parquet.
+
+Never copy the one-minute test timing or one-day activation grace into
+production. The platform gate separately reads `/opt/oscar/config.json` and
+requires the shipping policy: `PARQUET_PRIMARY`, a five-minute completed-hour
+delay, a five-minute worker interval, 2/2/2 export/verification/deletion caps,
+three days of verified overlap from generation activation, exact five-output
+allowlisting, and hot-row deletion enabled. A completed hour normally gets its
+first publication opportunity shortly after the delay, but activation may be
+later under bounded backlog or failure. Hot-row retirement is no sooner than
+three days after successful activation; it is not a 72-hour deadline measured
+from observation arrival. The gate also verifies the fresh table omits the
+generic `GIN(result)` index while retaining the path/numeric event indexes and
+the natural-key, stream/time, identity, and archive-lifecycle indexes needed by
+hot transactional workflows. Five-JPEG publication remains immediate and
+asynchronous, with source MP4 deletion eligible only after 24 hours from a
+verified publication.
 
 The lifecycle fixture also remains isolated on a populated disposable test
 catalog. It selects a complete UTC-hour window at least two hours before the
-earliest existing archive generation or job window, while remaining older than
-the configured hot-retention threshold. Its deletion cutoff therefore cannot
-select later pre-existing generations. Before taking the guarded-delete metric
+earliest existing archive generation or job window and proves the activated
+generation is exactly one aligned UTC hour containing the fixture. Its deletion
+cutoff therefore cannot select later pre-existing generations. Before taking the guarded-delete metric
 baseline, the suite additionally requires three clean samples spanning a
 maintenance/delete polling interval: no active export, no latest failed retry,
-no allowlisted unowned row older than the deployed hot-retention cutoff, no
+no allowlisted unowned row older than the deployed completed-hour cutoff, no
 generation with hot rows older than the deployed rollback grace, and an empty
 DuckDB operation inventory with only the validated permanent lease present. The
 exact-generation plan, hold, confirmation-token,

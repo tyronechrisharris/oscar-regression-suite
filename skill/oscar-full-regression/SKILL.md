@@ -143,10 +143,22 @@ values `timeToRetention=0`, `videoQueryPeriod=1`,
 `enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
 `sourceRollbackGraceHours=24`, with `metadataReclamationWorkLimit=200`, while
 preserving its other fields. Require the archive test profile documented by the
-suite (`intervalMinutes=1`, `rollbackGraceDays=1`,
-`deleteHotAfterArchive=true`). Do not edit the packaged defaults to satisfy this
-gate: production media aging remains seven days and the production archive
-policy remains conservative.
+suite: a fresh database with `storageMode=PARQUET_PRIMARY`,
+`parquetPrimaryArchiveDelayMinutes=1`, `intervalMinutes=1`, 2/2/2 maximum
+generation/verification/deletion work, `rollbackGraceDays=1`,
+`deleteHotAfterArchive=true`, and exactly `gammaCounts`, `gammaThreshold`,
+`neutronCounts`, `setupGamma`, and `setupNeutron`. Mutable occupancy, alarm,
+and adjudication outputs remain PostgreSQL-backed. Require the actual fresh
+observation index catalog to omit the generic payload GIN while retaining the
+required event, natural-key, stream/time, identity, and lifecycle indexes.
+Do not edit packaged defaults to satisfy this gate: shipping uses the same
+explicit mode and five-output allowlist, a five-minute completed-hour delay,
+a five-minute worker interval, 2/2/2 work caps, and three days of verified hot
+overlap measured from activation. Parquet activation can be later under bounded
+backlog; PostgreSQL retirement is no sooner than that activation-relative grace,
+not a 72-hour deadline from observation arrival. Five-JPEG publication remains
+asynchronous, and source MP4 deletion remains eligible only 24 hours after a
+verified publication.
 The retained-media worker reads this configuration at OSCAR startup. After
 saving the accelerated profile, use the supported OSCAR restart and require the
 `retention-runtime-health` preflight to report a valid schema-1 scan checkpoint
