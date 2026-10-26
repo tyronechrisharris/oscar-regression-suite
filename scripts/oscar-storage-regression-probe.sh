@@ -2220,21 +2220,21 @@ COMMANDS
           coalesce(to_char(min(received_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),''),
           coalesce(extract(epoch FROM clock_timestamp()-min(received_at))::bigint,0),
           count(*) FILTER (WHERE archivegenerationid IS NOT NULL),
-          count(*) FILTER (WHERE EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner
-            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
-              AND owner.child_table='$child_table' AND owner.observation_id=stage.id)),
-          count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner
-            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
-              AND owner.child_table='$child_table' AND owner.observation_id=stage.id)),
-          count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_storage_route route
-            WHERE route.store_key='$store_key' AND route.id_scope=$id_scope
-              AND route.datastream_id=stage.datastreamid AND route.immutable)),
+          count(*) FILTER (WHERE owner.observation_id IS NOT NULL),
+          count(*) FILTER (WHERE owner.observation_id IS NULL),
+          count(*) FILTER (WHERE NOT coalesce(route.immutable,false)),
           (SELECT count(*) FROM oscar_obs_stage_owner owner
             WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
               AND owner.child_table='$child_table'
               AND NOT EXISTS (SELECT 1 FROM $child_table physical
                 WHERE physical.id=owner.observation_id))
-        FROM $child_table stage;" 2>/dev/null | tail -n 1 || true)
+        FROM $child_table stage
+        LEFT JOIN oscar_obs_stage_owner owner
+          ON owner.store_key='$store_key' AND owner.id_scope=$id_scope
+          AND owner.child_table='$child_table' AND owner.observation_id=stage.id
+        LEFT JOIN oscar_obs_storage_route route
+          ON route.store_key='$store_key' AND route.id_scope=$id_scope
+          AND route.datastream_id=stage.datastreamid;" 2>/dev/null | tail -n 1 || true)
       IFS='|' read -r child_rows child_oldest child_age child_markers child_owned child_unowned \
         child_route_mismatch child_missing_owners child_extra <<<"$child_metrics"
       if [[ -n ${child_extra:-} || ! $child_rows =~ ^[0-9]+$ || ! $child_age =~ ^[0-9]+$ ||
@@ -2802,17 +2802,6 @@ COMMANDS
           RETURN;
         END;
         LOOP
-          EXECUTE 'SELECT count(*),
-            count(*) FILTER (WHERE NOT EXISTS (
-              SELECT 1 FROM oscar_obs_stage_owner owner
-              WHERE owner.store_key=''$store_key'' AND owner.id_scope=$id_scope
-                AND owner.child_table=''$child_table'' AND owner.observation_id=stage.id)),
-            (SELECT count(*) FROM oscar_obs_stage_owner owner
-              WHERE owner.store_key=''$store_key'' AND owner.id_scope=$id_scope
-                AND owner.child_table=''$child_table''
-                AND NOT EXISTS (SELECT 1 FROM $child_table stage WHERE stage.id=owner.observation_id))
-            FROM $child_table stage'
-            INTO stage_rows, unowned_stage_rows, missing_physical_owners;
           SELECT count(*),count(DISTINCT owner.generation_id),
             count(*) FILTER (WHERE generation.id IS NULL
               OR generation.store_key<>'$store_key' OR generation.id_scope<>$id_scope
@@ -2838,6 +2827,21 @@ COMMANDS
           JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
           WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
             AND owner.child_table='$child_table' AND owner.observation_id=$cold_id;
+          IF (owner_rows=$expected_rows AND owner_generations>0 AND invalid_owner_generations=0
+              AND owner_generation_rows=owner_rows AND selected_generation_id IS NOT NULL
+              AND selected_generation_state IN ('ACTIVE','SEALED')
+              AND selected_generation_parity)
+             OR clock_timestamp()>=deadline THEN
+            EXECUTE 'SELECT count(stage.id),
+              count(stage.id) FILTER (WHERE owner.observation_id IS NULL),
+              count(owner.observation_id) FILTER (WHERE stage.id IS NULL)
+              FROM (SELECT id FROM $child_table) stage
+              FULL JOIN (
+                SELECT observation_id FROM oscar_obs_stage_owner
+                WHERE store_key=''$store_key'' AND id_scope=$id_scope AND child_table=''$child_table''
+              ) owner ON owner.observation_id=stage.id'
+              INTO stage_rows, unowned_stage_rows, missing_physical_owners;
+          END IF;
           full_ownership := stage_rows=$expected_rows AND owner_rows=stage_rows
             AND unowned_stage_rows=0 AND missing_physical_owners=0
             AND owner_generations>0 AND invalid_owner_generations=0
