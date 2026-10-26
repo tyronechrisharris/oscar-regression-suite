@@ -2772,6 +2772,7 @@ COMMANDS
       BEGIN;
       SET LOCAL client_min_messages=notice;
       SET LOCAL lock_timeout='2s';
+      SET LOCAL work_mem='64MB';
       DO \$stage_witness\$
       DECLARE
         deadline timestamptz := clock_timestamp()+make_interval(secs=>$wait_seconds);
@@ -2802,31 +2803,36 @@ COMMANDS
           RETURN;
         END;
         LOOP
-          SELECT count(*),count(DISTINCT owner.generation_id),
-            count(*) FILTER (WHERE generation.id IS NULL
-              OR generation.store_key<>'$store_key' OR generation.id_scope<>$id_scope
-              OR generation.state NOT IN ('ACTIVE','SEALED')
-              OR NOT generation.parity_verified)
-          INTO owner_rows,owner_generations,invalid_owner_generations
-          FROM oscar_obs_stage_owner owner
-          LEFT JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
-          WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
-            AND owner.child_table='$child_table';
-          SELECT coalesce(sum(exact.row_count),0),
-            coalesce(jsonb_agg(exact.id ORDER BY exact.id),'[]'::jsonb)
-          INTO owner_generation_rows,generation_ids
-          FROM (SELECT generation.id::text id,max(generation.row_count) row_count
-            FROM oscar_obs_stage_owner owner
-            JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
-            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
-              AND owner.child_table='$child_table'
-            GROUP BY generation.id) exact;
           SELECT generation.id::text,generation.state,generation.parity_verified
           INTO selected_generation_id,selected_generation_state,selected_generation_parity
           FROM oscar_obs_stage_owner owner
           JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
           WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
             AND owner.child_table='$child_table' AND owner.observation_id=$cold_id;
+          IF (selected_generation_id IS NOT NULL
+              AND selected_generation_state IN ('ACTIVE','SEALED')
+              AND selected_generation_parity)
+             OR clock_timestamp()>=deadline THEN
+            SELECT count(*),count(DISTINCT owner.generation_id),
+              count(*) FILTER (WHERE generation.id IS NULL
+                OR generation.store_key<>'$store_key' OR generation.id_scope<>$id_scope
+                OR generation.state NOT IN ('ACTIVE','SEALED')
+                OR NOT generation.parity_verified)
+            INTO owner_rows,owner_generations,invalid_owner_generations
+            FROM oscar_obs_stage_owner owner
+            LEFT JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
+            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+              AND owner.child_table='$child_table';
+            SELECT coalesce(sum(exact.row_count),0),
+              coalesce(jsonb_agg(exact.id ORDER BY exact.id),'[]'::jsonb)
+            INTO owner_generation_rows,generation_ids
+            FROM (SELECT generation.id::text id,max(generation.row_count) row_count
+              FROM oscar_obs_stage_owner owner
+              JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
+              WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+                AND owner.child_table='$child_table'
+              GROUP BY generation.id) exact;
+          END IF;
           IF (owner_rows=$expected_rows AND owner_generations>0 AND invalid_owner_generations=0
               AND owner_generation_rows=owner_rows AND selected_generation_id IS NOT NULL
               AND selected_generation_state IN ('ACTIVE','SEALED')
