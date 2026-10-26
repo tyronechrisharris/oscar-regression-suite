@@ -417,11 +417,6 @@ archive_scratch_inventory() {
     chmod 700 "$work"
     cleanup() { rm -rf -- "$work"; }
     trap cleanup EXIT HUP INT TERM
-    find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
-    LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
-    find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
-    LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
-    cmp -s "$work/first.sorted" "$work/second.sorted" || exit 25
     validator="$work/validator.sh"
     cat >"$validator" <<\OSCAR_SCRATCH_CHILD
 root=$1
@@ -439,19 +434,41 @@ for child do
   esac
   printf "%s\n" "$name" |
     grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" || exit 31
+  [ -e "$child" ] || [ -L "$child" ] || exit 25
   [ -d "$child" ] && [ ! -L "$child" ] || exit 32
-  real_child=$(realpath -e -- "$child")
+  real_child=$(realpath -e -- "$child") || exit 25
   [ "$(dirname -- "$real_child")" = "$root" ] || exit 33
   printf "%s\n" "$name"
 done
 OSCAR_SCRATCH_CHILD
     chmod 600 "$validator"
-    if [ -s "$work/second.sorted" ]; then
-      xargs -0 -r sh -eu "$validator" "$root" "$lease" \
-        <"$work/second.sorted" >"$work/operations"
-    else
-      : >"$work/operations"
-    fi
+    attempt=0
+    while :; do
+      attempt=$((attempt+1))
+      find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
+      LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
+      find "$root" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
+      LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
+      if ! cmp -s "$work/first.sorted" "$work/second.sorted"; then
+        [ "$attempt" -lt 50 ] || { cmp -s "$work/first.sorted" "$work/second.sorted" || exit 25; }
+        sleep 0.1
+        continue
+      fi
+      if [ -s "$work/second.sorted" ]; then
+        if xargs -0 -r sh -eu "$validator" "$root" "$lease" \
+             <"$work/second.sorted" >"$work/operations"; then
+          break
+        else
+          rc=$?
+          [ "$attempt" -lt 50 ] || exit "$rc"
+          sleep 0.1
+          continue
+        fi
+      else
+        : >"$work/operations"
+        break
+      fi
+    done
     [ "$(stat -c %d:%i -- "$root")" = "$root_identity" ] &&
       [ "$(stat -c %u:%g:%a -- "$root")" = 10001:10001:700 ] &&
       [ "$(stat -c %d:%i -- "$lease")" = "$lease_identity" ] &&
