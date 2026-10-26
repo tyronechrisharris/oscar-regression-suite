@@ -37,7 +37,7 @@ compose() {
 psql_admin() {
   compose exec -T postgres sh -eu -c '
     PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password)
-    PGOPTIONS='-csearch_path=oscar,public -ctimezone=UTC'
+    PGOPTIONS="-csearch_path=oscar,public -ctimezone=UTC"
     export PGPASSWORD PGOPTIONS
     exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"
   ' psql-wrapper "$@"
@@ -260,7 +260,7 @@ SELECT concat_ws('|',
   archive->>'immutableStageWindowMinutes', archive->>'maximumFuturePhenomenonSkewMinutes',
   archive->>'parquetPrimaryIntervalMinutes', archive->>'maximumStagePartitionsPerCycle',
   archive->>'maximumGenerationsPerCycle', archive->>'maximumVerificationsPerCycle',
-  archive->>'maximumDeletionsPerCycle', (archive->'outputNames')::text)
+  archive->>'maximumDeletionsPerCycle', (archive->'outputNames')::jsonb::text)
 FROM valid;
 SQL
   } | psql_admin --quiet --tuples-only --no-align | tail -n 1
@@ -2093,13 +2093,18 @@ COMMANDS
       FROM pg_stat_statements,current_db WHERE dbid=current_db.oid
         AND query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+((oscar|public)[.])?obs([[:space:]]|[(])'),
     statement_io AS (SELECT coalesce(sum(temp_blks_written),0) temp_blocks,
-        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'),0) delete_calls,
-        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'),0) delete_rows,
         coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'),0) delete_calls,
+        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'),0) delete_rows,
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
           AND query ~* 'id[[:space:]]*=[[:space:]]*[$][0-9]+' AND query !~* 'any[[:space:]]*[(]'),0) singleton_delete_calls,
         coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
           AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_calls,
         coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
           AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_rows
       FROM pg_stat_statements,current_db WHERE dbid=current_db.oid),
     catalog AS (SELECT count(*) FILTER(WHERE state='ACTIVE') active,count(*) FILTER(WHERE state='SEALED') sealed,coalesce(sum(row_count),0) rows FROM oscar_archive_generation),
