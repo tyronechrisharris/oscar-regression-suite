@@ -8,6 +8,11 @@ description: Deploy, run, diagnose, and report the OSCAR end-to-end regression s
 Run the repository-backed harness instead of improvising one-off browser or curl
 checks. Preserve its evidence and restore the reserved RPM even when a test fails.
 
+For soak, endurance, sustained-load, or memory-leak requests, use the separate
+`oscar-soak-test` skill and use this skill only for its before/after functional
+baseline. Do not describe this suite's ordinary smoke/full runtime as soak
+certification.
+
 ## Non-negotiable safety rules
 
 - Treat the full profile as test-lab-only. It stops/restarts one RPM, replaces its
@@ -34,15 +39,16 @@ checks. Preserve its evidence and restore the reserved RPM even when a test fail
   SSH target to resolve the configured release as an existing, non-root,
   non-symlink directory containing a regular non-symlink `oscar.sh`; revalidate
   that binding for every action.
-- Treat `storage-lifecycle` as a second mutation boundary: require a fresh 3.9.2
-  test database and the
-  probe's one-generation purge guard. Never run it on production/physical lanes
-  and never add a restore step to the ordinary regression run.
+- Treat `storage-lifecycle` as a second controlled boundary: require a fresh
+  3.9.2 test database. Its Parquet-primary stage/retirement/retrieval probes are
+  read-only and observe naturally ingested emulator data; portable export and
+  the supported restart still mutate service state. Never run it on
+  production/physical lanes and never add a restore step to the ordinary run.
 - Treat `restore-drill` as a distinct destructive profile. It is never part of
   smoke/full and requires the exact target/storage acknowledgements plus the
   restore-specific path binding documented in `docs/STORAGE_REGRESSION.md`.
   Require both `STORAGE_WORKFLOW=required` and
-  `STORAGE_BACKUP_WORKFLOW=required`, plus `OSCAR_BACKUP_MODE=single`. Run it and the matching
+  `STORAGE_BACKUP_WORKFLOW=required`. Run it and the matching
   `3.9.2-release` only from the same available, committed, clean canonical
   40-hex suite HEAD; ignored `.env` and `results/` remain permitted.
   Require the two canonical archive/backup paths and exact path
@@ -117,12 +123,7 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    merely to obtain a pass.
 
 For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
-`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, and set the
-expected `OSCAR_BACKUP_MODE` (`disabled` is the product and suite default). In
-disabled mode require inactive PostgreSQL archiving, no external WAL bind, and
-exact fail-before-mutation behavior. In single mode require one authenticated
-schema-v2 CURRENT snapshot with streamed WAL and no cumulative WAL tar. Run
-`storage-health` after an overnight daily-file
+`STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
 rotation and a configured retained-media fixture for smoke/non-lifecycle coverage,
 then run the full `storage-lifecycle` only on its separately acknowledged
 disposable database. A full run can self-seed its retained-media proof from the
@@ -140,51 +141,65 @@ permitted compatibility fallback.
 Before mutation, require the running OSCAR service's persisted
 `videoRetentionConfig` to contain exactly the regression-only acceleration
 values `timeToRetention=0`, `videoQueryPeriod=1`,
-`enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`, and
-`sourceRollbackGraceHours=24`, with `metadataReclamationWorkLimit=200`, while
+`enableFrameRetention=true`, `frameRetentionCount=5`, `jpegQuality=85`,
+`sourceRollbackGraceHours=24`, `maximumCatchUpHours=6`,
+`lateArrivalOverlapHours=24`, `lateArrivalScanPeriodMinutes=360`,
+`lateArrivalCatchUpHours=2`, `reconciliationCatchUpHours=24`,
+`reconciliationPeriodHours=24`, `occupancyStreamRefreshMinutes=15`, and
+`metadataReclamationWorkLimit=200`, while
 preserving its other fields. Require the archive test profile documented by the
 suite: a fresh database with `storageMode=PARQUET_PRIMARY`,
-`parquetPrimaryArchiveDelayMinutes=1`, `intervalMinutes=1`, 2/2/2 maximum
-generation/verification/deletion work, `rollbackGraceDays=1`,
+`immutableStageWindowMinutes=30`, `parquetPrimaryArchiveDelayMinutes=5`,
+`parquetPrimaryIntervalMinutes=1`, `maximumFuturePhenomenonSkewMinutes=5`,
+`maximumStagePartitionsPerCycle=8`, 2/2/2 maximum
+generation/verification/compatibility-deletion work,
 `deleteHotAfterArchive=true`, and exactly `gammaCounts`, `gammaThreshold`,
 `neutronCounts`, `setupGamma`, and `setupNeutron`. Mutable occupancy, alarm,
 and adjudication outputs remain PostgreSQL-backed. Require the actual fresh
-observation index catalog to omit the generic payload GIN while retaining the
-required event, natural-key, stream/time, identity, and lifecycle indexes.
-Do not edit packaged defaults to satisfy this gate: shipping uses the same
-explicit mode and five-output allowlist, a five-minute completed-hour delay,
-a five-minute worker interval, 2/2/2 work caps, and three days of verified hot
-overlap measured from activation. Parquet activation can be later under bounded
-backlog; PostgreSQL retirement is no sooner than that activation-relative grace,
-not a 72-hour deadline from observation arrival. Five-JPEG publication remains
-asynchronous, and source MP4 deletion remains eligible only 24 hours after a
-verified publication.
+observation index catalog to omit both the generic payload GIN and the legacy
+archive-generation index while retaining the mutable-event and identity/time
+indexes. Require stage health to report exact attached/detached children,
+oldest receipt age, sidecar ownership, no missing/orphan ownership, NULL legacy
+markers, and no immutable rows in the parent. The nominal budget is
+`30 + 5 + 1 + 5 = 41` minutes and the operational SLO is one hour; failure or
+backlog must preserve the LOGGED child. Atomic Parquet publication, re-hash,
+row/UUID parity, and exact ownership across every capped generation must precede
+transactional detach and whole-child drop. `hotRetentionDays`,
+`intervalMinutes`, `rollbackGraceDays`, and row-deletion caps remain
+`HOT_RETENTION` compatibility controls, not primary-mode retirement clocks.
+Five-JPEG publication remains asynchronous, and source MP4 deletion remains
+eligible only 24 hours after a verified publication.
 The retained-media worker reads this configuration at OSCAR startup. After
-saving the accelerated profile, use the supported OSCAR restart and require the
-`retention-runtime-health` preflight to report a valid schema-1 scan checkpoint
-no more than 180 seconds behind the zero-day eligible cutoff before triggering
-alarms. A much older cursor is bounded catch-up from a previous runtime profile,
-not proof that acceleration is active. Only on a completely fresh disposable
-site with no recordings or retained-media jobs may preparation stop OSCAR,
-remove the new retention scan/reconciliation checkpoints, and restart. Never
-reset or fast-forward these durable checkpoints on production.
-Require exact storage schema v5 checksum
+saving the accelerated profile on a newly initialized disposable site, use the
+supported OSCAR restart before importing lanes or permitting emulator traffic.
+Require the `retention-runtime-health` preflight to report a valid schema-1 scan
+checkpoint no more than 180 seconds behind the zero-day eligible cutoff, then
+provision the lane fixture and perform its supported restart. A much older cursor
+is bounded catch-up from a previous runtime profile, not proof that acceleration
+is active. Never delete or fast-forward scan or reconciliation checkpoints. If
+setup occurred in the wrong order, recreate the disposable database and state or
+allow oldest-first catch-up.
+Require the direct daily-file journal to retain sealed sources for 30 days with
+`requireBackupBeforeSealedJournalDeletion=false`: deletion must still require a
+valid immutable publication and exact sealed-journal replay parity, so default
+disabled backup mode remains bounded without weakening corruption/late-segment
+protection. Require exact storage schema v5 checksum
 `sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5`
 before lifecycle mutation and before/after restore. Require DuckDB's exact 256
 MiB memory, two-thread, 4,096 MiB spill, two-session process-wide admission,
-30-second admission-timeout policy and private archive-disjoint
-`/var/lib/oscar/duckdb-tmp`. Require its permanent `.oscar-duckdb.lock` to be a
-real UID/GID 10001 mode-0600 file inside the mode-0700 root, with no completed
-operation directories or unexpected entries; prove the scratch is excluded from backup. Require
+30-second admission-timeout policy and private archive-disjoint empty
+`/var/lib/oscar/duckdb-tmp`; prove the scratch is excluded from backup. Require
 the exact direct-daily-file config, a reserved-lane UID append caused by a real
 emulator transition, exact bounded 12-key publication manifests, and byte
 durability after the supported whole-deployment restart. The restart gate must
-also report zero database/module shutdown errors so a concurrent PostgreSQL stop
+close any in-flight metrics sample before entering the restart-exempt phase,
+cancel and drain the retention worker's scoped PostGIS query before OSCAR
+reports a successful stop, and report zero database/module shutdown errors so a concurrent PostgreSQL stop
 cannot pass merely because services later become healthy, and zero camera
 recording timeout/quarantine/stale-generation errors so a healthy final container
 cannot hide a poisoned per-camera command queue.
-Allow the exact supported portable export, confirmed purge, and deployment
-restart to enter only their named `storage-lifecycle-*-disruption` metric
+Allow the exact supported portable export and deployment restart to enter only
+their named `storage-lifecycle-*-disruption` metric
 phases. Retain all raw samples, exclude those exact windows only from
 steady-state service availability, and require healthy post-boundary samples,
 unchanged images, and zero OOM kills. Exclude Compose one-off command containers
@@ -197,14 +212,17 @@ three-snapshot-stable metadata inventory.
 Require exact-five hash-valid JPEGs, bounded catalog/frame transfers and
 frame/event resource budgets, bounded baseline structure plus Chromium decode
 and exact dimensions for every quality-85 frame, lazy gallery requests with bounded concurrency,
-fallback behavior, schema-2 media metadata health, exact
+fallback behavior, and an authoritative `urn:osh:system:lane:*` parent UID in
+every retained manifest (never the RPM child UID or an unresolved placeholder).
+Require schema-2 media metadata health, exact
 `retention-processed-index/%019d-%02d.idx` suffixes `00..11`, exact binary
 headers/36-byte records, no legacy marker/tombstone growth, journal restart
-recovery, archive parity/export and mixed-tier queries, generation- and
-archived-observation holds resolving exactly to `GENERATION_EXACT` and
-`COLD_RANGE_CONSERVATIVE` with dry-run exclusion, and a `HOT_EXACT` hold that
-rejects authenticated deletion until release, plus dry-run/token
-safety, independent backup-key HMAC/checksum/exact-inventory verification plus
+recovery, natural whole-child parity/retirement, zero raw-row DELETE calls,
+portable export, and exact cold-ID plus mixed attached-hot/Parquet-cold queries.
+Keep `GENERATION_EXACT`, `COLD_RANGE_CONSERVATIVE`, and `HOT_EXACT` helper
+contracts available for separately controlled `HOT_RETENTION` compatibility;
+never invoke their destructive purge path from the primary lifecycle. Require
+independent backup-key HMAC/checksum/exact-inventory verification plus
 supported re-verification,
 an exact separately HMAC-authenticated `JOURNAL_CONFIRMED` v2 sidecar deliberately
 outside the immutable checksum inventory, a bounded canonical backup-time archive-generation
@@ -214,15 +232,15 @@ tar segment path/type/size/SHA-256 reconciliation, and exact once-only regular
 retained-media checkpoint, every processed/deletion index, and each proved
 event/lane/camera manifest plus `frame-01.jpg` through `frame-05.jpg` in the
 authenticated app-state backup with pre-backup path/type/size/SHA-256 identity,
+and wait after restart for a nonempty processed-index inventory plus three
+consecutive stable file-count snapshots before creating that backup,
 exact tags/running image IDs/OCI labels and
-checksum plus the archive marker and optional single-mode backup marker, stable private
-deployment lock rejection, inactive PostgreSQL WAL archiving with no external
-WAL bind, and packaged/running helper hashes,
-compiled atomic-publisher source provenance and no-replace collision behavior,
-no full backup-root mount in either long-running service and isolated one-shot
-base-backup wiring and no archive partial artifacts,
-controlled stale-activation rollback with
-exact-row retry ownership and deployed archive-helper behavior,
+checksum plus deployment-bound archive/backup and preserved legacy-WAL root markers,
+stable private deployment lock rejection, `archive_mode=off`, no external WAL
+command or host bind, compiled atomic-publisher source provenance and no-replace
+collision behavior, no full backup-root mount in either long-running service,
+isolated one-shot `pg_basebackup --wal-method=stream` wiring, and no archive partial artifacts,
+deployed archive-helper behavior,
 checksums/pg_stat, and storage/resource metrics.
 
 `LEGACY_UNKNOWN` is migration-only for pre-v5 observation holds; never accept it
@@ -230,18 +248,20 @@ as CLI output. Pre-v5 generation holds must migrate to `GENERATION_EXACT`.
 
 Only when the user has explicitly authorized a destructive isolated recovery
 test and all documented acknowledgements are present, set both
-`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, set
-`OSCAR_BACKUP_MODE=single`, then run
-`npm run test:restore-drill` separately. Require pre-backup canaries to return
-across the database, application state, and archive;
-require promotion onto a timeline newer than the base backup, no external WAL
-dependency or cumulative WAL payload, a durable post-promotion write across
-checkpoint/restart, and exact reconstruction
-of the authenticated `VERIFIED` epoch receipt, removal of one-time recovery settings
+`STORAGE_WORKFLOW=required` and `STORAGE_BACKUP_WORKFLOW=required`, then run
+`OSCAR_BACKUP_MODE=single`, then run `npm run test:restore-drill` separately.
+Require pre-backup canaries to return across the database, application state,
+archive, `.env`, secrets, and TLS;
+require every component of the empty archive partition/profile canary hierarchy
+to be runtime-owned and owner-writable/searchable before backup;
+require promotion onto a timeline newer than the base backup, a self-contained
+streamed-WAL base backup with no external WAL dependency, exact reconstruction
+of the authenticated `VERIFIED` epoch receipt, proof that the receipt survives
+checkpoint and the recovery-settings cleanup restart, removal of one-time recovery settings
 and signals, healthy services, archive verification, and unchanged immutable image
 IDs. The acknowledged storage planes must resolve exactly and remain distinct and
-non-overlapping. Require the private safety copy to be root-owned mode 0700 and
-to contain safe, non-linked `.env`, `secrets/`, and `tls/` entries.
+non-overlapping. Require the private safety copy to preserve the exact mutated
+`.env`/secrets/TLS names, contents, owners, groups, and modes with no links.
 Keep every raw resource sample. Exempt only the exact
 `storage-restore-drill-disruption` phase from steady-state service checks, and
 only in this profile; require a real target-host sample during it, healthy
@@ -262,21 +282,23 @@ remote lease for investigation.
 Never reinterpret a smoke/full request as restore authorization.
 
 For final 3.9.2 certification, set all five operational-view/UUID/camera/storage/
-backup workflows to `required`, set the exact `OSCAR_BUILD_LABEL` and expected
-`OSCAR_BACKUP_MODE`, and run `npm run test:3.9.2-release` with no scenario
-filter. Disabled mode is fully certified by its live refusal/non-mutation gate
-and needs no restore evidence. For single mode, first preserve a complete
-unfiltered `restore-drill` PASS and point
-`OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching result directory. Do not
-accept a release run with mismatched identity, any skip/failure, or—when single
-mode is selected—missing evidence or an incomplete schema-v2 restore
-attestation.
+backup workflows to `required`, set the exact `OSCAR_BUILD_LABEL`, and run
+`npm run test:3.9.2-release` with no scenario filter. In shipped
+`OSCAR_BACKUP_MODE=disabled`, require the complete disabled-mode refusal and
+unchanged-state oracle; restore evidence is not applicable. In optional
+`OSCAR_BACKUP_MODE=single`, first preserve a complete unfiltered `restore-drill`
+PASS and point `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching result
+directory. Do not accept mismatched identity, missing mode-required evidence,
+any skip/failure, or an incomplete restore attestation.
 
 The smoke Dashboard Offline/Unknown checks are browser-only response fixtures;
 they do not disconnect cameras or mutate SensorHub. The full profile separately
 requires real Dashboard transitions during reserved-RPM stop/restart, fault
 injection/clear, in-place tamper clear, and extended occupancy. Do not describe
 this as live camera disconnect/reconnect coverage.
+The Status-of-Health RPM transition oracle must match the RPM's own labeled
+`Online`/`Offline` state; a camera's independent `Online` text must never satisfy
+the RPM reconnect check.
 
 The live smoke Tamper baseline is not a response fixture. It requires each
 emulator RPM to explicitly model `tamper_fault=false` and the Dashboard to

@@ -39,10 +39,15 @@ The binding is revalidated before every action. The probe itself runs from a
 fresh mode-0700 private workspace and removes it on completion. These checks are
 interlocks, not authorization.
 
-It copies one existing test observation into four uniquely registered synthetic fixture rows:
-three contiguous cold candidates and one hot/current control row.
-Cold deletion is refused unless the dry-run plan contains exactly the one
-registered fixture generation. In optional `single` backup mode, backup creation
+The Parquet-primary lifecycle does not copy, backdate, update, or delete raw
+observations. It follows one naturally ingested newly completed child through verified
+whole-relation retirement and uses read-only PostgreSQL/API probes for exact-ID
+and mixed hot/cold retrieval. A bounded `ACCESS SHARE` witness deliberately
+makes detach back off while it records exact all-row ownership across every
+generation; it does not block ingestion or write product data and is released
+before the normal worker retires the child. Legacy synthetic-row and tokenized-purge helpers
+remain isolated for separately controlled `HOT_RETENTION` compatibility work
+and are never invoked by the primary scenario. In optional `single` backup mode, backup creation
 and verification may replace the one previously committed snapshot only after
 the new snapshot is authenticated and atomically published; restore is never
 attempted by this workflow. Do not enable this path on production or a target containing data
@@ -56,7 +61,7 @@ The same disposable target must explicitly use `timeToRetention=0`,
 `jpegQuality=85`, `sourceRollbackGraceHours=24`, and
 `maintenanceWorkLimit=200`, and `metadataReclamationWorkLimit=200` for the generated-alarm
 media check. The suite verifies those
-live values before it polls or creates the archive fixture; it never edits the
+live values before it polls the immutable stage; it never edits the
 configuration. The 24-hour source grace keeps the exact generated MP4s available
 for the final forensic comparison. OSCAR's packaged production age default is one day,
 followed by the same 24-hour source rollback grace.
@@ -110,11 +115,10 @@ from steady-state service checks only for this profile. Host coverage, healthy
 pre/post samples, restart/OOM checks, and immutable image identity remain
 mandatory.
 
-The ordinary full storage lifecycle also invokes supported portable-export,
-confirmed-purge, and whole-deployment restart commands. Each may briefly stop
+The ordinary full Parquet-primary storage lifecycle invokes supported
+portable-export and whole-deployment restart commands. Each may briefly stop
 OSCAR. Preserve every raw metric, and exempt service availability only inside
 the exact `storage-lifecycle-export-disruption`,
-`storage-lifecycle-purge-disruption`, and
 `storage-lifecycle-restart-disruption` phases. Require healthy samples around
 each boundary, unchanged image identity, and zero OOM kills. Do not treat
 Compose one-off command containers as long-running OSCAR services.

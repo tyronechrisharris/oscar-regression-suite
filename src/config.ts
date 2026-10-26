@@ -320,7 +320,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
       ? {storageEventNodeId: process.env.STORAGE_EVENT_NODE_ID.trim()} : {}),
     storageDatabaseScope: integer("STORAGE_DATABASE_SCOPE", 4, 0),
     storageHotRetentionDays: integer("STORAGE_HOT_RETENTION_DAYS", 1, 1),
-    storageArchiveTimeoutMs: integer("STORAGE_ARCHIVE_TIMEOUT_MS", 300_000, 60_000),
+    storageArchiveTimeoutMs: integer("STORAGE_ARCHIVE_TIMEOUT_MS", 2_700_000, 60_000),
     storageProbeTimeoutMs: integer("STORAGE_PROBE_TIMEOUT_MS", 1_800_000, 60_000),
     storageRestoreProbeTimeoutMs: boundedInteger(
       "STORAGE_RESTORE_PROBE_TIMEOUT_MS",

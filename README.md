@@ -68,8 +68,9 @@ source review before the suite can certify that version.
   health; exact direct daily-file config, live lane-UID append, hardened
   publication manifests, and restart durability; archive catalog, exact schema
   v5 checksum, bounded DuckDB resources and scratch cleanup, parity, portable
-  export, hot/cold query, all three exact hold modes with deletion enforcement,
-  tokenized purge, and authenticated coordinated-backup controls, retained-media
+  export, exact cold-ID and mixed attached-hot/Parquet-cold queries, natural
+  whole-child retirement with zero raw-row DELETEs, and authenticated
+  coordinated-backup controls, retained-media
   inclusion, scratch exclusion, and daily-journal receipts;
   exact application/PostGIS/gateway tags, immutable running image IDs,
   available repository digests, OCI labels, checksum, the archive root marker and
@@ -305,20 +306,29 @@ smoke run, reports/national-statistics filters, and both OSCAR 3.9.2 storage gat
 Storage-health is non-destructive but not strictly read-only: its publisher
 contract creates and removes private temporary probe data, so the suite-wide
 remote lease is held. The full `storage-lifecycle` scenario uses a separately acknowledged disposable
-3.9.2 database, registers four synthetic copied observations (three cold rows
-plus one current control), and refuses any
-cold purge whose plan includes data outside its unique fixture generation. It
+3.9.2 database and read-only observation probes to follow a naturally ingested,
+eligible immutable child through verified whole-relation retirement. It never
+inserts, updates, deletes, accelerates, or purges raw detector rows. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
 that disposable test deployment. The packaged production profile uses immediate
 asynchronous five-JPEG eligibility with a bounded five-minute query cadence and
 preserves the original MP4 until at least 24 hours after verified publication.
 Its observation archive is explicitly `PARQUET_PRIMARY`: exactly five immutable
-detector outputs enter aligned completed-hour generations after a five-minute
-delay, with a five-minute worker interval, 2/2/2 export/verification/deletion
-caps, and at least three days of hot overlap from generation activation. Mutable
-occupancy/alarm/adjudication data remains PostgreSQL-backed, and the fresh-schema
-gate verifies the broad generic payload GIN is absent while required workflow and
-lifecycle indexes remain. It does not restore a backup. Daily-file publication verification requires an
+detector outputs land in LOGGED 30-minute children, then use a five-minute
+archive delay, one-minute worker, five-minute future-skew budget, and at most
+eight partition retirements per cycle. The 30+5+1+5 = 41 minute nominal budget
+has a one-hour operational SLO; failure or backlog preserves the child rather
+than making that SLO a data-loss deadline. Checksum/UUID-count parity and exact
+sidecar ownership across one or more capped generations precedes whole-child
+detach/drop, leaving Parquet plus direct
+daily files as the durable raw authorities. Mutable occupancy/alarm/adjudication
+and compact metadata remain PostgreSQL-backed. `hotRetentionDays`,
+`intervalMinutes`, and `rollbackGraceDays` retain their unchanged meaning only
+for `HOT_RETENTION`. The fresh-schema gate verifies the broad generic payload
+GIN and legacy archive-generation index are absent while required mutable-event
+indexes remain. The suite reports stage age, attached/detached children,
+ownership integrity, NULL legacy markers, mutable-only parent behavior, direct
+cold-ID retrieval, and mixed hot/cold range filters. It does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture. `STORAGE_BACKUP_WORKFLOW=required` validates the
 selected product mode: disabled proves fail-closed non-mutation, while single
 proves one authenticated self-contained snapshot. See

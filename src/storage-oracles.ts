@@ -538,6 +538,10 @@ export interface StoragePlatformProbe {
   archiveEnabled: boolean | null;
   storageMode: string;
   parquetPrimaryArchiveDelayMinutes: number | null;
+  immutableStageWindowMinutes: number | null;
+  maximumFuturePhenomenonSkewMinutes: number | null;
+  parquetPrimaryIntervalMinutes: number | null;
+  maximumStagePartitionsPerCycle: number | null;
   archiveIntervalMinutes: number | null;
   hotRetentionDays: number | null;
   deleteHotAfterArchive: boolean | null;
@@ -558,6 +562,10 @@ export interface StoragePlatformProbe {
     archiveEnabled: boolean | null;
     storageMode: string;
     parquetPrimaryArchiveDelayMinutes: number | null;
+    immutableStageWindowMinutes: number | null;
+    maximumFuturePhenomenonSkewMinutes: number | null;
+    parquetPrimaryIntervalMinutes: number | null;
+    maximumStagePartitionsPerCycle: number | null;
     archiveIntervalMinutes: number | null;
     hotRetentionDays: number | null;
     rollbackGraceDays: number | null;
@@ -627,6 +635,32 @@ export interface StoragePlatformProbe {
     metadataReclamationWorkLimit: number | null;
     maintenanceWorkLimit: number | null;
   };
+}
+
+export interface ImmutableStageHealthProbe {
+  applicable: boolean;
+  storageMode: string;
+  attachedChildCount: number;
+  detachedChildCount: number;
+  stageRowCount: number;
+  oldestReceivedAt: string | null;
+  oldestReceivedAtAgeSeconds: number;
+  stagingSloSeconds: number;
+  stagingSloExceeded: boolean;
+  exactSidecarOwnerCount: number;
+  ownedStageRowCount: number;
+  attachedUnownedRowCount: number;
+  detachedUnownedRowCount: number;
+  orphanRegistryOwnerCount: number;
+  orphanGenerationOwnerCount: number;
+  ownersMissingPhysicalRowCount: number;
+  markerNonNullRowCount: number;
+  immutableRouteMismatchRowCount: number;
+  parentOnlyRowCount: number;
+  parentImmutableRowCount: number;
+  missingRelationCount: number;
+  inheritanceMismatchCount: number;
+  sampleConsistent: boolean;
 }
 
 export interface ArchiveScratchProbe {
@@ -953,6 +987,11 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
     archiveEnabled: typeof probe.archiveEnabled === "boolean" ? probe.archiveEnabled : null,
     storageMode: text(probe.storageMode, "storageMode"),
     parquetPrimaryArchiveDelayMinutes: nullableNumber(probe.parquetPrimaryArchiveDelayMinutes),
+    immutableStageWindowMinutes: nullableNumber(probe.immutableStageWindowMinutes),
+    maximumFuturePhenomenonSkewMinutes:
+      nullableNumber(probe.maximumFuturePhenomenonSkewMinutes),
+    parquetPrimaryIntervalMinutes: nullableNumber(probe.parquetPrimaryIntervalMinutes),
+    maximumStagePartitionsPerCycle: nullableNumber(probe.maximumStagePartitionsPerCycle),
     archiveIntervalMinutes: nullableNumber(probe.archiveIntervalMinutes),
     hotRetentionDays: nullableNumber(probe.hotRetentionDays),
     deleteHotAfterArchive: typeof probe.deleteHotAfterArchive === "boolean"
@@ -981,6 +1020,12 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
         storageMode: text(defaults.storageMode, "packagedDefaults.storageMode"),
         parquetPrimaryArchiveDelayMinutes:
           nullableNumber(defaults.parquetPrimaryArchiveDelayMinutes),
+        immutableStageWindowMinutes: nullableNumber(defaults.immutableStageWindowMinutes),
+        maximumFuturePhenomenonSkewMinutes:
+          nullableNumber(defaults.maximumFuturePhenomenonSkewMinutes),
+        parquetPrimaryIntervalMinutes: nullableNumber(defaults.parquetPrimaryIntervalMinutes),
+        maximumStagePartitionsPerCycle:
+          nullableNumber(defaults.maximumStagePartitionsPerCycle),
         archiveIntervalMinutes: nullableNumber(defaults.archiveIntervalMinutes),
         hotRetentionDays: nullableNumber(defaults.hotRetentionDays),
         rollbackGraceDays: nullableNumber(defaults.rollbackGraceDays),
@@ -1068,6 +1113,79 @@ export function assessStoragePlatform(value: unknown): StoragePlatformProbe {
       };
     })(),
   };
+}
+
+export function assessImmutableStageHealth(value: unknown): ImmutableStageHealthProbe {
+  const probe = object(value, "immutable stage health probe");
+  const applicable = probe.applicable === true;
+  const storageMode = text(probe.storageMode, "storageMode");
+  if (!applicable) {
+    return {
+      applicable, storageMode, attachedChildCount: 0, detachedChildCount: 0,
+      stageRowCount: 0, oldestReceivedAt: null, oldestReceivedAtAgeSeconds: 0,
+      stagingSloSeconds: 3600, stagingSloExceeded: false, exactSidecarOwnerCount: 0,
+      ownedStageRowCount: 0, attachedUnownedRowCount: 0, detachedUnownedRowCount: 0,
+      orphanRegistryOwnerCount: 0, orphanGenerationOwnerCount: 0,
+      ownersMissingPhysicalRowCount: 0, markerNonNullRowCount: 0,
+      immutableRouteMismatchRowCount: 0, parentOnlyRowCount: 0,
+      parentImmutableRowCount: 0, missingRelationCount: 0,
+      inheritanceMismatchCount: 0, sampleConsistent: true,
+    };
+  }
+  const oldest = probe.oldestReceivedAt;
+  if (oldest !== null && (typeof oldest !== "string" || !Number.isFinite(Date.parse(oldest)))) {
+    throw new Error("oldestReceivedAt must be null or an ISO timestamp");
+  }
+  return {
+    applicable, storageMode,
+    attachedChildCount: integer(probe.attachedChildCount, "attachedChildCount"),
+    detachedChildCount: integer(probe.detachedChildCount, "detachedChildCount"),
+    stageRowCount: integer(probe.stageRowCount, "stageRowCount"),
+    oldestReceivedAt: oldest,
+    oldestReceivedAtAgeSeconds:
+      integer(probe.oldestReceivedAtAgeSeconds, "oldestReceivedAtAgeSeconds"),
+    stagingSloSeconds: integer(probe.stagingSloSeconds, "stagingSloSeconds", 1),
+    stagingSloExceeded: probe.stagingSloExceeded === true,
+    exactSidecarOwnerCount:
+      integer(probe.exactSidecarOwnerCount, "exactSidecarOwnerCount"),
+    ownedStageRowCount: integer(probe.ownedStageRowCount, "ownedStageRowCount"),
+    attachedUnownedRowCount:
+      integer(probe.attachedUnownedRowCount, "attachedUnownedRowCount"),
+    detachedUnownedRowCount:
+      integer(probe.detachedUnownedRowCount, "detachedUnownedRowCount"),
+    orphanRegistryOwnerCount:
+      integer(probe.orphanRegistryOwnerCount, "orphanRegistryOwnerCount"),
+    orphanGenerationOwnerCount:
+      integer(probe.orphanGenerationOwnerCount, "orphanGenerationOwnerCount"),
+    ownersMissingPhysicalRowCount:
+      integer(probe.ownersMissingPhysicalRowCount, "ownersMissingPhysicalRowCount"),
+    markerNonNullRowCount: integer(probe.markerNonNullRowCount, "markerNonNullRowCount"),
+    immutableRouteMismatchRowCount:
+      integer(probe.immutableRouteMismatchRowCount, "immutableRouteMismatchRowCount"),
+    parentOnlyRowCount: integer(probe.parentOnlyRowCount, "parentOnlyRowCount"),
+    parentImmutableRowCount:
+      integer(probe.parentImmutableRowCount, "parentImmutableRowCount"),
+    missingRelationCount: integer(probe.missingRelationCount, "missingRelationCount"),
+    inheritanceMismatchCount:
+      integer(probe.inheritanceMismatchCount, "inheritanceMismatchCount"),
+    sampleConsistent: probe.sampleConsistent === true,
+  };
+}
+
+export function immutableStageHealthIsSafe(value: ImmutableStageHealthProbe): boolean {
+  if (!value.applicable) return value.storageMode !== "PARQUET_PRIMARY";
+  return value.storageMode === "PARQUET_PRIMARY" && value.sampleConsistent &&
+    value.stagingSloSeconds === 3600 && !value.stagingSloExceeded &&
+    value.oldestReceivedAtAgeSeconds <= value.stagingSloSeconds &&
+    (value.stageRowCount === 0) === (value.oldestReceivedAt === null) &&
+    value.stageRowCount === value.ownedStageRowCount + value.attachedUnownedRowCount +
+      value.detachedUnownedRowCount &&
+    value.exactSidecarOwnerCount === value.ownedStageRowCount &&
+    value.detachedUnownedRowCount === 0 && value.orphanRegistryOwnerCount === 0 &&
+    value.orphanGenerationOwnerCount === 0 && value.ownersMissingPhysicalRowCount === 0 &&
+    value.markerNonNullRowCount === 0 && value.immutableRouteMismatchRowCount === 0 &&
+    value.parentImmutableRowCount === 0 && value.missingRelationCount === 0 &&
+    value.inheritanceMismatchCount === 0;
 }
 
 export function assessArchiveScratch(value: unknown): ArchiveScratchProbe {

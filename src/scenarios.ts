@@ -59,12 +59,14 @@ import {
   assessArchiveHealth,
   assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessImmutableStageHealth,
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
+  immutableStageHealthIsSafe,
   MAX_RETAINED_FRAME_BYTES,
   mediaMetadataHealthIsSafe,
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
@@ -263,9 +265,11 @@ const PARQUET_PRIMARY_OUTPUT_NAMES = [
 
 const REGRESSION_ARCHIVE_POLICY = {
   storageMode: "PARQUET_PRIMARY",
-  parquetPrimaryArchiveDelayMinutes: 1,
-  archiveIntervalMinutes: 1,
-  rollbackGraceDays: 1,
+  parquetPrimaryArchiveDelayMinutes: 5,
+  immutableStageWindowMinutes: 30,
+  maximumFuturePhenomenonSkewMinutes: 5,
+  parquetPrimaryIntervalMinutes: 1,
+  maximumStagePartitionsPerCycle: 8,
   maximumGenerationsPerCycle: 2,
   maximumVerificationsPerCycle: 2,
   maximumDeletionsPerCycle: 2,
@@ -275,7 +279,11 @@ const SHIPPING_STORAGE_POLICY = {
   archiveEnabled: true,
   storageMode: "PARQUET_PRIMARY",
   parquetPrimaryArchiveDelayMinutes: 5,
-  archiveIntervalMinutes: 5,
+  immutableStageWindowMinutes: 30,
+  maximumFuturePhenomenonSkewMinutes: 5,
+  parquetPrimaryIntervalMinutes: 1,
+  maximumStagePartitionsPerCycle: 8,
+  archiveIntervalMinutes: 60,
   hotRetentionDays: 2,
   rollbackGraceDays: 3,
   maximumGenerationsPerCycle: 2,
@@ -4217,13 +4225,12 @@ export class RegressionScenarios {
           value.dailyJournalConfigured && value.deleteHotAfterArchive === true &&
           Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
             value[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
-          value.hotRetentionDays === this.config.storageHotRetentionDays &&
           Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
             value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
           JSON.stringify(value.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
           JSON.stringify(value.packagedDefaults.outputNames) ===
             JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
-          indexes.genericPayloadGinAbsent && indexes.requiredCount === 14 &&
+          indexes.genericPayloadGinAbsent && indexes.requiredCount === 13 &&
           indexes.requiredPresent === indexes.requiredCount && indexes.missingNames.length === 0 &&
           indexes.eventPathGinExact && indexes.numericEventIndexesExact &&
           resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
@@ -4235,6 +4242,26 @@ export class RegressionScenarios {
           resources.sessionAcquireTimeoutSeconds ===
             REGRESSION_ARCHIVE_RESOURCES.sessionAcquireTimeoutSeconds &&
           resources.temporaryDirectory === REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory;
+        return {passed, value, observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "hot-stage",
+        action: "verify immutable observation staging lifecycle",
+        target: "oscar_obs_stage_partition/oscar_obs_stage_owner",
+        expected: "PARQUET_PRIMARY reports exact attached/detached children and sidecar ownership, no orphan or missing ownership, NULL legacy markers, mutable-only parent rows, and an oldest received_at within the one-hour staging SLO; HOT_RETENTION remains not applicable",
+      }, async () => {
+        const value = await poll(
+          async () => assessImmutableStageHealth(await probe.runJson("stage-health")),
+          candidate => candidate.storageMode === "PARQUET_PRIMARY"
+            ? immutableStageHealthIsSafe(candidate)
+            : !candidate.applicable,
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "immutable staging catalog to reach a consistent read-only boundary"},
+        );
+        const passed = value.storageMode === "PARQUET_PRIMARY"
+          ? immutableStageHealthIsSafe(value)
+          : !value.applicable;
         return {passed, value, observed: JSON.stringify(value)};
       });
 
@@ -4362,17 +4389,14 @@ export class RegressionScenarios {
   private async storageLifecycle(): Promise<void> {
     if (this.storageUnavailable("storage-lifecycle")) return;
     const probe = this.alarmMediaProbe ?? new StorageProbeClient(this.config, this.reporter.runId);
-    const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
-    let fixtureCreateAttempted = false;
     let apiPage: Page | undefined;
     let directJournalLaneUid: string | undefined;
     let directJournalAfterAppend: DirectJournalLaneState | undefined;
-    let expectedAuthorizedHotDeleteSingletonCalls = 0;
     try {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
-        expected: "the exact OSCAR 3.9.2 release, fresh PARQUET_PRIMARY schema, accelerated completed-hour archive profile, lean observation indexes, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
+        expected: "the exact OSCAR 3.9.2 release, fresh 30-minute PARQUET_PRIMARY staging profile, lean mutable-parent indexes, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
         const media = platform.videoRetention;
         const resources = platform.archiveResources;
         const passed = storagePlatformHasExactReleaseIdentity(
@@ -4381,7 +4405,6 @@ export class RegressionScenarios {
             platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
             Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
               platform[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
-            platform.hotRetentionDays === this.config.storageHotRetentionDays &&
             JSON.stringify(platform.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
             platform.observationIndexes.genericPayloadGinAbsent &&
             platform.observationIndexes.requiredPresent ===
@@ -4428,7 +4451,7 @@ export class RegressionScenarios {
       });
       if (!profileAccepted) {
         throw new Error(
-          "Storage lifecycle mutation refused because the exact accelerated 3.9.2 archive/media test profile failed",
+          "Storage lifecycle refused because the exact 3.9.2 stage/archive/media test profile failed",
         );
       }
 
@@ -4478,7 +4501,7 @@ export class RegressionScenarios {
 
       const scratchAccepted = await this.check({
         scenario: "storage-lifecycle", category: "cold-archive",
-        action: "verify clean DuckDB scratch before fixture mutation",
+        action: "verify clean DuckDB scratch before stage observation",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
         expected: "the private archive-disjoint scratch root contains only its exact safe lease between archive operations",
       }, async () => {
@@ -4594,53 +4617,171 @@ export class RegressionScenarios {
         await probe.runJson("snapshot"),
       );
       this.reporter.storageMetric(lifecycleBefore);
-      fixtureCreateAttempted = true;
-      const fixture = await probe.runJson<{coldId: string; coldRowCount: number; hotId: string; datastreamId: number;
-        coldTime: string; hotTime: string; activationBlocked: boolean; sourceMutated: boolean;
-        staleActivationRejected: boolean; staleRowUnmarked: boolean}>(
-          "fixture-create-race", [fixtureRun, String(this.config.storageHotRetentionDays)]);
-      await this.check({scenario: "storage-lifecycle", category: "cold-archive",
-        action: "reject concurrent source change during archive activation", target: String(fixture.coldId),
-        expected: "a controlled source-row change after export makes activation roll back without marking the stale row"}, async () => ({
-        passed: fixture.activationBlocked && fixture.sourceMutated && fixture.staleActivationRejected &&
-          fixture.staleRowUnmarked,
-        observed: JSON.stringify(fixture),
-      }));
-      const archived = await poll(
-        () => probe.runJson<{generationId: string | null; generationState: string | null;
-          parityVerified: boolean; generationRows: number; generationMinId: string | null;
-          generationMaxId: string | null; windowStart: string | null; windowEnd: string | null;
-          completedHourWindow: boolean; fixtureWithinWindow: boolean;
-          markedRows: number; fixtureColdMarked: boolean;
-          fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
-          "fixture-status", [fixtureRun]),
-        value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
-          value.parityVerified && value.generationRows === fixture.coldRowCount &&
-          value.markedRows === fixture.coldRowCount &&
-          value.completedHourWindow && value.fixtureWithinWindow &&
-          value.fixtureColdMarked && value.fixtureHotUnmarked && value.exactRowOwnership),
+      type PrimaryStageSample = {
+        available: boolean;
+        storeKey: string;
+        idScope: number;
+        parentTable: string;
+        childTable: string;
+        windowStart: string;
+        windowEnd: string;
+        rowCount: number;
+        ownerCount: number;
+        markerNonNullRowCount: number;
+        coldId: string;
+        datastreamId: number;
+        coldTime: string;
+        oldestReceivedAt: string;
+      };
+      type PrimaryStageStatus = {
+        registryState: "ATTACHED" | "DETACHED" | null;
+        relationPresent: boolean;
+        inheritsParent: boolean;
+        rowCount: number;
+        ownerCount: number;
+        markerNonNullRowCount: number;
+        coldHotPresent: boolean;
+        sampleConsistent: boolean;
+        selectedGeneration: {
+          generationId: string | null;
+          generationState: string | null;
+          parityVerified: boolean;
+          generationRowCount: number | null;
+        };
+        windowGenerations: {
+          generationCount: number;
+          generationIds: string[];
+          invalidGenerationCount: number;
+          nonSealedGenerationCount: number;
+          generationRowCount: number;
+        };
+      };
+      type PrimaryStageWitness = {
+        relationPresent: boolean;
+        fullOwnershipObserved: boolean;
+        rowCount: number;
+        ownerCount: number;
+        ownerGenerationCount: number;
+        invalidOwnerGenerationCount: number;
+        ownerGenerationRowCount: number;
+        generationIds: string[];
+        selectedGenerationId: string | null;
+        selectedGenerationState: string | null;
+        selectedGenerationParityVerified: boolean;
+      };
+      const stageSample = await poll(
+        () => probe.runJson<PrimaryStageSample>("stage-lifecycle-select"),
+        value => value.available,
         {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "the retried exact source row set to enter one parity-verified archive generation"},
+          description: "a completed nonempty 30-minute immutable stage child"},
       );
-      await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
-        target: String(fixture.coldId),
-        expected: "only the exact exported three-row cold fixture is marked into one completed-UTC-hour ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
-          passed: Boolean(archived.generationId && archived.parityVerified && archived.exactRowOwnership &&
-            archived.completedHourWindow && archived.fixtureWithinWindow &&
-            fixture.coldRowCount === 3 && archived.generationRows === fixture.coldRowCount &&
-            archived.markedRows === fixture.coldRowCount &&
-            archived.generationMinId === (BigInt(fixture.coldId) - 2n).toString() &&
-            archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
-        }));
+      const stageSampleAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "select a newly completed immutable stage child without mutation",
+        target: stageSample.childTable,
+        expected: "a completed attached LOGGED child still inside its archive-delay window contains only NULL legacy markers and has bounded exact sidecar ownership",
+      }, async () => {
+        const passed = stageSample.available && stageSample.idScope === this.config.storageDatabaseScope &&
+          stageSample.parentTable === "obs" && stageSample.rowCount > 0 &&
+          stageSample.ownerCount >= 0 && stageSample.ownerCount <= stageSample.rowCount &&
+          stageSample.markerNonNullRowCount === 0 &&
+          Number.isFinite(Date.parse(stageSample.windowStart)) &&
+          Number.isFinite(Date.parse(stageSample.windowEnd)) &&
+          Number.isFinite(Date.parse(stageSample.coldTime)) &&
+          Number.isFinite(Date.parse(stageSample.oldestReceivedAt));
+        return {passed, value: passed, observed: JSON.stringify(stageSample)};
+      });
+      if (!stageSampleAccepted) {
+        throw new Error("PARQUET_PRIMARY lifecycle refused an invalid immutable stage sample");
+      }
+      const witness = await probe.runJson<PrimaryStageWitness>("stage-lifecycle-witness", [
+        stageSample.childTable, stageSample.storeKey, String(stageSample.idScope),
+        String(stageSample.rowCount), stageSample.coldId,
+        String(Math.min(7_200, Math.ceil(this.config.storageArchiveTimeoutMs / 1_000))),
+      ]);
+      const ownershipWitnessAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "witness exact multi-generation ownership before retirement",
+        target: stageSample.childTable,
+        expected: "while a read-only ACCESS SHARE lock keeps the child present, every exact row has one compact sidecar owner and every distinct owner generation is parity-verified ACTIVE or SEALED",
+      }, async () => {
+        const passed = witness.relationPresent && witness.fullOwnershipObserved &&
+          witness.rowCount === stageSample.rowCount &&
+          witness.ownerCount === stageSample.rowCount &&
+          witness.ownerGenerationCount > 0 &&
+          witness.ownerGenerationCount === witness.generationIds.length &&
+          new Set(witness.generationIds).size === witness.generationIds.length &&
+          witness.invalidOwnerGenerationCount === 0 &&
+          witness.ownerGenerationRowCount === stageSample.rowCount &&
+          witness.generationIds.every(id =>
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) &&
+          typeof witness.selectedGenerationId === "string" &&
+          witness.generationIds.includes(witness.selectedGenerationId) &&
+          ["ACTIVE", "SEALED"].includes(witness.selectedGenerationState ?? "") &&
+          witness.selectedGenerationParityVerified;
+        return {passed, value: passed, observed: JSON.stringify({stageSample, witness})};
+      });
+      if (!ownershipWitnessAccepted) {
+        throw new Error("PARQUET_PRIMARY lifecycle did not witness exact verified child ownership");
+      }
+      const sameWitnessedGenerationIds = (ids: string[]): boolean =>
+        ids.length === witness.generationIds.length &&
+        ids.every((id, index) => id === witness.generationIds[index]);
+      const retired = await poll(
+        () => probe.runJson<PrimaryStageStatus>("stage-lifecycle-status", [
+          stageSample.childTable, stageSample.storeKey, String(stageSample.idScope),
+          stageSample.coldId, String(stageSample.datastreamId),
+          stageSample.windowStart, stageSample.windowEnd, witness.selectedGenerationId!,
+        ]),
+        value => value.sampleConsistent && value.registryState === null &&
+          !value.relationPresent && !value.coldHotPresent &&
+          value.selectedGeneration.generationState === "SEALED" &&
+          value.selectedGeneration.parityVerified &&
+          value.windowGenerations.generationCount === witness.ownerGenerationCount &&
+          sameWitnessedGenerationIds(value.windowGenerations.generationIds) &&
+          value.windowGenerations.invalidGenerationCount === 0 &&
+          value.windowGenerations.nonSealedGenerationCount === 0 &&
+          value.windowGenerations.generationRowCount === stageSample.rowCount,
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 2_000,
+          description: "checksum/parity-verified whole-child retirement"},
+      );
+      const archived = retired.selectedGeneration;
+      await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "retire one verified immutable child as a whole relation",
+        target: stageSample.childTable,
+        expected: "the catalog entry and physical child disappear only after every witnessed generation passes parity and the selected observation remains in sealed Parquet; no row marker is used",
+      }, async () => {
+        const passed = retired.sampleConsistent && retired.registryState === null &&
+          !retired.relationPresent && !retired.inheritsParent && !retired.coldHotPresent &&
+          retired.markerNonNullRowCount === 0 && archived.parityVerified &&
+          archived.generationState === "SEALED" &&
+          archived.generationId === witness.selectedGenerationId &&
+          retired.windowGenerations.generationCount === witness.ownerGenerationCount &&
+          sameWitnessedGenerationIds(retired.windowGenerations.generationIds) &&
+          retired.windowGenerations.invalidGenerationCount === 0 &&
+          retired.windowGenerations.nonSealedGenerationCount === 0 &&
+          retired.windowGenerations.generationRowCount === stageSample.rowCount &&
+          typeof archived.generationId === "string";
+        return {passed, value: passed, observed: JSON.stringify({stageSample, witness, retired})};
+      });
+      if (!archived.generationId) {
+        throw new Error("Whole-child retirement produced no queryable archive generation");
+      }
+      this.reporter.storageMetric(storageMetricFromProbe(
+        "storage-lifecycle-after-whole-child-retirement",
+        await probe.runJson("snapshot"),
+      ));
       const exportDisruptionPhase = "storage-lifecycle-export-disruption";
       await this.metrics.sample();
       this.reporter.expectRemoteMetricDisruptionPhase(exportDisruptionPhase);
       this.metrics.setPhase(exportDisruptionPhase);
       try {
         await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
-          target: archived.generationId ?? "fixture generation",
+          target: archived.generationId,
           expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
-          const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
+          const value = await probe.runJson<Record<string, unknown>>(
+            "export-check", [archived.generationId!]);
           return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
             value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
         });
@@ -4649,96 +4790,57 @@ export class RegressionScenarios {
         await this.metrics.sample();
       }
       await this.check({scenario: "storage-lifecycle", category: "portability",
-        action: "exercise deployed archive-object helper", target: archived.generationId ?? "fixture generation",
+        action: "exercise deployed archive-object helper", target: archived.generationId,
         expected: "the image helper verifies and copies a cataloged object by hash and rejects checksum mismatch and traversal"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("archive-helper-check", [fixtureRun]);
+        const value = await probe.runJson<Record<string, unknown>>(
+          "archive-helper-check", [archived.generationId!]);
         const passed = ["verified", "copied", "copyChecksumValid", "mismatchRejected", "traversalRejected"]
           .every(field => value[field] === true);
         return {passed, observed: JSON.stringify(value)};
       });
       apiPage = await this.browser.oscarPage();
       const request = apiPage.context().request;
-      const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
-      const hotPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.hotId));
-      const streamPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.datastreamId));
-      const maintenanceIdle = await this.check({
-        scenario: "storage-lifecycle", category: "performance",
-        action: "isolate fixture hot-delete accounting",
-        target: this.config.targetHost,
-        expected: "three clean samples spanning a maintenance/delete interval prove no export, failed retry, eligible unowned row, eligible hot delete, or DuckDB scratch work before the fixture baseline",
-      }, async () => {
-        type ArchiveIdle = {idle: boolean; exportingJobs: number; latestFailedJobs: number;
-          eligibleHotDeleteGenerations: number; eligibleUnownedRows: number; scratchEntries: number};
-        let idleSince = 0;
-        let stableSamples = 0;
-        const value = await poll(async () => {
-          const current = await probe.runJson<ArchiveIdle>("archive-maintenance-idle");
-          if (current.idle && current.exportingJobs === 0 && current.latestFailedJobs === 0 &&
-              current.eligibleHotDeleteGenerations === 0 && current.eligibleUnownedRows === 0 &&
-              current.scratchEntries === 0) {
-            if (stableSamples === 0) idleSince = Date.now();
-            stableSamples++;
-          } else {
-            idleSince = 0;
-            stableSamples = 0;
-          }
-          return {...current, stableSamples, stableForMs: idleSince ? Date.now() - idleSince : 0};
-        }, state => state.idle && state.stableSamples >= 3 && state.stableForMs >= 65_000, {
-          timeoutMs: this.config.storageArchiveTimeoutMs,
-          intervalMs: 35_000,
-          description: "pre-existing archive maintenance to remain idle across a maintenance/delete interval",
-        });
-        const passed = value.idle && value.stableSamples >= 3 && value.stableForMs >= 65_000;
-        return {passed, value: passed, observed: JSON.stringify(value)};
-      });
-      if (!maintenanceIdle) {
-        throw new Error("Fixture hot-delete accounting refused while pre-existing archive maintenance remained active");
-      }
-      const archiveDeleteBefore = storageMetricFromProbe(
-        "storage-lifecycle-before-multirow-hot-delete",
-        await probe.runJson("snapshot"),
-      );
-      this.reporter.storageMetric(archiveDeleteBefore);
-      await probe.runJson("fixture-accelerate", [fixtureRun]);
-      const sealed = await poll(
-        () => probe.runJson<{generationState: string | null; coldHotPresent: boolean; hotPresent: boolean}>(
-          "fixture-status", [fixtureRun]),
-        value => value.generationState === "SEALED" && !value.coldHotPresent && value.hotPresent,
-        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "parity-verified fixture generation to seal and delete only its cold hot-store row"},
-      );
-      const archiveDeleteAfter = storageMetricFromProbe(
-        "storage-lifecycle-after-multirow-hot-delete",
-        await probe.runJson("snapshot"),
-      );
-      this.reporter.storageMetric(archiveDeleteAfter);
-      await this.check({scenario: "storage-lifecycle", category: "performance",
-        action: "verify one guarded multi-row PostgreSQL purge",
-        target: archived.generationId ?? "fixture generation",
-        expected: "the exact three-row fixture is removed by one id=ANY guarded delete with no singleton delete"}, async () => {
-        const metricDelta = (field: keyof typeof archiveDeleteBefore): number | null => {
-          const before = archiveDeleteBefore[field];
-          const after = archiveDeleteAfter[field];
-          return typeof before === "number" && typeof after === "number" ? after - before : null;
-        };
-        const batchCalls = metricDelta("batchedObservationDeleteCalls");
-        const batchRows = metricDelta("batchedObservationDeleteRows");
-        const singletonCalls = metricDelta("legacySingletonObservationDeleteCalls");
-        const passed = fixture.coldRowCount === 3 && !sealed.coldHotPresent &&
-          batchCalls === 1 && batchRows === fixture.coldRowCount && singletonCalls === 0;
-        return {passed, observed: JSON.stringify({batchCalls, batchRows, singletonCalls,
-          coldRowCount: fixture.coldRowCount, coldHotPresent: sealed.coldHotPresent})};
-      });
+      const coldPublicId = encodeOshBigId(
+        this.config.storageDatabaseScope, BigInt(stageSample.coldId));
+      const streamPublicId = encodeOshBigId(
+        this.config.storageDatabaseScope, BigInt(stageSample.datastreamId));
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query cold event by ID",
-        target: coldPublicId, expected: "the cold observation remains queryable after its PostgreSQL row is removed"}, async () => {
+        target: coldPublicId, expected: "the archived observation remains queryable by its exact public ID after its whole PostgreSQL child is dropped"}, async () => {
         const response = await request.get(this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(coldPublicId)}`));
-        return {passed: sealed.generationState === "SEALED" && response.ok(),
-          observed: `generation=${sealed.generationState}; hot row=${sealed.coldHotPresent}; HTTP ${response.status()}`};
+        try {
+          const status = response.status();
+          if (!response.ok()) {
+            return {passed: false,
+              observed: `generation=${archived.generationState}; child present=${retired.relationPresent}; HTTP ${status}`};
+          }
+          const body = await response.json();
+          const record = body && typeof body === "object" ? body as Record<string, unknown> : null;
+          const idMatches = record?.id === coldPublicId;
+          const streamMatches = record?.["datastream@id"] === streamPublicId;
+          return {passed: archived.generationState === "SEALED" && idMatches && streamMatches,
+            observed: `generation=${archived.generationState}; child present=${retired.relationPresent}; HTTP ${status}; id=${String(record?.id)}; datastream=${String(record?.["datastream@id"])}`};
+        } finally {
+          await response.dispose();
+        }
       });
+      const hotSample = await poll(
+        () => probe.runJson<{available: boolean; hotId: string | null; hotTime: string | null}>(
+          "stage-lifecycle-hot", [String(stageSample.datastreamId), stageSample.coldId]),
+        value => value.available && typeof value.hotId === "string" &&
+          typeof value.hotTime === "string",
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 2_000,
+          description: "a current attached hot sample for the archived datastream"},
+      );
+      if (!hotSample.hotId || !hotSample.hotTime) {
+        throw new Error("Mixed-tier retrieval found no current attached hot sample");
+      }
+      const hotPublicId = encodeOshBigId(
+        this.config.storageDatabaseScope, BigInt(hotSample.hotId));
+      const hotTime = hotSample.hotTime;
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query mixed hot/cold range",
-        target: streamPublicId, expected: "bounded ascending and descending pages over one range expose the cold and hot fixture IDs"}, async () => {
-        const start = new Date(Date.parse(fixture.coldTime) - 60_000).toISOString();
-        const end = new Date(Date.parse(fixture.hotTime) + 60_000).toISOString();
+        target: streamPublicId, expected: "bounded ascending and descending filters over one datastream expose the exact cold Parquet ID and a current attached-stage ID"}, async () => {
+        const start = new Date(Date.parse(stageSample.coldTime) - 60_000).toISOString();
+        const end = new Date(Date.parse(hotTime) + 60_000).toISOString();
         const base = `/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`;
         const ascending = await request.get(this.viewerUrl(`${base}&order=asc`));
         const descending = await request.get(this.viewerUrl(`${base}&order=desc`));
@@ -4749,122 +4851,21 @@ export class RegressionScenarios {
           }
           const ascendingIds = parseCollectionIds(await ascending.json());
           const descendingIds = parseCollectionIds(await descending.json());
-          const coldFound = ascendingIds.includes(coldPublicId);
-          const hotFound = descendingIds.includes(hotPublicId);
-          return {passed: coldFound && hotFound,
-            observed: `ascending=${ascendingIds.length}, cold=${coldFound}; descending=${descendingIds.length}, hot=${hotFound}`};
+          const ascColdIndex = ascendingIds.indexOf(coldPublicId);
+          const ascHotIndex = ascendingIds.indexOf(hotPublicId);
+          const descHotIndex = descendingIds.indexOf(hotPublicId);
+          const descColdIndex = descendingIds.indexOf(coldPublicId);
+          const coldFound = ascColdIndex >= 0 && descColdIndex >= 0;
+          const hotFound = ascHotIndex >= 0 && descHotIndex >= 0;
+          const ordered = coldFound && hotFound &&
+            ascColdIndex < ascHotIndex && descHotIndex < descColdIndex;
+          return {passed: ordered,
+            observed: `ascending=${ascendingIds.length}, cold=${ascColdIndex}, hot=${ascHotIndex}; descending=${descendingIds.length}, hot=${descHotIndex}, cold=${descColdIndex}`};
         } finally {
           await ascending.dispose();
           await descending.dispose();
-        }
+          }
       });
-      const hotHold = await probe.runJson<{
-        holdId: string;
-        hotId: string;
-        resolution: string;
-        listed: boolean;
-      }>("fixture-hot-hold-create", [fixtureRun]);
-      try {
-        await this.check({
-          scenario: "storage-lifecycle", category: "retention",
-          action: "enforce exact hot-observation legal hold",
-          target: hotPublicId,
-          expected: "a listed HOT_EXACT hold rejects authenticated observation deletion and leaves the hot row queryable",
-        }, async () => {
-          const deletion = await request.delete(
-            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-          );
-          const deletionStatus = deletion.status();
-          const deletionRejected = !deletion.ok();
-          await deletion.dispose();
-          const stillPresent = await request.get(
-            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-          );
-          const queryStatus = stillPresent.status();
-          const queryable = stillPresent.ok();
-          await stillPresent.dispose();
-          const passed = hotHold.resolution === "HOT_EXACT" && hotHold.listed &&
-            hotHold.hotId === fixture.hotId && deletionRejected && queryable;
-          return {
-            passed,
-            observed: `resolution=${hotHold.resolution}; listed=${hotHold.listed}; ` +
-              `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
-          };
-        });
-      } finally {
-        const release = await probe.runJson<{released: boolean}>(
-          "fixture-hot-hold-release",
-          [fixtureRun, hotHold.holdId],
-        );
-        if (!release.released) throw new Error("Disposable HOT_EXACT hold was not released");
-      }
-      const authorizedHotDeleteBefore = storageMetricFromProbe(
-        "storage-lifecycle-before-authorized-hot-delete",
-        await probe.runJson("snapshot"),
-      );
-      this.reporter.storageMetric(authorizedHotDeleteBefore);
-      await this.check({
-        scenario: "storage-lifecycle", category: "retention",
-        action: "delete hot observation after hold release",
-        target: hotPublicId,
-        expected: "the same authenticated delete succeeds only after release, becomes unqueryable, and accounts for exactly one singleton SQL delete",
-      }, async () => {
-        const deletion = await request.delete(
-          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-        );
-        const deletionStatus = deletion.status();
-        const deleted = deletion.ok();
-        await deletion.dispose();
-        const missing = await request.get(
-          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-        );
-        const queryStatus = missing.status();
-        await missing.dispose();
-        expectedAuthorizedHotDeleteSingletonCalls = deleted && queryStatus === 404 ? 1 : 0;
-        const authorizedHotDeleteAfter = storageMetricFromProbe(
-          "storage-lifecycle-after-authorized-hot-delete",
-          await probe.runJson("snapshot"),
-        );
-        this.reporter.storageMetric(authorizedHotDeleteAfter);
-        const beforeSingletonCalls = authorizedHotDeleteBefore.legacySingletonObservationDeleteCalls;
-        const afterSingletonCalls = authorizedHotDeleteAfter.legacySingletonObservationDeleteCalls;
-        const authorizedHotDeleteSingletonCalls =
-          typeof beforeSingletonCalls === "number" && typeof afterSingletonCalls === "number"
-            ? afterSingletonCalls - beforeSingletonCalls
-            : null;
-        return {
-          passed: expectedAuthorizedHotDeleteSingletonCalls === 1 &&
-            authorizedHotDeleteSingletonCalls === expectedAuthorizedHotDeleteSingletonCalls,
-          observed: JSON.stringify({
-            deleteStatus: deletionStatus,
-            followUpGetStatus: queryStatus,
-            expectedAuthorizedHotDeleteSingletonCalls,
-            authorizedHotDeleteSingletonCalls,
-          }),
-        };
-      });
-      const purgeDisruptionPhase = "storage-lifecycle-purge-disruption";
-      await this.metrics.sample();
-      this.reporter.expectRemoteMetricDisruptionPhase(purgeDisruptionPhase);
-      this.metrics.setPhase(purgeDisruptionPhase);
-      try {
-        await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
-          target: archived.generationId ?? "fixture generation",
-          expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
-          const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
-          const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
-            "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
-            "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
-            "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
-            .every(key => value[key] === true) &&
-            value.generationHoldResolution === "GENERATION_EXACT" &&
-            value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
-          return {passed, observed: JSON.stringify(value)};
-        });
-      } finally {
-        this.metrics.setPhase("storage-lifecycle-post-purge");
-        await this.metrics.sample();
-      }
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
         expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
@@ -5028,7 +5029,7 @@ export class RegressionScenarios {
         category: "performance",
         action: "verify bounded database work amplification",
         target: "PostgreSQL observation lifecycle",
-        expected: "the lifecycle adds only its exactly measured authorized hot-row API delete, no unaccounted singleton deletes, and at most 512 MiB of PostgreSQL temporary data",
+        expected: "whole-child raw retirement adds no observation-row DELETE calls and uses at most 512 MiB of PostgreSQL temporary data",
       }, async () => {
         const delta = (field: keyof typeof lifecycleBefore): number | null => {
           const before = lifecycleBefore[field];
@@ -5037,29 +5038,37 @@ export class RegressionScenarios {
         };
         const tempBytes = delta("tempBytes");
         const tempBlocks = delta("statementTempBlocksWritten");
+        const deleteCalls = delta("observationDeleteCalls");
+        const deleteRows = delta("observationDeleteRows");
         const singletonDeletes = delta("legacySingletonObservationDeleteCalls");
+        const batchedDeleteCalls = delta("batchedObservationDeleteCalls");
+        const batchedDeleteRows = delta("batchedObservationDeleteRows");
         const unaccountedSingletonDeletes = singletonDeletes === null
           ? null
-          : singletonDeletes - expectedAuthorizedHotDeleteSingletonCalls;
-        const countersMonotonic = [tempBytes, tempBlocks, singletonDeletes,
+          : singletonDeletes;
+        const countersMonotonic = [tempBytes, tempBlocks, deleteCalls, deleteRows,
+          singletonDeletes, batchedDeleteCalls, batchedDeleteRows,
           unaccountedSingletonDeletes]
           .every(value => value !== null && value >= 0);
         const passed = countersMonotonic && tempBytes! <= 512 * 1024 * 1024 &&
           tempBlocks! <= 65_536 &&
-          expectedAuthorizedHotDeleteSingletonCalls === 1 &&
-          singletonDeletes === expectedAuthorizedHotDeleteSingletonCalls &&
+          deleteCalls === 0 && deleteRows === 0 &&
+          singletonDeletes === 0 &&
+          batchedDeleteCalls === 0 && batchedDeleteRows === 0 &&
           unaccountedSingletonDeletes === 0;
         return {passed, observed: JSON.stringify({
           tempBytes, statementTempBlocksWritten: tempBlocks,
+          observationDeleteCalls: deleteCalls,
+          observationDeleteRows: deleteRows,
           legacySingletonObservationDeleteCalls: singletonDeletes,
-          expectedAuthorizedHotDeleteSingletonCalls,
+          batchedObservationDeleteCalls: batchedDeleteCalls,
+          batchedObservationDeleteRows: batchedDeleteRows,
+          expectedAuthorizedHotDeleteSingletonCalls: 0,
           unaccountedSingletonDeletes,
         })};
       });
     } finally {
       if (apiPage) await apiPage.close().catch(() => undefined);
-      if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
-        this.reporter.error("storage-lifecycle", "fixture-cleanup", error));
       await probe.cleanup();
       if (this.alarmMediaProbe === probe) this.alarmMediaProbe = undefined;
     }

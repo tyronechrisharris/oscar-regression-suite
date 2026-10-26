@@ -495,6 +495,11 @@ export class StorageProbeClient {
       ], {
         timeout: restore
           ? (this.config.storageRestoreProbeTimeoutMs ?? 7_200_000)
+          : action === "stage-lifecycle-witness"
+            ? Math.max(
+              this.config.storageProbeTimeoutMs,
+              this.config.storageArchiveTimeoutMs + 60_000,
+            )
           : this.config.storageProbeTimeoutMs,
         maxBuffer: 32 * 1024 * 1024,
         encoding: "utf8",

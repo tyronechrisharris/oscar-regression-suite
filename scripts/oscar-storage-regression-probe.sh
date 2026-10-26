@@ -5,9 +5,11 @@ umask 077
 
 # Privileged target-side helper for the OSCAR 3.9.2 storage regression. It is copied to
 # /tmp for one run and is never installed into the deployment. Ordinary
-# lifecycle mutations operate only on rows registered in
+# Legacy HOT_RETENTION fixture mutations operate only on rows registered in
 # oscar_regression_fixture and fail closed if a cold-deletion plan includes any
-# other generation. The separately selected restore-drill action intentionally
+# other generation. PARQUET_PRIMARY lifecycle observation uses natural ingest,
+# read-only catalog queries, and a bounded ACCESS SHARE witness lock; it never
+# changes product rows. The separately selected restore-drill action intentionally
 # replaces the isolated database, application state, cold archive, and credentials
 # from the self-contained schema-v2 snapshot; the runner binds that profile to
 # exact target, data-loss, and canonical storage-path acknowledgements, and the
@@ -35,7 +37,7 @@ compose() {
 psql_admin() {
   compose exec -T postgres sh -eu -c '
     PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password)
-    PGOPTIONS=-csearch_path=oscar,public
+    PGOPTIONS='-csearch_path=oscar,public -ctimezone=UTC'
     export PGPASSWORD PGOPTIONS
     exec psql --set=ON_ERROR_STOP=1 --username oscar_bootstrap --dbname gis "$@"
   ' psql-wrapper "$@"
@@ -47,6 +49,7 @@ scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null
 json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
+valid_utc_timestamp() { [[ $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$ ]]; }
 retention_hold_id_from_output() {
   local output=$1 expected_store=$2 expected_scope=$3 expected_resolution=$4
   local line hold_id='' store_key='' id_scope='' resolution='' matches=0
@@ -183,6 +186,14 @@ WITH payload AS (
     AND json_typeof(archive->'rollbackGraceDays') = 'number' AND archive->>'rollbackGraceDays' ~ '^[0-9]+$'
     AND json_typeof(archive->'parquetPrimaryArchiveDelayMinutes') = 'number'
       AND archive->>'parquetPrimaryArchiveDelayMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'immutableStageWindowMinutes') = 'number'
+      AND archive->>'immutableStageWindowMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'maximumFuturePhenomenonSkewMinutes') = 'number'
+      AND archive->>'maximumFuturePhenomenonSkewMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'parquetPrimaryIntervalMinutes') = 'number'
+      AND archive->>'parquetPrimaryIntervalMinutes' ~ '^[0-9]+$'
+    AND json_typeof(archive->'maximumStagePartitionsPerCycle') = 'number'
+      AND archive->>'maximumStagePartitionsPerCycle' ~ '^[0-9]+$'
     AND json_typeof(archive->'maximumGenerationsPerCycle') = 'number'
       AND archive->>'maximumGenerationsPerCycle' ~ '^[0-9]+$'
     AND json_typeof(archive->'maximumVerificationsPerCycle') = 'number'
@@ -246,6 +257,8 @@ SELECT concat_ws('|',
   daily->>'requireBackupBeforeSealedJournalDeletion',
   oscar->>'delegateObservationLifecycleToDatabase', oscar->>'dailyFilePurgeWorkLimit',
   archive->>'enabled', archive->>'storageMode', archive->>'parquetPrimaryArchiveDelayMinutes',
+  archive->>'immutableStageWindowMinutes', archive->>'maximumFuturePhenomenonSkewMinutes',
+  archive->>'parquetPrimaryIntervalMinutes', archive->>'maximumStagePartitionsPerCycle',
   archive->>'maximumGenerationsPerCycle', archive->>'maximumVerificationsPerCycle',
   archive->>'maximumDeletionsPerCycle', (archive->'outputNames')::text)
 FROM valid;
@@ -1766,13 +1779,14 @@ case $action in
       daily_root daily_journal daily_publication daily_zone daily_mode daily_fsync daily_records \
       daily_unforced_bytes daily_segment_bytes daily_segment_age daily_record_bytes daily_retention \
       daily_require_backup lifecycle_delegated daily_purge_work archive_enabled storage_mode \
-      primary_archive_delay max_generations max_verifications max_deletions output_names_json \
+      primary_archive_delay stage_window future_skew primary_interval max_stage_partitions \
+      max_generations max_verifications max_deletions output_names_json \
       unexpected_config_field <<<"$config_fields"
     [[ -z ${unexpected_config_field:-} ]] || fail 'The structural OSCAR config result is ambiguous.'
     packaged_config_fields=$(platform_config_fields /opt/oscar/config.json) ||
       fail 'The packaged OSCAR default config failed structural JSON extraction.'
     IFS='|' read -r -a packaged_config <<<"$packaged_config_fields"
-    [[ ${#packaged_config[@]} -eq 47 ]] ||
+    [[ ${#packaged_config[@]} -eq 51 ]] ||
       fail 'The packaged OSCAR default config result is ambiguous.'
     packaged_archive_interval=${packaged_config[0]}
     packaged_hot_retention=${packaged_config[1]}
@@ -1798,10 +1812,14 @@ case $action in
     packaged_archive_enabled=${packaged_config[40]}
     packaged_storage_mode=${packaged_config[41]}
     packaged_primary_archive_delay=${packaged_config[42]}
-    packaged_max_generations=${packaged_config[43]}
-    packaged_max_verifications=${packaged_config[44]}
-    packaged_max_deletions=${packaged_config[45]}
-    packaged_output_names_json=${packaged_config[46]}
+    packaged_stage_window=${packaged_config[43]}
+    packaged_future_skew=${packaged_config[44]}
+    packaged_primary_interval=${packaged_config[45]}
+    packaged_max_stage_partitions=${packaged_config[46]}
+    packaged_max_generations=${packaged_config[47]}
+    packaged_max_verifications=${packaged_config[48]}
+    packaged_max_deletions=${packaged_config[49]}
+    packaged_output_names_json=${packaged_config[50]}
     for value in "$daily_root" "$daily_journal" "$daily_publication" "$daily_zone" "$daily_mode" \
       "$storage_mode" "$packaged_storage_mode"; do
       safe_json_text "$value"
@@ -1833,10 +1851,11 @@ case $action in
       WITH current_db AS (
         SELECT oid AS dbid FROM pg_database WHERE datname = current_database()
       ), rewritten AS (
-        SELECT coalesce(sum(calls),0)::bigint calls,coalesce(sum(rows),0)::bigint rows
+        SELECT coalesce(sum(calls),0)::bigint calls,
+          coalesce(sum(GREATEST(rows, calls * regexp_count(query, '::jsonb'))),0)::bigint rows
         FROM pg_stat_statements statements
         JOIN current_db USING (dbid)
-        WHERE query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+(public[.])?obs[[:space:]]*[(]'
+        WHERE query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+((oscar|public)[.])?obs[[:space:]]*[(]'
           AND query ~ '[)][[:space:]]*,[[:space:]]*[(]')
       SELECT calls||'|'||rows FROM rewritten;" | tail -n 1)
     IFS='|' read -r batch_calls batch_rows batch_extra <<<"$batch_evidence"
@@ -1849,7 +1868,7 @@ case $action in
         ('obs_pkey'),('obs_unique_constraint_v2'),('obs_datastream_idx'),
         ('obs_phenomenon_time_idx'),('obs_datastream_id_phenomenon_time_idx'),
         ('obs_result_time_idx'),('obs_datastream_id_result_time_idx'),('obs_foi_idx'),
-        ('obs_unarchived_time_idx'),('obs_archive_generation_idx'),
+        ('obs_unarchived_time_idx'),
         ('obs_result_path_ops_idx'),('obs_result_occupancy_count_idx'),
         ('obs_result_max_gamma_idx'),('obs_result_max_neutron_idx')
       ), actual AS (
@@ -1918,13 +1937,17 @@ case $action in
       "$checksums" "$([[ $installed == t ]] && echo true || echo false)" "$([[ $preloaded == t ]] && echo true || echo false)" "$schema" "$schema_checksum"
     printf '"archiveMarker":{"present":%s,"exact":%s,"format":"%s","version":"%s","dataChecksums":"%s","initializedAt":"%s"},' \
       "$marker_present" "$marker_exact" "$marker_format" "$marker_version" "$marker_checksums" "$marker_initialized"
-    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveEnabled":%s,"storageMode":"%s","parquetPrimaryArchiveDelayMinutes":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,"maximumGenerationsPerCycle":%s,"maximumVerificationsPerCycle":%s,"maximumDeletionsPerCycle":%s,"outputNames":%s,"observationIndexes":%s,' \
+    printf '"batchRewriteConfigured":%s,"batchRewriteObservedCalls":%s,"batchRewriteObservedRows":%s,"dailyJournalConfigured":%s,"archiveEnabled":%s,"storageMode":"%s","parquetPrimaryArchiveDelayMinutes":%s,"immutableStageWindowMinutes":%s,"maximumFuturePhenomenonSkewMinutes":%s,"parquetPrimaryIntervalMinutes":%s,"maximumStagePartitionsPerCycle":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"deleteHotAfterArchive":%s,"rollbackGraceDays":%s,"maximumGenerationsPerCycle":%s,"maximumVerificationsPerCycle":%s,"maximumDeletionsPerCycle":%s,"outputNames":%s,"observationIndexes":%s,' \
       "$batch" "$batch_calls" "$batch_rows" "$journal" "$archive_enabled" "$storage_mode" \
-      "${primary_archive_delay:-null}" "${interval:-null}" "${hot_retention:-null}" "$delete_hot" \
+      "${primary_archive_delay:-null}" "${stage_window:-null}" "${future_skew:-null}" \
+      "${primary_interval:-null}" "${max_stage_partitions:-null}" \
+      "${interval:-null}" "${hot_retention:-null}" "$delete_hot" \
       "${grace:-null}" "${max_generations:-null}" "${max_verifications:-null}" \
       "${max_deletions:-null}" "$output_names_json" "$observation_indexes"
-    printf '"packagedDefaults":{"archiveEnabled":%s,"storageMode":"%s","parquetPrimaryArchiveDelayMinutes":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"rollbackGraceDays":%s,"maximumGenerationsPerCycle":%s,"maximumVerificationsPerCycle":%s,"maximumDeletionsPerCycle":%s,"outputNames":%s,"deleteHotAfterArchive":%s,"videoRetentionDays":%s,"videoQueryPeriodMinutes":%s,"maximumCatchUpHours":%s,"lateArrivalOverlapHours":%s,"lateArrivalScanPeriodMinutes":%s,"lateArrivalCatchUpHours":%s,"reconciliationCatchUpHours":%s,"reconciliationPeriodHours":%s,"occupancyStreamRefreshMinutes":%s,"retainedFrameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s,"maintenanceWorkLimit":%s,"frameRetentionEnabled":%s,"sealedJournalRetentionDays":%s,"requireBackupBeforeSealedJournalDeletion":%s},' \
+    printf '"packagedDefaults":{"archiveEnabled":%s,"storageMode":"%s","parquetPrimaryArchiveDelayMinutes":%s,"immutableStageWindowMinutes":%s,"maximumFuturePhenomenonSkewMinutes":%s,"parquetPrimaryIntervalMinutes":%s,"maximumStagePartitionsPerCycle":%s,"archiveIntervalMinutes":%s,"hotRetentionDays":%s,"rollbackGraceDays":%s,"maximumGenerationsPerCycle":%s,"maximumVerificationsPerCycle":%s,"maximumDeletionsPerCycle":%s,"outputNames":%s,"deleteHotAfterArchive":%s,"videoRetentionDays":%s,"videoQueryPeriodMinutes":%s,"maximumCatchUpHours":%s,"lateArrivalOverlapHours":%s,"lateArrivalScanPeriodMinutes":%s,"lateArrivalCatchUpHours":%s,"reconciliationCatchUpHours":%s,"reconciliationPeriodHours":%s,"occupancyStreamRefreshMinutes":%s,"retainedFrameCount":%s,"jpegQuality":%s,"sourceRollbackGraceHours":%s,"metadataReclamationWorkLimit":%s,"maintenanceWorkLimit":%s,"frameRetentionEnabled":%s,"sealedJournalRetentionDays":%s,"requireBackupBeforeSealedJournalDeletion":%s},' \
       "$packaged_archive_enabled" "$packaged_storage_mode" "$packaged_primary_archive_delay" \
+      "$packaged_stage_window" "$packaged_future_skew" "$packaged_primary_interval" \
+      "$packaged_max_stage_partitions" \
       "$packaged_archive_interval" "$packaged_hot_retention" "$packaged_grace" \
       "$packaged_max_generations" "$packaged_max_verifications" "$packaged_max_deletions" \
       "$packaged_output_names_json" "$packaged_delete_hot" \
@@ -2065,17 +2088,18 @@ COMMANDS
     stats AS (SELECT temp_bytes,xact_commit,xact_rollback,tup_inserted,tup_updated,tup_deleted FROM pg_stat_database WHERE datname=current_database()),
     wal AS (SELECT wal_bytes::numeric wal_bytes FROM pg_stat_wal),
     current_db AS (SELECT oid FROM pg_database WHERE datname=current_database()),
-    statements AS (SELECT coalesce(sum(calls),0) calls,coalesce(sum(rows),0) rows
+    statements AS (SELECT coalesce(sum(calls),0) calls,
+        coalesce(sum(GREATEST(rows, calls * GREATEST(regexp_count(query, '::jsonb'), 1))),0) rows
       FROM pg_stat_statements,current_db WHERE dbid=current_db.oid
-        AND query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+(public[.])?obs([[:space:]]|[(])'),
+        AND query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+((oscar|public)[.])?obs([[:space:]]|[(])'),
     statement_io AS (SELECT coalesce(sum(temp_blks_written),0) temp_blocks,
-        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'),0) delete_calls,
-        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'),0) delete_rows,
-        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'),0) delete_calls,
+        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'),0) delete_rows,
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
           AND query ~* 'id[[:space:]]*=[[:space:]]*[$][0-9]+' AND query !~* 'any[[:space:]]*[(]'),0) singleton_delete_calls,
-        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'
+        coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
           AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_calls,
-        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(public[.])?obs([[:space:]]|$)'
+        coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
           AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_rows
       FROM pg_stat_statements,current_db WHERE dbid=current_db.oid),
     catalog AS (SELECT count(*) FILTER(WHERE state='ACTIVE') active,count(*) FILTER(WHERE state='SEALED') sealed,coalesce(sum(row_count),0) rows FROM oscar_archive_generation),
@@ -2108,6 +2132,143 @@ COMMANDS
       'legacyProcessedMarkerFiles',$legacy_markers,'legacyDeletionTombstones',$legacy_tombstones,
       'mediaMetadataCheckpointBytes',$metadata_checkpoint_bytes,'backupBytes',$backup_bytes)
     FROM db,stats,wal,statements,statement_io,catalog,jobs,parity,holds,backups;"
+    ;;
+
+  stage-health)
+    config_fields=$(platform_config_fields /var/lib/oscar/config.json) ||
+      fail 'The live OSCAR config failed structural JSON extraction for stage health.'
+    IFS='|' read -r -a stage_config <<<"$config_fields"
+    [[ ${#stage_config[@]} -eq 51 ]] ||
+      fail 'The live OSCAR config result is ambiguous for stage health.'
+    stage_mode=${stage_config[41]}; stage_window=${stage_config[43]}
+    [[ $stage_mode == PARQUET_PRIMARY || $stage_mode == HOT_RETENTION ]] ||
+      fail 'The live OSCAR storage mode is unsupported.'
+    if [[ $stage_mode != PARQUET_PRIMARY ]]; then
+      safe_json_text "$stage_mode"
+      printf '{"applicable":false,"storageMode":"%s"}\n' "$stage_mode"
+      exit 0
+    fi
+    [[ $stage_window == 30 ]] || fail 'PARQUET_PRIMARY stage health requires a 30-minute stage window.'
+    stage_tables=$(scalar "SELECT count(*) FROM (VALUES
+      (to_regclass(current_schema()||'.oscar_obs_stage_partition')),
+      (to_regclass(current_schema()||'.oscar_obs_stage_owner')),
+      (to_regclass(current_schema()||'.oscar_obs_storage_route'))) required(relation)
+      WHERE relation IS NOT NULL;")
+    [[ $stage_tables == 3 ]] || fail 'PARQUET_PRIMARY stage catalog tables are incomplete.'
+
+    stage_base=$(psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "
+      SELECT
+        count(*) FILTER (WHERE state='ATTACHED'),
+        count(*) FILTER (WHERE state='DETACHED'),
+        (SELECT count(*) FROM oscar_obs_stage_owner),
+        (SELECT count(*) FROM oscar_obs_stage_owner owner
+          WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_partition partition
+            WHERE partition.store_key=owner.store_key AND partition.id_scope=owner.id_scope
+              AND partition.child_table=owner.child_table)),
+        (SELECT count(*) FROM oscar_obs_stage_owner owner
+          WHERE NOT EXISTS (SELECT 1 FROM oscar_archive_generation generation
+            WHERE generation.id=owner.generation_id)),
+        (SELECT count(*) FROM ONLY obs),
+        (SELECT count(*) FROM ONLY obs observation WHERE EXISTS (
+          SELECT 1 FROM oscar_obs_storage_route route
+          WHERE route.datastream_id=observation.datastreamid AND route.immutable))
+      FROM oscar_obs_stage_partition;" | tail -n 1)
+    IFS='|' read -r attached_children detached_children owner_count orphan_registry_owners \
+      orphan_generation_owners parent_rows parent_immutable_rows base_extra <<<"$stage_base"
+    [[ -z ${base_extra:-} && $attached_children =~ ^[0-9]+$ && $detached_children =~ ^[0-9]+$ &&
+       $owner_count =~ ^[0-9]+$ && $orphan_registry_owners =~ ^[0-9]+$ &&
+       $orphan_generation_owners =~ ^[0-9]+$ && $parent_rows =~ ^[0-9]+$ &&
+       $parent_immutable_rows =~ ^[0-9]+$ ]] || fail 'Could not obtain bounded stage catalog counts.'
+
+    stage_rows=0; owned_stage_rows=0; attached_unowned_rows=0; detached_unowned_rows=0
+    owners_missing_rows=0; marker_nonnull_rows=0; immutable_route_mismatches=0
+    missing_relations=0; inheritance_mismatches=0; oldest_age_seconds=0; oldest_received_at=''
+    sample_consistent=true
+    while IFS='|' read -r store_key id_scope parent_table child_table state window_valid extra; do
+      [[ -n $store_key ]] || continue
+      if ! valid_store_key "$store_key" || ! valid_id_scope "$id_scope" ||
+         ! valid_store_key "$parent_table" || ! valid_store_key "$child_table" ||
+         [[ -n ${extra:-} ]] || [[ $state != ATTACHED && $state != DETACHED ]]; then
+        fail 'Stage catalog contains an unsafe or ambiguous partition identity.'
+      fi
+      relation_present=$(scalar "SELECT to_regclass(current_schema()||'.$child_table') IS NOT NULL;")
+      if [[ $relation_present != t ]]; then
+        missing_relations=$((missing_relations+1)); sample_consistent=false; continue
+      fi
+      logged_regular=$(scalar "SELECT EXISTS(SELECT 1 FROM pg_class child
+        JOIN pg_namespace child_namespace ON child_namespace.oid=child.relnamespace
+        WHERE child_namespace.nspname=current_schema() AND child.relname='$child_table'
+          AND child.relkind='r' AND child.relpersistence='p');")
+      inherits=$(scalar "SELECT EXISTS(SELECT 1 FROM pg_inherits inheritance
+        JOIN pg_class child ON child.oid=inheritance.inhrelid
+        JOIN pg_class parent ON parent.oid=inheritance.inhparent
+        JOIN pg_namespace child_namespace ON child_namespace.oid=child.relnamespace
+        JOIN pg_namespace parent_namespace ON parent_namespace.oid=parent.relnamespace
+        WHERE child_namespace.nspname=current_schema() AND parent_namespace.nspname=current_schema()
+          AND child.relname='$child_table' AND parent.relname='$parent_table');")
+      if [[ $window_valid != t || $logged_regular != t ||
+            ($state == ATTACHED && $inherits != t) || ($state == DETACHED && $inherits != f) ]]; then
+        inheritance_mismatches=$((inheritance_mismatches+1)); sample_consistent=false
+      fi
+      child_metrics=$(psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "
+        SELECT count(*),
+          coalesce(to_char(min(received_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),''),
+          coalesce(extract(epoch FROM clock_timestamp()-min(received_at))::bigint,0),
+          count(*) FILTER (WHERE archivegenerationid IS NOT NULL),
+          count(*) FILTER (WHERE EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner
+            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+              AND owner.child_table='$child_table' AND owner.observation_id=stage.id)),
+          count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner
+            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+              AND owner.child_table='$child_table' AND owner.observation_id=stage.id)),
+          count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_storage_route route
+            WHERE route.store_key='$store_key' AND route.id_scope=$id_scope
+              AND route.datastream_id=stage.datastreamid AND route.immutable)),
+          (SELECT count(*) FROM oscar_obs_stage_owner owner
+            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+              AND owner.child_table='$child_table'
+              AND NOT EXISTS (SELECT 1 FROM $child_table physical
+                WHERE physical.id=owner.observation_id))
+        FROM $child_table stage;" 2>/dev/null | tail -n 1 || true)
+      IFS='|' read -r child_rows child_oldest child_age child_markers child_owned child_unowned \
+        child_route_mismatch child_missing_owners child_extra <<<"$child_metrics"
+      if [[ -n ${child_extra:-} || ! $child_rows =~ ^[0-9]+$ || ! $child_age =~ ^[0-9]+$ ||
+            ! $child_markers =~ ^[0-9]+$ || ! $child_owned =~ ^[0-9]+$ ||
+            ! $child_unowned =~ ^[0-9]+$ || ! $child_route_mismatch =~ ^[0-9]+$ ||
+            ! $child_missing_owners =~ ^[0-9]+$ ]]; then
+        sample_consistent=false; continue
+      fi
+      stage_rows=$((stage_rows+child_rows)); owned_stage_rows=$((owned_stage_rows+child_owned))
+      marker_nonnull_rows=$((marker_nonnull_rows+child_markers))
+      immutable_route_mismatches=$((immutable_route_mismatches+child_route_mismatch))
+      owners_missing_rows=$((owners_missing_rows+child_missing_owners))
+      if [[ $state == ATTACHED ]]; then attached_unowned_rows=$((attached_unowned_rows+child_unowned))
+      else detached_unowned_rows=$((detached_unowned_rows+child_unowned)); fi
+      if (( child_age > oldest_age_seconds )); then
+        oldest_age_seconds=$child_age; oldest_received_at=$child_oldest
+      fi
+    done < <(psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "
+      SELECT store_key,id_scope,parent_table,child_table,state,
+        (window_end=window_start+make_interval(mins=>$stage_window)
+          AND extract(epoch FROM window_start)::bigint % ($stage_window*60)=0)
+      FROM oscar_obs_stage_partition ORDER BY store_key,id_scope,window_start,child_table;")
+    [[ -z $oldest_received_at ]] || safe_json_text "$oldest_received_at"
+    if (( owned_stage_rows + owners_missing_rows != owner_count )); then sample_consistent=false; fi
+    slo_exceeded=false
+    if (( oldest_age_seconds > 3600 )); then slo_exceeded=true; fi
+    printf '{"applicable":true,"storageMode":"PARQUET_PRIMARY","attachedChildCount":%s,"detachedChildCount":%s,' \
+      "$attached_children" "$detached_children"
+    printf '"stageRowCount":%s,"oldestReceivedAt":%s,"oldestReceivedAtAgeSeconds":%s,"stagingSloSeconds":3600,"stagingSloExceeded":%s,' \
+      "$stage_rows" "$([[ -n $oldest_received_at ]] && printf '"%s"' "$oldest_received_at" || printf null)" \
+      "$oldest_age_seconds" "$slo_exceeded"
+    printf '"exactSidecarOwnerCount":%s,"ownedStageRowCount":%s,"attachedUnownedRowCount":%s,"detachedUnownedRowCount":%s,' \
+      "$owner_count" "$owned_stage_rows" "$attached_unowned_rows" "$detached_unowned_rows"
+    printf '"orphanRegistryOwnerCount":%s,"orphanGenerationOwnerCount":%s,"ownersMissingPhysicalRowCount":%s,' \
+      "$orphan_registry_owners" "$orphan_generation_owners" "$owners_missing_rows"
+    printf '"markerNonNullRowCount":%s,"immutableRouteMismatchRowCount":%s,"parentOnlyRowCount":%s,"parentImmutableRowCount":%s,' \
+      "$marker_nonnull_rows" "$immutable_route_mismatches" "$parent_rows" "$parent_immutable_rows"
+    printf '"missingRelationCount":%s,"inheritanceMismatchCount":%s,"sampleConsistent":%s}\n' \
+      "$missing_relations" "$inheritance_mismatches" "$sample_consistent"
     ;;
 
   archive-health)
@@ -2538,6 +2699,264 @@ COMMANDS
     trap - EXIT
     ;;
 
+  stage-lifecycle-select)
+    config_fields=$(platform_config_fields /var/lib/oscar/config.json) ||
+      fail 'The live OSCAR config failed structural JSON extraction for stage selection.'
+    IFS='|' read -r -a stage_config <<<"$config_fields"
+    [[ ${#stage_config[@]} -eq 51 && ${stage_config[41]} == PARQUET_PRIMARY ]] ||
+      fail 'Stage lifecycle selection requires PARQUET_PRIMARY.'
+    stage_window=${stage_config[43]}; archive_delay=${stage_config[42]}
+    [[ $stage_window == 30 && $archive_delay =~ ^[1-9][0-9]*$ ]] ||
+      fail 'Stage lifecycle timing is invalid.'
+    selected=false
+    while IFS='|' read -r store_key id_scope parent_table child_table window_start window_end extra; do
+      [[ -n $store_key ]] || continue
+      if ! valid_store_key "$store_key" || ! valid_id_scope "$id_scope" ||
+         ! valid_store_key "$parent_table" || ! valid_store_key "$child_table" ||
+         [[ -n ${extra:-} ]]; then
+        fail 'Stage lifecycle candidate has an unsafe identity.'
+      fi
+      candidate=$(psql_admin --quiet --tuples-only --no-align --command "
+        WITH cold AS (
+          SELECT id,datastreamid,phenomenontime,received_at
+          FROM $child_table ORDER BY phenomenontime,id LIMIT 1
+        )
+        SELECT json_build_object(
+          'available',true,'storeKey','$store_key','idScope',$id_scope,
+          'parentTable','$parent_table','childTable','$child_table',
+          'windowStart','$window_start','windowEnd','$window_end',
+          'rowCount',(SELECT count(*) FROM $child_table),
+          'ownerCount',(SELECT count(*) FROM oscar_obs_stage_owner
+            WHERE store_key='$store_key' AND id_scope=$id_scope AND child_table='$child_table'),
+          'markerNonNullRowCount',(SELECT count(*) FROM $child_table
+            WHERE archivegenerationid IS NOT NULL),
+          'coldId',(SELECT id::text FROM cold),
+          'datastreamId',(SELECT datastreamid FROM cold),
+          'coldTime',(SELECT to_char(phenomenontime AT TIME ZONE 'UTC',
+            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM cold),
+          'oldestReceivedAt',(SELECT to_char(min(received_at) AT TIME ZONE 'UTC',
+            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM $child_table))
+        WHERE EXISTS (SELECT 1 FROM cold)
+          AND EXISTS (SELECT 1 FROM pg_class child
+            JOIN pg_namespace child_namespace ON child_namespace.oid=child.relnamespace
+            WHERE child_namespace.nspname=current_schema() AND child.relname='$child_table'
+              AND child.relkind='r' AND child.relpersistence='p');" 2>/dev/null | tail -n 1 || true)
+      if [[ $candidate == \{* ]]; then printf '%s\n' "$candidate"; selected=true; break; fi
+    done < <(psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "
+      SELECT store_key,id_scope,parent_table,child_table,
+        to_char(window_start AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+        to_char(window_end AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+      FROM oscar_obs_stage_partition
+      WHERE state='ATTACHED' AND window_end<=clock_timestamp()
+        AND window_end>clock_timestamp()-make_interval(mins=>$archive_delay)
+        AND window_end=window_start+make_interval(mins=>$stage_window)
+        AND extract(epoch FROM window_start)::bigint % ($stage_window*60)=0
+      ORDER BY window_end DESC,child_table LIMIT 16;")
+    $selected || printf '{"available":false}\n'
+    ;;
+
+  stage-lifecycle-witness)
+    child_table=${1:-}; store_key=${2:-}; id_scope=${3:-}; expected_rows=${4:-}
+    cold_id=${5:-}; wait_seconds=${6:-}
+    valid_store_key "$child_table" && valid_store_key "$store_key" && valid_id_scope "$id_scope" ||
+      fail 'Stage lifecycle witness has an unsafe stage identity.'
+    [[ $expected_rows =~ ^[1-9][0-9]{0,18}$ && $cold_id =~ ^[1-9][0-9]{0,18}$ &&
+       $wait_seconds =~ ^[1-9][0-9]{0,4}$ && $wait_seconds -le 7200 ]] ||
+      fail 'Stage lifecycle witness bounds are invalid.'
+    witness_output=$(psql_admin --quiet --tuples-only --no-align --command "
+      BEGIN;
+      SET LOCAL client_min_messages=notice;
+      SET LOCAL lock_timeout='2s';
+      DO \$stage_witness\$
+      DECLARE
+        deadline timestamptz := clock_timestamp()+make_interval(secs=>$wait_seconds);
+        relation_present boolean := false;
+        full_ownership boolean := false;
+        stage_rows bigint := 0;
+        unowned_stage_rows bigint := 0;
+        missing_physical_owners bigint := 0;
+        owner_rows bigint := 0;
+        owner_generations bigint := 0;
+        invalid_owner_generations bigint := 0;
+        owner_generation_rows bigint := 0;
+        generation_ids jsonb := '[]'::jsonb;
+        selected_generation_id text := NULL;
+        selected_generation_state text := NULL;
+        selected_generation_parity boolean := false;
+      BEGIN
+        BEGIN
+          EXECUTE 'LOCK TABLE $child_table IN ACCESS SHARE MODE';
+          relation_present := true;
+        EXCEPTION WHEN undefined_table OR lock_not_available THEN
+          RAISE NOTICE 'OSCAR_STAGE_WITNESS:%', json_build_object(
+            'relationPresent',false,'fullOwnershipObserved',false,
+            'rowCount',0,'ownerCount',0,'ownerGenerationCount',0,
+            'invalidOwnerGenerationCount',0,'ownerGenerationRowCount',0,
+            'generationIds','[]'::json,'selectedGenerationId',NULL,
+            'selectedGenerationState',NULL,'selectedGenerationParityVerified',false);
+          RETURN;
+        END;
+        LOOP
+          EXECUTE 'SELECT count(*),
+            count(*) FILTER (WHERE NOT EXISTS (
+              SELECT 1 FROM oscar_obs_stage_owner owner
+              WHERE owner.store_key=''$store_key'' AND owner.id_scope=$id_scope
+                AND owner.child_table=''$child_table'' AND owner.observation_id=stage.id)),
+            (SELECT count(*) FROM oscar_obs_stage_owner owner
+              WHERE owner.store_key=''$store_key'' AND owner.id_scope=$id_scope
+                AND owner.child_table=''$child_table''
+                AND NOT EXISTS (SELECT 1 FROM $child_table stage WHERE stage.id=owner.observation_id))
+            FROM $child_table stage'
+            INTO stage_rows, unowned_stage_rows, missing_physical_owners;
+          SELECT count(*),count(DISTINCT owner.generation_id),
+            count(*) FILTER (WHERE generation.id IS NULL
+              OR generation.store_key<>'$store_key' OR generation.id_scope<>$id_scope
+              OR generation.state NOT IN ('ACTIVE','SEALED')
+              OR NOT generation.parity_verified)
+          INTO owner_rows,owner_generations,invalid_owner_generations
+          FROM oscar_obs_stage_owner owner
+          LEFT JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
+          WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+            AND owner.child_table='$child_table';
+          SELECT coalesce(sum(exact.row_count),0),
+            coalesce(jsonb_agg(exact.id ORDER BY exact.id),'[]'::jsonb)
+          INTO owner_generation_rows,generation_ids
+          FROM (SELECT generation.id::text id,max(generation.row_count) row_count
+            FROM oscar_obs_stage_owner owner
+            JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
+            WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+              AND owner.child_table='$child_table'
+            GROUP BY generation.id) exact;
+          SELECT generation.id::text,generation.state,generation.parity_verified
+          INTO selected_generation_id,selected_generation_state,selected_generation_parity
+          FROM oscar_obs_stage_owner owner
+          JOIN oscar_archive_generation generation ON generation.id=owner.generation_id
+          WHERE owner.store_key='$store_key' AND owner.id_scope=$id_scope
+            AND owner.child_table='$child_table' AND owner.observation_id=$cold_id;
+          full_ownership := stage_rows=$expected_rows AND owner_rows=stage_rows
+            AND unowned_stage_rows=0 AND missing_physical_owners=0
+            AND owner_generations>0 AND invalid_owner_generations=0
+            AND owner_generation_rows=owner_rows AND selected_generation_id IS NOT NULL
+            AND selected_generation_state IN ('ACTIVE','SEALED')
+            AND selected_generation_parity;
+          EXIT WHEN full_ownership OR clock_timestamp()>=deadline;
+          PERFORM pg_sleep(0.1);
+        END LOOP;
+        RAISE NOTICE 'OSCAR_STAGE_WITNESS:%', json_build_object(
+          'relationPresent',relation_present,'fullOwnershipObserved',full_ownership,
+          'rowCount',stage_rows,'ownerCount',owner_rows,
+          'ownerGenerationCount',owner_generations,
+          'invalidOwnerGenerationCount',invalid_owner_generations,
+          'ownerGenerationRowCount',owner_generation_rows,
+          'generationIds',generation_ids,'selectedGenerationId',selected_generation_id,
+          'selectedGenerationState',selected_generation_state,
+          'selectedGenerationParityVerified',selected_generation_parity);
+      END
+      \$stage_witness\$;
+      COMMIT;" 2>&1) || fail 'Could not hold the bounded read-only stage ownership witness.'
+    witness=$(sed -n 's/^NOTICE:[[:space:]]*OSCAR_STAGE_WITNESS://p' <<<"$witness_output" | tail -n 1)
+    [[ $witness == \{* ]] || fail 'Stage lifecycle witness returned no bounded evidence.'
+    printf '%s\n' "$witness"
+    ;;
+
+  stage-lifecycle-status)
+    child_table=${1:-}; store_key=${2:-}; id_scope=${3:-}; cold_id=${4:-}; datastream_id=${5:-}
+    window_start=${6:-}; window_end=${7:-}; selected_generation_id=${8:-}
+    valid_store_key "$child_table" && valid_store_key "$store_key" && valid_id_scope "$id_scope" ||
+      fail 'Stage lifecycle status has an unsafe stage identity.'
+    [[ $cold_id =~ ^[1-9][0-9]{0,18}$ && $datastream_id =~ ^[1-9][0-9]{0,18}$ ]] ||
+      fail 'Stage lifecycle status has an unsafe observation identity.'
+    valid_utc_timestamp "$window_start" && valid_utc_timestamp "$window_end" ||
+      fail 'Stage lifecycle status has an unsafe stage window.'
+    valid_uuid "$selected_generation_id" ||
+      fail 'Stage lifecycle status has an unsafe selected generation identity.'
+    registry_state=$(scalar "SELECT coalesce((SELECT state FROM oscar_obs_stage_partition
+      WHERE store_key='$store_key' AND id_scope=$id_scope AND child_table='$child_table'),'');")
+    [[ -z $registry_state || $registry_state == ATTACHED || $registry_state == DETACHED ]] ||
+      fail 'Stage lifecycle status found an invalid registry state.'
+    relation_present=$(scalar "SELECT to_regclass(current_schema()||'.$child_table') IS NOT NULL;")
+    row_count=0; owner_count=0; marker_count=0; inherits=false; sample_consistent=true
+    if [[ $relation_present == t ]]; then
+      relation_metrics=$(psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "
+        SELECT count(*),count(*) FILTER(WHERE archivegenerationid IS NOT NULL),
+          (SELECT count(*) FROM oscar_obs_stage_owner WHERE store_key='$store_key'
+            AND id_scope=$id_scope AND child_table='$child_table') FROM $child_table;" 2>/dev/null |
+        tail -n 1 || true)
+      IFS='|' read -r row_count marker_count owner_count relation_extra <<<"$relation_metrics"
+      if [[ -n ${relation_extra:-} || ! $row_count =~ ^[0-9]+$ || ! $marker_count =~ ^[0-9]+$ ||
+            ! $owner_count =~ ^[0-9]+$ ]]; then
+        row_count=0; marker_count=0; owner_count=0; sample_consistent=false
+      fi
+      inherits=$(scalar "SELECT EXISTS(SELECT 1 FROM pg_inherits inheritance
+        JOIN pg_class child ON child.oid=inheritance.inhrelid
+        JOIN pg_class parent ON parent.oid=inheritance.inhparent
+        JOIN pg_namespace child_namespace ON child_namespace.oid=child.relnamespace
+        JOIN pg_namespace parent_namespace ON parent_namespace.oid=parent.relnamespace
+        WHERE child_namespace.nspname=current_schema() AND parent_namespace.nspname=current_schema()
+          AND child.relname='$child_table' AND parent.relname='obs');")
+    fi
+    cold_hot_present=$(scalar "SELECT EXISTS(SELECT 1 FROM obs WHERE id=$cold_id);")
+    selected_generation=$(json_query "WITH candidate AS (
+        SELECT generation.id,generation.state,generation.parity_verified,generation.row_count
+        FROM oscar_archive_generation generation
+        WHERE generation.id='$selected_generation_id'::uuid
+          AND generation.store_key='$store_key' AND generation.id_scope=$id_scope
+          AND generation.state IN ('ACTIVE','SEALED')
+          AND EXISTS (SELECT 1 FROM oscar_archive_id_block block
+            WHERE block.generation_id=generation.id
+              AND $cold_id BETWEEN block.min_id AND block.max_id)
+          AND EXISTS (SELECT 1 FROM oscar_archive_schema schema
+            WHERE schema.generation_id=generation.id AND schema.datastream_id=$datastream_id))
+      SELECT json_build_object('generationId',(SELECT id FROM candidate),
+        'generationState',(SELECT state FROM candidate),
+        'parityVerified',coalesce((SELECT parity_verified FROM candidate),false),
+        'generationRowCount',(SELECT row_count FROM candidate));")
+    [[ $selected_generation == \{* ]] || fail 'Could not inspect the selected stage generation.'
+    window_generations=$(json_query "SELECT json_build_object(
+        'generationCount',count(*),
+        'generationIds',coalesce(json_agg(id::text ORDER BY id::text),'[]'::json),
+        'invalidGenerationCount',count(*) FILTER (WHERE NOT parity_verified
+          OR state NOT IN ('ACTIVE','SEALED')),
+        'nonSealedGenerationCount',count(*) FILTER (WHERE state<>'SEALED'),
+        'generationRowCount',coalesce(sum(row_count),0))
+      FROM oscar_archive_generation
+      WHERE store_key='$store_key' AND id_scope=$id_scope AND profile='RAW_GATED'
+        AND window_start='$window_start'::timestamptz
+        AND window_end='$window_end'::timestamptz;")
+    [[ $window_generations == \{* ]] || fail 'Could not inspect every stage-window generation.'
+    [[ -z $registry_state ]] || safe_json_text "$registry_state"
+    printf '{"registryState":%s,"relationPresent":%s,"inheritsParent":%s,' \
+      "$([[ -n $registry_state ]] && printf '"%s"' "$registry_state" || printf null)" \
+      "$([[ $relation_present == t ]] && printf true || printf false)" \
+      "$([[ $inherits == t ]] && printf true || printf false)"
+    printf '"rowCount":%s,"ownerCount":%s,"markerNonNullRowCount":%s,"coldHotPresent":%s,"sampleConsistent":%s,"selectedGeneration":%s,"windowGenerations":%s}\n' \
+      "$row_count" "$owner_count" "$marker_count" \
+      "$([[ $cold_hot_present == t ]] && printf true || printf false)" "$sample_consistent" \
+      "$selected_generation" "$window_generations"
+    ;;
+
+  stage-lifecycle-hot)
+    datastream_id=${1:-}; excluded_id=${2:-}
+    [[ $datastream_id =~ ^[1-9][0-9]{0,18}$ && $excluded_id =~ ^[1-9][0-9]{0,18}$ ]] ||
+      fail 'Stage hot-sample identity is invalid.'
+    hot=$(json_query "WITH candidate AS (
+        SELECT observation.id,observation.phenomenontime
+        FROM obs observation
+        JOIN pg_class relation ON relation.oid=observation.tableoid
+        JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+        JOIN oscar_obs_stage_partition partition ON partition.child_table=relation.relname
+          AND partition.state='ATTACHED'
+        WHERE namespace.nspname=current_schema() AND observation.datastreamid=$datastream_id
+          AND observation.id<>$excluded_id
+        ORDER BY observation.phenomenontime DESC,observation.id DESC LIMIT 1)
+      SELECT json_build_object('available',EXISTS(SELECT 1 FROM candidate),
+        'hotId',(SELECT id::text FROM candidate),
+        'hotTime',(SELECT to_char(phenomenontime AT TIME ZONE 'UTC',
+          'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM candidate));")
+    [[ $hot == \{* ]] || fail 'Could not inspect an attached hot observation sample.'
+    printf '%s\n' "$hot"
+    ;;
+
   fixture-create)
     run=${1:-}; retention=${2:-}; valid_run "$run" || fail 'Invalid run ID.'
     [[ $retention =~ ^[1-9][0-9]*$ ]] || fail 'Invalid retention days.'
@@ -2736,9 +3155,13 @@ COMMANDS
     ;;
 
   export-check)
-    run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
-    generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
-    valid_uuid "$generation" || fail 'Fixture has no archive generation.'
+    subject=${1:-}
+    if valid_uuid "$subject"; then generation=$subject; run=${subject//-/}
+    else
+      run=$subject; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
+      generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
+    fi
+    valid_uuid "$generation" || fail 'No archive generation was selected.'
     store_key=$(scalar "SELECT store_key FROM oscar_archive_generation WHERE id='$generation';")
     id_scope=$(scalar "SELECT id_scope FROM oscar_archive_generation WHERE id='$generation';")
     valid_store_key "$store_key" && valid_id_scope "$id_scope" ||
@@ -2756,9 +3179,13 @@ COMMANDS
     ;;
 
   archive-helper-check)
-    run=${1:-}; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
-    generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
-    valid_uuid "$generation" || fail 'Fixture has no archive generation.'
+    subject=${1:-}
+    if valid_uuid "$subject"; then generation=$subject; run=${subject//-/}
+    else
+      run=$subject; valid_run "$run" || fail 'Invalid run ID.'; ensure_fixture_table
+      generation=$(scalar "SELECT generation_id FROM oscar_regression_fixture WHERE run_id='$run';")
+    fi
+    valid_uuid "$generation" || fail 'No archive generation was selected.'
     object=$(psql_admin --tuples-only --no-align --field-separator=$'\t' --command \
       "SELECT relative_path,sha256 FROM oscar_archive_object WHERE generation_id='$generation' AND state='ACTIVE' ORDER BY relative_path LIMIT 1;" | tail -n1)
     IFS=$'\t' read -r relative expected_sha <<<"$object"

@@ -118,8 +118,19 @@ counters come from PostgreSQL statistics. `observationInsertCalls`,
 ingest remains effective. `observationDeleteCalls`, `observationDeleteRows`,
 `observationRowsPerDeleteCall`, `legacySingletonObservationDeleteCalls`,
 `batchedObservationDeleteCalls`, `batchedObservationDeleteRows`, and
-`batchedObservationRowsPerDeleteCall` distinguish the retired one-row delete
-path from the guarded set-based purge. `statementTempBlocksWritten` exposes
+`batchedObservationRowsPerDeleteCall` remain comparable for `HOT_RETENTION` and
+mutable-data maintenance. Parquet-primary raw retirement is whole-child
+detach/drop, not a row-delete target. Its `storage-health` outcome records the
+read-only stage snapshot as JSON: attached/detached child counts, stage rows,
+oldest `received_at` and age versus the 3,600-second SLO, exact sidecar owner
+count, attached/detached unowned rows, orphan/missing ownership, marker-null and
+immutable-route mismatches, parent-only/parent-immutable rows, missing
+relations, inheritance mismatches, and snapshot consistency. This keeps every
+stage invariant in the standardized outcome CSV/JSON without flattening it into
+the legacy deletion counters. The full lifecycle adds pre-drop evidence for the
+exact owner-generation ID set, aggregate owner/generation row parity, and owner
+generation validity, then records the matching post-drop sealed generation set
+and selected cold-ID retrieval. `statementTempBlocksWritten` exposes
 database-scoped temporary query I/O. Archive generation/row/byte, failure, parity, hold,
 verified-backup, journal, daily-file, retained-media, and backup-size fields
 support like-for-like release comparisons. Retained-media metadata reclamation

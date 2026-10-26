@@ -131,7 +131,6 @@ export class RunReporter {
     const lifecycleDisruption = (this.metadata.profile === "full" ||
       this.metadata.profile === "3.9.2-release") && [
       "storage-lifecycle-export-disruption",
-      "storage-lifecycle-purge-disruption",
       "storage-lifecycle-restart-disruption",
       "storage-lifecycle-backup-disruption",
     ].includes(normalized);

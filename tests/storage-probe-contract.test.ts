@@ -95,6 +95,10 @@ function structuralStorageFixtureAccepted(value: unknown): boolean {
     typeof db.useBatch === "boolean" && db.useBatch === true &&
     archive.storageMode === "PARQUET_PRIMARY" &&
     typeof archive.parquetPrimaryArchiveDelayMinutes === "number" &&
+    typeof archive.immutableStageWindowMinutes === "number" &&
+    typeof archive.maximumFuturePhenomenonSkewMinutes === "number" &&
+    typeof archive.parquetPrimaryIntervalMinutes === "number" &&
+    typeof archive.maximumStagePartitionsPerCycle === "number" &&
     typeof archive.maximumGenerationsPerCycle === "number" &&
     typeof archive.maximumVerificationsPerCycle === "number" &&
     typeof archive.maximumDeletionsPerCycle === "number" &&
@@ -283,6 +287,16 @@ test("storage probe client registers privileged alarm baseline cleanup before an
   assert.match(cleanup, /this\.alarmBaselineRuns\.clear\(\)/);
 });
 
+test("stage ownership witness receives the archive deadline plus a bounded transport margin", () => {
+  const run = storageClient.slice(
+    storageClient.indexOf("async runJson<T>"),
+    storageClient.indexOf("async cleanup(): Promise<void>"),
+  );
+  assert.match(run, /action === "stage-lifecycle-witness"/);
+  assert.match(run, /this\.config\.storageArchiveTimeoutMs \+ 60_000/);
+  assert.match(run, /Math\.max\([\s\S]*this\.config\.storageProbeTimeoutMs/);
+});
+
 test("restore control state is pre-armed, descendant-aware, and fail-closed", () => {
   const state = storageClient.slice(
     storageClient.indexOf("private async waitForRestoreTermination"),
@@ -453,6 +467,8 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
     "duckDbMaximumConcurrentSessions", "duckDbSessionAcquireTimeoutSeconds",
     "duckDbTemporaryDirectory", "archiveResources", "schemaChecksum", "archiveScratch",
     "archiveEnabled", "storageMode", "PARQUET_PRIMARY", "parquetPrimaryArchiveDelayMinutes",
+    "immutableStageWindowMinutes", "maximumFuturePhenomenonSkewMinutes",
+    "parquetPrimaryIntervalMinutes", "maximumStagePartitionsPerCycle",
     "maximumGenerationsPerCycle", "maximumVerificationsPerCycle", "maximumDeletionsPerCycle",
     "outputNames", "observationIndexes", "genericPayloadGinAbsent", "obs_data_idx",
     "obs_result_path_ops_idx", "numericEventIndexesExact",
@@ -478,7 +494,9 @@ test("platform config uses structural JSON extraction and rejects decoys, duplic
     moduleClass: "org.sensorhub.impl.database.system.SystemDriverDatabase",
     dbConfig: {objClass: "org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseConfig",
       useBatch: true, archive: {storageMode: "PARQUET_PRIMARY",
-        parquetPrimaryArchiveDelayMinutes: 5, maximumGenerationsPerCycle: 2,
+        parquetPrimaryArchiveDelayMinutes: 5, immutableStageWindowMinutes: 30,
+        maximumFuturePhenomenonSkewMinutes: 5, parquetPrimaryIntervalMinutes: 1,
+        maximumStagePartitionsPerCycle: 8, maximumGenerationsPerCycle: 2,
         maximumVerificationsPerCycle: 2, maximumDeletionsPerCycle: 2,
         outputNames: ["gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"],
         hotRetentionDays: 2, deleteHotAfterArchive: true}}};
@@ -518,7 +536,11 @@ test("storage gates require the shipped Parquet-primary policy and fresh index c
   for (const required of [
     'storageMode: "PARQUET_PRIMARY"',
     "parquetPrimaryArchiveDelayMinutes: 5",
-    "archiveIntervalMinutes: 5",
+    "immutableStageWindowMinutes: 30",
+    "maximumFuturePhenomenonSkewMinutes: 5",
+    "parquetPrimaryIntervalMinutes: 1",
+    "maximumStagePartitionsPerCycle: 8",
+    "archiveIntervalMinutes: 60",
     "rollbackGraceDays: 3",
     "maximumGenerationsPerCycle: 2",
     "maximumVerificationsPerCycle: 2",
@@ -526,11 +548,46 @@ test("storage gates require the shipped Parquet-primary policy and fresh index c
     '"gammaCounts"', '"gammaThreshold"', '"neutronCounts"', '"setupGamma"', '"setupNeutron"',
     "REGRESSION_ARCHIVE_POLICY", "PARQUET_PRIMARY_OUTPUT_NAMES",
     "genericPayloadGinAbsent", "requiredPresent === indexes.requiredCount",
-    "eventPathGinExact", "numericEventIndexesExact", "completedHourWindow", "fixtureWithinWindow",
+    "eventPathGinExact", "numericEventIndexesExact", "assessImmutableStageHealth",
+    "immutableStageHealthIsSafe",
   ]) assert.ok(block.includes(required) || scenarios.includes(required),
     `missing Parquet-primary release gate: ${required}`);
-  assert.doesNotMatch(block, /archiveIntervalMinutes:\s*60/);
   assert.doesNotMatch(block, /rollbackGraceDays:\s*1[\s\S]{0,100}SHIPPING_STORAGE_POLICY/);
+});
+
+test("stage health is read-only, mode-aware, and reports exact short-stage invariants", () => {
+  const block = probe.slice(probe.indexOf("  stage-health)"), probe.indexOf("  archive-health)"));
+  for (const required of [
+    "PARQUET_PRIMARY", "HOT_RETENTION", "attachedChildCount", "detachedChildCount",
+    "received_at", "stagingSloSeconds\":3600", "exactSidecarOwnerCount",
+    "attachedUnownedRowCount", "detachedUnownedRowCount", "orphanRegistryOwnerCount",
+    "orphanGenerationOwnerCount", "ownersMissingPhysicalRowCount", "archivegenerationid IS NOT NULL",
+    "markerNonNullRowCount", "parentImmutableRowCount", "ONLY obs", "route.immutable",
+    "missingRelationCount", "inheritanceMismatchCount", "sampleConsistent",
+    "relpersistence='p'", "extract(epoch FROM window_start)::bigint % ($stage_window*60)=0",
+  ]) assert.ok(block.includes(required), `missing immutable-stage health field: ${required}`);
+  assert.doesNotMatch(block, /\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b/);
+});
+
+test("primary lifecycle samples natural whole-child retirement without product mutation", () => {
+  const block = probe.slice(
+    probe.indexOf("  stage-lifecycle-select)"), probe.indexOf("  fixture-create)"));
+  for (const required of [
+    "Stage lifecycle selection requires PARQUET_PRIMARY", "state='ATTACHED'",
+    "window_end<=clock_timestamp()", "make_interval(mins=>$archive_delay)", "received_at",
+    "relpersistence='p'", "extract(epoch FROM window_start)::bigint % ($stage_window*60)=0",
+    "oscar_obs_stage_owner", "archivegenerationid IS NOT NULL",
+    "stage-lifecycle-witness)", "LOCK TABLE $child_table IN ACCESS SHARE MODE",
+    "unowned_stage_rows=0", "missing_physical_owners=0",
+    "fullOwnershipObserved", "ownerGenerationCount", "invalidOwnerGenerationCount",
+    "ownerGenerationRowCount", "generationIds", "pg_sleep(0.1)",
+    "stage-lifecycle-status)", "oscar_archive_id_block", "oscar_archive_schema",
+    "generation.state IN ('ACTIVE','SEALED')", "parityVerified", "generationRowCount",
+    "windowGenerations", "nonSealedGenerationCount", "profile='RAW_GATED'",
+    "pg_inherits", "coldHotPresent", "sampleConsistent", "stage-lifecycle-hot)",
+    "partition.state='ATTACHED'", "observation.tableoid",
+  ]) assert.ok(block.includes(required), `missing read-only whole-child probe: ${required}`);
+  assert.doesNotMatch(block, /\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b/);
 });
 
 test("journal status validates exact bounded v1 manifests and direct lane state", () => {
@@ -814,6 +871,8 @@ test("storage snapshot emits activeHolds exactly once", () => {
     "insert metrics must not include obs-prefixed tables");
   assert.ok(block.includes("obs([[:space:]]|$)"),
     "delete metrics must not include obs-prefixed tables");
+  assert.ok(block.includes("oscar_obs_stage_[a-z0-9_]+([[:space:]]|$)"),
+    "delete metrics must include dynamic immutable stage child relations");
 });
 
 test("backup check authenticates markers, epoch, verification, and exact journal outcomes", () => {
@@ -1007,7 +1066,7 @@ test("lifecycle uses the scoped 3.9.2 archive administration interface", () => {
   assert.match(hotBlock, /retention_hold_id_from_output "\$hot_output" "\$store_key" "\$id_scope" HOT_EXACT/);
 });
 
-test("disposable lifecycle proves exact-row activation and deployed helper behavior", () => {
+test("legacy HOT_RETENTION fixture controls remain isolated from the primary stage path", () => {
   const allocator = probe.slice(probe.indexOf("create_observation_fixture()"), probe.indexOf("\n\ncase $action"));
   for (const required of [
     "INSERT INTO oscar_regression_fixture_allocator(singleton,leased_high_water)",
@@ -1092,10 +1151,10 @@ test("retained-media scenario browser-decodes every assessed frame", () => {
 
 test("storage lifecycle refuses mutation when exact release/profile preflight fails", () => {
   const start = scenarios.indexOf("private async storageLifecycle");
-  const fixtureCreate = scenarios.indexOf('"fixture-create-race"', start);
+  const stageSelect = scenarios.indexOf('"stage-lifecycle-select"', start);
   const refusal = scenarios.indexOf("Storage lifecycle mutation refused", start);
-  assert.ok(start > 0 && refusal > start && fixtureCreate > refusal);
-  const block = scenarios.slice(start, fixtureCreate);
+  assert.ok(start > 0 && refusal > start && stageSelect > refusal);
+  const block = scenarios.slice(start, stageSelect);
   assert.match(block, /if \(!profileAccepted\)/);
   assert.match(block, /media\.enabled === REGRESSION_MEDIA_RETENTION\.enabled/);
   assert.match(block, /media\.timeToRetentionDays === REGRESSION_MEDIA_RETENTION\.timeToRetentionDays/);
@@ -1128,30 +1187,41 @@ test("lifecycle-only required storage refuses zero-media certification before la
   assert.match(block, /no exact retained-media set completed certification/);
 });
 
-test("storage lifecycle cleans an attempted fixture even when create acknowledgement is lost", () => {
+test("Parquet-primary lifecycle observes natural stage retirement without fixture DML", () => {
   const start = scenarios.indexOf("private async storageLifecycle");
   const end = scenarios.indexOf("private async storageRestoreDrill", start);
   const block = scenarios.slice(start, end);
-  const attempted = block.indexOf("fixtureCreateAttempted = true");
-  const create = block.indexOf('probe.runJson<{coldId: string; coldRowCount: number; hotId: string', attempted);
-  const cleanup = block.indexOf('if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup"', create);
-  assert.ok(attempted > 0 && create > attempted && cleanup > create);
-  assert.doesNotMatch(block, /fixtureCreated/);
+  for (const required of [
+    "stage-lifecycle-select", "stage-lifecycle-witness", "stage-lifecycle-status",
+    "stage-lifecycle-hot",
+    "completed nonempty 30-minute immutable stage child",
+    "witness exact multi-generation ownership before retirement",
+    "checksum/parity-verified whole-child retirement", "sameWitnessedGenerationIds",
+    "witness.ownerCount === stageSample.rowCount",
+    "witness.ownerGenerationRowCount === stageSample.rowCount",
+    "value.windowGenerations.generationCount === witness.ownerGenerationCount",
+    "value.windowGenerations.generationRowCount === stageSample.rowCount",
+    "registryState === null", "!retired.relationPresent", "!retired.coldHotPresent",
+    "archived.generationId === witness.selectedGenerationId",
+  ]) assert.ok(block.includes(required), `missing natural stage lifecycle contract: ${required}`);
+  for (const forbidden of [
+    "fixture-create", "fixture-create-race", "fixture-accelerate", "fixture-cleanup",
+    "fixture-hot-hold-create", "fixture-controls", "request.delete(",
+  ]) assert.ok(!block.includes(forbidden), `primary lifecycle invokes legacy mutation: ${forbidden}`);
 });
 
-test("storage lifecycle proves direct journal durability, hold enforcement, scratch cleanup, and metadata backup", () => {
+test("storage lifecycle proves direct journal, whole-child retirement, retrieval, scratch, and backup", () => {
   const start = scenarios.indexOf("private async storageLifecycle");
   const end = scenarios.indexOf("private async storageRestoreDrill", start);
   const block = scenarios.slice(start, end);
   for (const required of [
     "OSCAR_STORAGE_SCHEMA_CHECKSUM", "journal-lane-state", "prove direct journal append",
     "status.tamper_fault", "reserved lane journal bytes to advance", "verify compact media metadata",
-    "mediaMetadataHealthIsSafe", "fixture-hot-hold-create", "HOT_EXACT",
-    ".delete(", "fixture-hot-hold-release", "GENERATION_EXACT", "COLD_RANGE_CONSERVATIVE",
-    "generationHoldEnforced", "coldObservationHoldEnforced", "archive-scratch-health",
+    "mediaMetadataHealthIsSafe", "stage-lifecycle-select", "stage-lifecycle-witness",
+    "stage-lifecycle-status",
+    "stage-lifecycle-hot", "archive-scratch-health",
     "return {passed: clean, value: clean",
     "storage-lifecycle-export-disruption", 'this.metrics.setPhase("storage-lifecycle-post-export")',
-    "storage-lifecycle-purge-disruption", 'this.metrics.setPhase("storage-lifecycle-post-purge")',
     "storage-lifecycle-restart-disruption", 'this.metrics.setPhase("storage-lifecycle-post-restart")',
     "storage-lifecycle-backup-disruption", 'this.metrics.setPhase("storage-lifecycle-post-backup")',
     "await this.metrics.sample()", "retained-media indexes to repopulate and stabilize after restart",
@@ -1159,45 +1229,22 @@ test("storage lifecycle proves direct journal durability, hold enforcement, scra
     "verify accelerated retained-media worker is active", "retention-runtime-health",
     "retentionRuntimeReady", "REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS",
     "&order=asc", "&order=desc",
-    "verify clean DuckDB scratch before fixture mutation", "scratchAccepted",
-    "archive-maintenance-idle", "isolate fixture hot-delete accounting", "maintenanceIdle",
-    "eligibleUnownedRows", "stableSamples >= 3", "stableForMs >= 65_000",
+    "verify clean DuckDB scratch before stage observation", "scratchAccepted",
     "archiveScratchIsSafe(value)", "duckDbScratchExcluded",
     "mediaMetadataCheckpointIncluded", "processedObservationIndexesIncluded",
     "deletionIndexesIncluded",
     "retainedMediaExpectedSets", "retainedMediaExpectedMembers",
     "retainedMediaExactMembersVerified", "expectedProcessedIndexes", "expectedDeletionIndexes",
-    "verify one guarded multi-row PostgreSQL purge", "batchCalls === 1",
-    "batchRows === fixture.coldRowCount", "fixture.coldRowCount === 3",
-    "storage-lifecycle-before-authorized-hot-delete",
-    "storage-lifecycle-after-authorized-hot-delete",
-    "authorizedHotDeleteSingletonCalls === expectedAuthorizedHotDeleteSingletonCalls",
+    "retire one verified immutable child as a whole relation",
+    "query cold event by ID", "query mixed hot/cold range",
+    'record?.["datastream@id"] === streamPublicId',
+    "ascColdIndex < ascHotIndex", "descHotIndex < descColdIndex",
     "verify bounded database work amplification", "legacySingletonObservationDeleteCalls",
-    "singletonDeletes === expectedAuthorizedHotDeleteSingletonCalls",
+    "deleteCalls === 0", "deleteRows === 0",
+    "singletonDeletes === 0", "batchedDeleteCalls === 0", "batchedDeleteRows === 0",
     "unaccountedSingletonDeletes === 0",
     "512 * 1024 * 1024", "65_536",
   ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
-  const idle = probe.slice(probe.indexOf("archive_maintenance_idle_json()"), probe.indexOf("case $action in"));
-  for (const required of [
-    "storageMode", "PARQUET_PRIMARY", "parquetPrimaryArchiveDelayMinutes",
-    "rollbackGraceDays", "outputNames", "eligible_unowned_rows",
-    "JOIN obs_datastreams d", "o.archivegenerationid IS NULL", "LIMIT 1",
-    "date_trunc('hour',now()-make_interval(mins=>c.primary_archive_delay_minutes))",
-    "make_interval(days=>c.rollback_grace_days)",
-  ]) assert.ok(idle.includes(required), `missing bounded deployed-config idle contract: ${required}`);
-  const holdCreate = block.indexOf('"fixture-hot-hold-create"');
-  const heldDelete = block.indexOf("request.delete(", holdCreate);
-  const holdRelease = block.indexOf('"fixture-hot-hold-release"', heldDelete);
-  const authorizedDeleteBefore = block.indexOf(
-    '"storage-lifecycle-before-authorized-hot-delete"', holdRelease,
-  );
-  const releasedDelete = block.indexOf("request.delete(", holdRelease);
-  const authorizedDeleteAfter = block.indexOf(
-    '"storage-lifecycle-after-authorized-hot-delete"', releasedDelete,
-  );
-  assert.ok(holdCreate > 0 && heldDelete > holdCreate && holdRelease > heldDelete &&
-    authorizedDeleteBefore > holdRelease && releasedDelete > authorizedDeleteBefore &&
-    authorizedDeleteAfter > releasedDelete);
   assert.match(block, /lane\.bytes >= directJournalAfterAppend!\.bytes/);
 });
 

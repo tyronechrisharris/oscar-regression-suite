@@ -7,6 +7,7 @@ import {
   assessArchiveHealth,
   assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessImmutableStageHealth,
   assessDailyFilePublication,
   assessJpeg,
   assessMediaMetadataHealth,
@@ -14,6 +15,7 @@ import {
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
+  immutableStageHealthIsSafe,
   mediaMetadataHealthIsSafe,
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
   parseBaselineJpeg,
@@ -272,16 +274,20 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
       dataChecksums: "on", initializedAt: "2026-10-17T12:00:00Z"},
     batchRewriteConfigured: true, batchRewriteObservedCalls: 2,
     batchRewriteObservedRows: 100, dailyJournalConfigured: true, archiveEnabled: true,
-    storageMode: "PARQUET_PRIMARY", parquetPrimaryArchiveDelayMinutes: 1,
-    archiveIntervalMinutes: 1, maximumGenerationsPerCycle: 2,
+    storageMode: "PARQUET_PRIMARY", parquetPrimaryArchiveDelayMinutes: 5,
+    immutableStageWindowMinutes: 30, maximumFuturePhenomenonSkewMinutes: 5,
+    parquetPrimaryIntervalMinutes: 1, maximumStagePartitionsPerCycle: 8,
+    archiveIntervalMinutes: 60, maximumGenerationsPerCycle: 2,
     maximumVerificationsPerCycle: 2, maximumDeletionsPerCycle: 2,
     outputNames: ["gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"],
-    observationIndexes: {genericPayloadGinAbsent: true, requiredCount: 14,
-      requiredPresent: 14, missingNames: [], eventPathGinExact: true,
+    observationIndexes: {genericPayloadGinAbsent: true, requiredCount: 13,
+      requiredPresent: 13, missingNames: [], eventPathGinExact: true,
       numericEventIndexesExact: true},
     hotRetentionDays: 1, deleteHotAfterArchive: true, rollbackGraceDays: 1,
     packagedDefaults: {archiveEnabled: true, storageMode: "PARQUET_PRIMARY",
-      parquetPrimaryArchiveDelayMinutes: 5, archiveIntervalMinutes: 5,
+      parquetPrimaryArchiveDelayMinutes: 5, immutableStageWindowMinutes: 30,
+      maximumFuturePhenomenonSkewMinutes: 5, parquetPrimaryIntervalMinutes: 1,
+      maximumStagePartitionsPerCycle: 8, archiveIntervalMinutes: 60,
       hotRetentionDays: 2, rollbackGraceDays: 3,
       maximumGenerationsPerCycle: 2, maximumVerificationsPerCycle: 2,
       maximumDeletionsPerCycle: 2,
@@ -542,6 +548,31 @@ test("archive health counts partial archive and WAL artifacts independently", ()
     checksumVerificationPassed: true});
   assert.equal(health.archivePartialArtifacts, 1);
   assert.equal(health.walPartialArtifacts, 2);
+});
+
+test("immutable-stage health requires exact ownership and mutable-only parent rows", () => {
+  const healthy = assessImmutableStageHealth({
+    applicable: true, storageMode: "PARQUET_PRIMARY", attachedChildCount: 2,
+    detachedChildCount: 0, stageRowCount: 12,
+    oldestReceivedAt: "2026-10-25T12:00:00.000000Z", oldestReceivedAtAgeSeconds: 900,
+    stagingSloSeconds: 3600, stagingSloExceeded: false, exactSidecarOwnerCount: 8,
+    ownedStageRowCount: 8, attachedUnownedRowCount: 4, detachedUnownedRowCount: 0,
+    orphanRegistryOwnerCount: 0, orphanGenerationOwnerCount: 0,
+    ownersMissingPhysicalRowCount: 0, markerNonNullRowCount: 0,
+    immutableRouteMismatchRowCount: 0, parentOnlyRowCount: 3, parentImmutableRowCount: 0,
+    missingRelationCount: 0, inheritanceMismatchCount: 0, sampleConsistent: true,
+  });
+  assert.equal(immutableStageHealthIsSafe(healthy), true);
+  assert.equal(immutableStageHealthIsSafe({...healthy, markerNonNullRowCount: 1}), false);
+  assert.equal(immutableStageHealthIsSafe({...healthy, detachedUnownedRowCount: 1,
+    stageRowCount: 13}), false);
+  assert.equal(immutableStageHealthIsSafe({...healthy, parentImmutableRowCount: 1}), false);
+  assert.equal(immutableStageHealthIsSafe({...healthy, oldestReceivedAtAgeSeconds: 3601,
+    stagingSloExceeded: true}), false);
+
+  const hotRetention = assessImmutableStageHealth({applicable: false,
+    storageMode: "HOT_RETENTION"});
+  assert.equal(immutableStageHealthIsSafe(hotRetention), true);
 });
 
 test("OSH BigId encoding is deterministic and rejects unsafe IDs", () => {

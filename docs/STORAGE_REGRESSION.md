@@ -55,8 +55,10 @@ either `/var/lib/oscar/backups` or `/var/lib/postgresql/backups`. It requires th
 flow to use the running database's network namespace while mounting only the fresh `postgres/`
 staging directory and exact bootstrap-password file into the one-shot base-backup client.
 It also requires the packaged storage CLI to route portable-export copies and
-purge deletions through the archive-object helper; the acknowledged lifecycle
-then exercises both CLI paths against its registered generation.
+operator-directed purge deletions through the archive-object helper. The
+acknowledged Parquet-primary lifecycle exercises export copy/verification
+against the naturally retired generation; destructive purge remains outside the
+primary regression path.
 
 The platform gate also fail-closes on the live JVM temporary-directory split.
 It first requires the packaged entrypoint to be the exact executable deployed in
@@ -136,48 +138,42 @@ linked, or non-regular `oscar.sh`. The exact Viewer host, SSH target, and
 canonical release path are rechecked before every probe action. Probe files and
 command captures use a fresh mode-0700 private workspace with mode-0600 files.
 
-The target must use a fresh database and the regression-only accelerated archive
-profile: `storageMode=PARQUET_PRIMARY`,
-`parquetPrimaryArchiveDelayMinutes=1`, `intervalMinutes=1`,
-`maximumGenerationsPerCycle=2`, `maximumVerificationsPerCycle=2`,
-`maximumDeletionsPerCycle=2`, `rollbackGraceDays=1`, and
-`deleteHotAfterArchive=true`. Its exact allowlist is `gammaCounts`,
+The target must use a fresh database and the 3.9.2 Parquet-primary profile:
+`storageMode=PARQUET_PRIMARY`, `immutableStageWindowMinutes=30`,
+`parquetPrimaryArchiveDelayMinutes=5`, `parquetPrimaryIntervalMinutes=1`,
+`maximumFuturePhenomenonSkewMinutes=5`, `maximumStagePartitionsPerCycle=8`,
+2/2/2 export/verification/deletion caps, and `deleteHotAfterArchive=true`. Its
+exact allowlist is `gammaCounts`,
 `gammaThreshold`, `neutronCounts`, `setupGamma`, and `setupNeutron`; mutable
 occupancy/alarm/adjudication outputs are intentionally not Parquet-primary. Set
 `STORAGE_HOT_RETENTION_DAYS=1` so the compatibility field matches the live test
-configuration, but do not interpret that field as primary-mode eligibility.
-The accelerated worker still exports completed UTC-hour windows; it does not
-create one Parquet object per observation or acknowledge writes directly to
-Parquet.
+configuration, but do not interpret `hotRetentionDays`, `intervalMinutes`, or
+`rollbackGraceDays` as primary-mode eligibility; those fields preserve the
+unchanged `HOT_RETENTION` profile only.
 
-Never copy the one-minute test timing or one-day activation grace into
-production. The platform gate separately reads `/opt/oscar/config.json` and
-requires the shipping policy: `PARQUET_PRIMARY`, a five-minute completed-hour
-delay, a five-minute worker interval, 2/2/2 export/verification/deletion caps,
-three days of verified overlap from generation activation, exact five-output
-allowlisting, and hot-row deletion enabled. A completed hour normally gets its
-first publication opportunity shortly after the delay, but activation may be
-later under bounded backlog or failure. Hot-row retirement is no sooner than
-three days after successful activation; it is not a 72-hour deadline measured
-from observation arrival. The gate also verifies the fresh table omits the
-generic `GIN(result)` index while retaining the path/numeric event indexes and
-the natural-key, stream/time, identity, and archive-lifecycle indexes needed by
-hot transactional workflows. Five-JPEG publication remains immediate and
-asynchronous, with source MP4 deletion eligible only after 24 hours from a
-verified publication.
+Immutable detector writes land in LOGGED 30-minute inherited children. Parquet
+publication may start after the five-minute delay and the one-minute worker;
+the five-minute accepted future-skew budget gives a 30+5+1+5 = 41 minute
+nominal residence budget. One hour is an operational SLO, not a destructive
+deadline: backlog, a failed checksum/parity check, a crash, or a legal hold
+keeps the child instead of dropping unverified data. Parquet plus the direct
+daily files are the durable raw authorities. Only after manifest-last
+publication, checksum and UUID/count parity, and exact compact sidecar ownership
+does OSCAR detach and drop a whole child. No primary-mode row-delete grace is
+used. The suite reports attached/detached children, the oldest `received_at`
+age, exact owner counts, missing/orphan ownership, NULL legacy markers, route
+classification, and the mutable-only parent invariant. The fresh parent omits
+the generic `GIN(result)` and legacy archive-generation index while retaining
+the event indexes required by mutable occupancy/alarm/adjudication workflows.
 
-The lifecycle fixture also remains isolated on a populated disposable test
-catalog. It selects a complete UTC-hour window at least two hours before the
-earliest existing archive generation or job window and proves the activated
-generation is exactly one aligned UTC hour containing the fixture. Its deletion
-cutoff therefore cannot select later pre-existing generations. Before taking the guarded-delete metric
-baseline, the suite additionally requires three clean samples spanning a
-maintenance/delete polling interval: no active export, no latest failed retry,
-no allowlisted unowned row older than the deployed completed-hour cutoff, no
-generation with hot rows older than the deployed rollback grace, and an empty
-DuckDB operation inventory with only the validated permanent lease present. The
-exact-generation plan, hold, confirmation-token,
-parity, and fail-closed non-fixture rejection remain mandatory.
+The lifecycle fixture remains isolated on a populated disposable test catalog.
+Its API assertions cover direct public-observation-ID retrieval from cold
+Parquet and bounded ascending/descending datastream filters spanning both hot
+and cold data. Occupancy UUID lookup remains a separate mutable-event workflow.
+Before lifecycle mutation, the suite requires clean archive jobs and DuckDB
+scratch. Whole-child retirement replaces the former batched PostgreSQL raw-row
+delete expectation; checksum/parity and fail-closed non-fixture rejection remain
+mandatory.
 
 The disposable configuration must also set these fields in the
 existing OSCAR service `videoRetentionConfig` before OSCAR starts:
@@ -206,8 +202,8 @@ This is regression-only acceleration: zero days makes alarms from the current
 run eligible on the next one-minute query, while 24 hours keeps each exact source
 MP4 available for the end-of-run ownership/decodability oracle. Preserve all
 other `videoRetentionConfig` fields. Full-profile preflight reads the persisted live
-config and requires the complete bounded scanner and media-retention profile before retained-media polling or cold-fixture
-creation, so a deployment with stale media policy fails early instead of timing out.
+config and requires the complete bounded scanner and media-retention profile before retained-media polling or stage
+observation, so a deployment with stale media policy fails early instead of timing out.
 The zero-day eligibility is also the packaged production default: work remains
 asynchronous and bounded, five JPEGs must publish and verify successfully, and
 the source MP4 remains available for the following 24-hour rollback grace.
@@ -224,72 +220,54 @@ The platform preflight also requires the archive purge helper to read from
 `/dev/null`; this proves that a helper invoked inside the work-list loop cannot
 consume subsequent rows and leave a multi-object purge plan partially applied.
 
-The probe registers exactly four observations copied from an existing
-`gammaCounts` row: a contiguous three-row cold set beyond hot retention and one
-current control. The three cold rows make the live purge oracle prove that one
-guarded set-based delete removes multiple rows rather than merely using an
-`ANY(...)` query shape once per row. A temporary,
-run-scoped PostgreSQL statement trigger inspects the writer's temporary
-activation ledger, and an advisory-lock barrier pauses only the statement that
-exported the fixture cold row; the probe changes that row's result
-time, releases the barrier, and requires the stale activation to fail with no
-archive marker. The trigger/function are always removed. It then requires the
-real retry to mark exactly the three-row current source set (matching generation
-count/min/max), leave the hot control unmarked, and obtain a parity receipt.
+The primary lifecycle probe does not manufacture raw observations. It selects a
+naturally ingested, nonempty attached child whose aligned window has completed,
+records one exact public observation ID and the child's exact row and
+owner counts, and polls read-only state until the registry row and physical
+relation are both gone. The corresponding generation must be `SEALED`, parity
+verified, and report the exact original child row count. The selected row must
+disappear from PostgreSQL inheritance without ever receiving a legacy
+`archivegenerationid` marker, then remain queryable by exact public ID from
+Parquet. A fresh attached row from the same datastream supplies the hot side of
+the bounded ascending/descending mixed-tier filter proof.
 
-Because `obs.id` has no database sequence, these direct-SQL fixtures use a
-singleton allocator row to serialize a collision-checked test-only `BIGINT`
-lease more than 2^40 IDs beyond the durable hot/archive high-water and fail
-atomically if any of the four candidates is no longer free. The archived fixture keeps
-the larger leased ID so a restart can
-advance the store's durable high-water even after ordinary fixture-row cleanup.
-This deliberate side effect is another reason `storage-lifecycle` is restricted
-to a fresh, disposable database and must never run against a production store.
-
-It verifies a self-contained export,
-accelerates only that registered generation's grace timestamp, proves the cold
-row remains API-queryable alongside the hot row, and tests all live hold
-resolutions. A generation hold must resolve to `GENERATION_EXACT`; an archived
-observation hold must resolve to `COLD_RANGE_CONSERVATIVE`; and the still-hot
-control row must resolve to `HOT_EXACT`. The generation and cold-observation
-holds must each be visible in the operator list and cause a deletion dry run to
-report one held generation with zero plan items. While `HOT_EXACT` is active,
-an authenticated observation DELETE must fail and a GET must still succeed;
-after release the same DELETE must succeed and GET must return 404. The CLI is
-never allowed to create `LEGACY_UNKNOWN`. Schema v5 retains that fourth value
-only for observation holds migrated from pre-v5 catalogs; migrated generation
-holds must be normalized to `GENERATION_EXACT`.
+This natural-ingest design validates the real 30-minute partition path without
+inventing IDs, backdating receipt clocks, changing activation timestamps, or
+issuing raw-row DELETEs. Full certification therefore needs emulator traffic
+and a newly completed nonempty child before the configured lifecycle timeout.
+Selection is deliberately limited to the five-minute archive-delay window so
+the suite can take a bounded PostgreSQL `ACCESS SHARE` witness lock before
+retirement. The read-only witness does not block ingestion or ownership writes;
+it only makes whole-child detach back off until the suite has observed every
+row's exact compact owner, the complete distinct generation-ID set, aggregate
+row parity, and parity-verified `ACTIVE`/`SEALED` state. After releasing the
+lock, the suite requires the same generation-ID set and row total to be sealed,
+the child catalog/relation to disappear, and the selected public observation to
+remain queryable from its sealed generation. This covers capped windows that
+span multiple generations instead of assuming one generation per child. The
+default `STORAGE_ARCHIVE_TIMEOUT_MS=2700000` allows up to 45 minutes to cross a
+30-minute boundary and observe delayed retirement. The
+legacy direct-SQL allocator, marker race,
+row-delete acceleration, hold, and tokenized fixture-purge helpers remain in the
+probe only for separately controlled `HOT_RETENTION` compatibility work. The
+`PARQUET_PRIMARY` scenario never calls them.
 
 Portable export uses the supported coordinated storage command and therefore
-briefly stops and restarts OSCAR to freeze a consistent copy. The confirmed
-tokenized purge follows the same consistency boundary. The suite records every
-raw resource sample but labels only these exact windows
-`storage-lifecycle-export-disruption` and
-`storage-lifecycle-purge-disruption`; they are excluded from steady-state
+briefly stops and restarts OSCAR to freeze a consistent copy. The suite records
+every raw resource sample but labels only that exact window
+`storage-lifecycle-export-disruption`; it is excluded from steady-state
 service-availability assertions only in `full` and `3.9.2-release`. Healthy
-post-export/post-purge samples, immutable image identity, and zero OOM kills
+post-export samples, immutable image identity, and zero OOM kills
 remain mandatory. Compose one-off command containers are not OSCAR services and
 are excluded from service inventory and resource aggregates.
-
-This live lifecycle runs the required accelerated archive-enabled profile. It
-does not rewrite/restart the target into an archive-disabled profile merely to
-repeat `HOT_EXACT` deletion enforcement; that separate configuration is covered
-by product integration tests and remains an environment-specific E2E acceptance
-item if a release policy requires it.
-
-It then tests hold release plus dry-run/token purge. Before purge it queries the frozen
-plan and aborts/deletes that plan unless exactly one item exists and it is the
-registered fixture generation. A wrong token must leave the plan unchanged;
-the valid one must leave object deletion states, ledger entries, and a
-tombstone. Cleanup deletes only registered hot rows and retains catalog audit
-evidence.
 
 While the generation is active, the lifecycle invokes the deployed application
 archive-object helper against a cataloged object: verified copy must preserve
 the catalog hash, while a wrong hash and traversal path must fail. WAL-helper
 publication is intentionally not exercised because 3.9.2 keeps PostgreSQL WAL
-archiving disabled. These mutations run only inside the separately acknowledged
-disposable lifecycle; `storage-health` never changes archive rows.
+archiving disabled. The coordinated export/helper test runs only inside the
+separately acknowledged disposable lifecycle; stage selection, ownership,
+retirement, and retrieval probes are read-only.
 
 ## Daily files and retained media
 
@@ -351,7 +329,7 @@ archive health also rejects `*.partial`, `*.partial.*`, `*.tmp`, and `*.tmp.*`
 artifacts anywhere below the external archive root. The full run uses the
 supported launcher to restart gateway, OSCAR, and PostgreSQL in dependency order
 and rejects shutdown/recovery errors or partial publications, then repeats the
-archive partial scan after helper, export, and purge coverage.
+archive partial scan after helper and export coverage.
 Do not fabricate or rename production daily files for this test.
 
 For smoke/non-lifecycle validation, provide `STORAGE_RETAINED_EVENT_ID` for an alarm
@@ -447,16 +425,12 @@ configured media-retention query interval plus 15 seconds, then waits for a
 nonempty processed-index inventory and three consecutive stable file-count
 snapshots. This prevents a backup from racing startup reclamation and the first
 durable-index reconstruction scan.
-The lifecycle snapshots database-scoped PostgreSQL statement counters directly
-before and after sealing its three-row cold fixture. It requires exactly one
-guarded `id=ANY(...)` delete to remove all three rows and zero calls to the
-retired singleton path. Across the complete lifecycle it also fails if more
-than 512 MiB (65,536 standard 8-KiB blocks) of temporary query work is added.
-The deliberately authenticated single-observation API delete after releasing
-the `HOT_EXACT` hold is bracketed by its own counter snapshots and must account
-for exactly one singleton SQL call. The final lifecycle gate subtracts only
-that proven call and fails on every unaccounted singleton delete; this does not
-relax the independent zero-singleton archive-purge assertion.
+The lifecycle snapshots database-scoped PostgreSQL statement counters around
+natural whole-child retirement. It requires zero singleton and zero batched
+observation-row DELETE calls: reclaiming the verified raw stage must be DDL
+detach/drop, not tuple churn. Across the complete lifecycle it also fails if
+more than 512 MiB (65,536 standard 8-KiB blocks) of temporary query work is
+added.
 The corresponding batch/singleton call, row, rows-per-call, and
 statement-temp-block counters remain in the CSV for trend analysis.
 The backup check then creates a coordinated backup and invokes the supported
@@ -656,8 +630,8 @@ Thresholds belong in site release policy; this suite reports the raw evidence.
 ## Recovery
 
 The copied probe lives under `/tmp` and is removed in `finally`. If a run is
-interrupted, stop further mutation, query `oscar_regression_fixture` by run ID,
-review its exact IDs and generation, release only holds whose reason starts
-`regression-`, and use the supported OSCAR archive commands. Never remove a
-cataloged archive object directly. Preserve the run bundle and classify the
-failure before retrying.
+interrupted, preserve the run bundle and classify the selected child's current
+catalog/relation state with the read-only stage probe before retrying. The
+primary lifecycle creates no fixture rows or holds to clean up. Use only the
+supported OSCAR archive commands for coordinated export or operator-directed
+cold retention; never remove a cataloged archive object directly.
