@@ -37,7 +37,9 @@ source review before the suite can certify that version.
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
-  stale-generation symptoms; alarm ingestion and full-database event filtering;
+  stale-generation symptoms; alarm ingestion and full-database lane/date event
+  filtering through authenticated count-and-page oracles, including the
+  Dashboard's unadjudicated-alarm predicate after generated alarms exist;
   exact generated public observation-ID-to-video association with one unique
   generation-qualified MP4 per authoritative OSH lane-camera UID, nonzero source
   objects, and browser-loaded MP4 metadata
@@ -66,8 +68,9 @@ source review before the suite can certify that version.
   health; exact direct daily-file config, live lane-UID append, hardened
   publication manifests, and restart durability; archive catalog, exact schema
   v5 checksum, bounded DuckDB resources and scratch cleanup, parity, portable
-  export, hot/cold query, all three exact hold modes with deletion enforcement,
-  tokenized purge, and authenticated coordinated-backup controls, retained-media
+  export, exact cold-ID and mixed attached-hot/Parquet-cold queries, natural
+  whole-child retirement with zero raw-row DELETEs, and authenticated
+  coordinated-backup controls, retained-media
   inclusion, scratch exclusion, and daily-journal receipts;
   exact application/PostGIS/gateway tags, immutable running image IDs,
   available repository digests, OCI labels, checksum, the archive root marker and
@@ -134,6 +137,21 @@ chmod 600 .env
 ```
 
 Edit `.env` for the test deployment. Never commit it.
+
+After installing a new release into a versioned target directory, rebind the
+private runner configuration to the one running Compose release. The command is
+read-only unless `--apply` is supplied, uses strict host-key checking, verifies
+the release resolves back to the running OSCAR container, and never changes
+restore acknowledgements or secrets:
+
+```bash
+./scripts/rebind-active-release.sh --build-label 3.9.2-EXACT-ARTIFACT
+./scripts/rebind-active-release.sh --apply --build-label 3.9.2-EXACT-ARTIFACT
+```
+
+Review the preview before applying it. This explicit rebind preserves the
+storage acknowledgement as an operator interlock; regression never silently
+follows a newest directory or a symlink.
 
 Run the low-mutation smoke profile first (it does not inject RPM faults, but it
 does post the national-statistics command and create report bucket files):
@@ -288,11 +306,29 @@ smoke run, reports/national-statistics filters, and both OSCAR 3.9.2 storage gat
 Storage-health is non-destructive but not strictly read-only: its publisher
 contract creates and removes private temporary probe data, so the suite-wide
 remote lease is held. The full `storage-lifecycle` scenario uses a separately acknowledged disposable
-3.9.2 database, registers two synthetic copied observations, and refuses any
-cold purge whose plan includes data outside its unique fixture generation. It
+3.9.2 database and read-only observation probes to follow a naturally ingested,
+eligible immutable child through verified whole-relation retirement. It never
+inserts, updates, deletes, accelerates, or purges raw detector rows. It
 also requires the documented zero-day, one-minute-query alarm-media profile on
-that disposable test deployment; the packaged and production age default stays
-seven days. It does not restore a backup. Daily-file publication verification requires an
+that disposable test deployment. The packaged production profile uses immediate
+asynchronous five-JPEG eligibility with a bounded five-minute query cadence and
+preserves the original MP4 until at least 24 hours after verified publication.
+Its observation archive is explicitly `PARQUET_PRIMARY`: exactly five immutable
+detector outputs land in LOGGED 30-minute children, then use a five-minute
+archive delay, one-minute worker, five-minute future-skew budget, and at most
+eight partition retirements per cycle. The 30+5+1+5 = 41 minute nominal budget
+has a one-hour operational SLO; failure or backlog preserves the child rather
+than making that SLO a data-loss deadline. Checksum/UUID-count parity and exact
+sidecar ownership across one or more capped generations precedes whole-child
+detach/drop, leaving Parquet plus direct
+daily files as the durable raw authorities. Mutable occupancy/alarm/adjudication
+and compact metadata remain PostgreSQL-backed. `hotRetentionDays`,
+`intervalMinutes`, and `rollbackGraceDays` retain their unchanged meaning only
+for `HOT_RETENTION`. The fresh-schema gate verifies the broad generic payload
+GIN and legacy archive-generation index are absent while required mutable-event
+indexes remain. The suite reports stage age, attached/detached children,
+ownership integrity, NULL legacy markers, mutable-only parent behavior, direct
+cold-ID retrieval, and mixed hot/cold range filters. It does not restore a backup. Daily-file publication verification requires an
 overnight/rotation-soak fixture. `STORAGE_BACKUP_WORKFLOW=required` validates the
 selected product mode: disabled proves fail-closed non-mutation, while single
 proves one authenticated self-contained snapshot. See

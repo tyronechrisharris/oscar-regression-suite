@@ -73,6 +73,14 @@ export class StorageProbeClient {
       "test \"$canonical\" != /",
       "test -f \"$canonical/oscar.sh\"",
       "test ! -L \"$canonical/oscar.sh\"",
+      "test -f \"$canonical/compose.yaml\"",
+      "test ! -L \"$canonical/compose.yaml\"",
+      "mapfile -t containers < <(docker ps --filter status=running --filter label=com.docker.compose.project=oscar --filter label=com.docker.compose.service=oscar --format '{{.ID}}')",
+      "test \"${#containers[@]}\" -eq 1",
+      "active_release=$(docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project.working_dir\" }}' \"${containers[0]}\")",
+      "active_config=$(docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project.config_files\" }}' \"${containers[0]}\")",
+      "test \"$active_release\" = \"$canonical\"",
+      "test \"$active_config\" = \"$canonical/compose.yaml\"",
       "printf '%s\\n' \"$canonical\"",
     ].join("; ");
     const command = [
@@ -84,7 +92,7 @@ export class StorageProbeClient {
     const canonical = stdout.trim();
     if (canonical !== this.releaseDirectory || canonical.includes("\n") || canonical.includes("\r")) {
       throw new Error(
-        "Storage probe refused: OSCAR_RELEASE_DIR is missing, linked, noncanonical, or changed remotely",
+        "Storage probe refused: OSCAR_RELEASE_DIR is missing, linked, noncanonical, or not the uniquely running Compose release",
       );
     }
     const acknowledgement =
@@ -487,6 +495,11 @@ export class StorageProbeClient {
       ], {
         timeout: restore
           ? (this.config.storageRestoreProbeTimeoutMs ?? 7_200_000)
+          : action === "stage-lifecycle-witness"
+            ? Math.max(
+              this.config.storageProbeTimeoutMs,
+              this.config.storageArchiveTimeoutMs + 60_000,
+            )
           : this.config.storageProbeTimeoutMs,
         maxBuffer: 32 * 1024 * 1024,
         encoding: "utf8",

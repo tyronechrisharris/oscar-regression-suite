@@ -50,7 +50,8 @@ For a 3.9.2 storage gate, inspect `storage-performance.csv` as well as functiona
 rows. Compare processed/deletion index counts and bytes, manifest/JPEG counts,
 checkpoint bytes, and legacy processed-marker/tombstone counts between like-for-
 like runs. Any nonzero legacy count, malformed metadata-health result, nonempty
-DuckDB scratch, missing direct-journal durability proof, or missing retained-media
+DuckDB operation inventory, missing or unsafe permanent scratch lease, unexpected
+scratch entry, missing direct-journal durability proof, or missing retained-media
 backup member is a correctness failure, not merely a performance observation.
 Windows-native Docker/PowerShell acceptance remains deferred unless a separate
 Windows run transcript exists.

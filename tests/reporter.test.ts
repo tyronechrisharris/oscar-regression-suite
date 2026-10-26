@@ -92,7 +92,11 @@ test("reporter aggregates correct and incorrect behavior and redacts secrets", (
   reporter.storageMetric({phase: "after-batch", databaseSizeBytes: 100, observationTableBytes: 50,
     observationIndexBytes: 25, walBytes: 10, tempBytes: 0, tuplesInserted: 10, tuplesUpdated: 0,
     tuplesDeleted: 0, transactionCommits: 2, transactionRollbacks: 0, observationInsertCalls: 1,
-    observationInsertRows: 10, observationRowsPerCall: 10, activeArchiveGenerations: 1,
+    observationInsertRows: 10, observationRowsPerCall: 10, statementTempBlocksWritten: 0,
+    observationDeleteCalls: 1, observationDeleteRows: 5, observationRowsPerDeleteCall: 5,
+    legacySingletonObservationDeleteCalls: 0, batchedObservationDeleteCalls: 1,
+    batchedObservationDeleteRows: 3, batchedObservationRowsPerDeleteCall: 3,
+    activeArchiveGenerations: 1,
     sealedArchiveGenerations: 0, archiveRows: 5, archiveBytes: 20, failedArchiveJobs: 0,
     failedParityReceipts: 0, activeHolds: 0, verifiedBackups: 1, journalBytes: 10,
     dailyFileBytes: 10, retainedMediaBytes: 10, retainedMediaManifestFiles: 1,
@@ -337,7 +341,7 @@ test("service disruption exemption rejects any profile or phase outside the exac
   );
 });
 
-test("full lifecycle permits only its exact export, purge, restart, and backup disruption phases", () => {
+test("full lifecycle permits only its exact export, restart, and backup disruption phases", () => {
   const root = mkdtempSync(join(tmpdir(), "oscar-regression-lifecycle-disruption-contract-"));
   const reporter = new RunReporter("lifecycle-disruption-contract", root, [], {
     ...metadata,
@@ -345,10 +349,13 @@ test("full lifecycle permits only its exact export, purge, restart, and backup d
   });
   for (const phase of [
     "storage-lifecycle-export-disruption",
-    "storage-lifecycle-purge-disruption",
     "storage-lifecycle-restart-disruption",
     "storage-lifecycle-backup-disruption",
   ]) assert.doesNotThrow(() => reporter.expectRemoteMetricDisruptionPhase(phase));
+  assert.throws(
+    () => reporter.expectRemoteMetricDisruptionPhase("storage-lifecycle-purge-disruption"),
+    /restricted to exact supported disruption phases/,
+  );
   assert.throws(
     () => reporter.expectRemoteMetricDisruptionPhase("storage-lifecycle-other-disruption"),
     /restricted to exact supported disruption phases/,

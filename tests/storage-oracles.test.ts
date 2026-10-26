@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
 import test from "node:test";
 import {
+  archiveScratchRestartIsSafe,
   archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessImmutableStageHealth,
   assessDailyFilePublication,
   assessJpeg,
   assessMediaMetadataHealth,
@@ -12,6 +15,7 @@ import {
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
+  immutableStageHealthIsSafe,
   mediaMetadataHealthIsSafe,
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
   parseBaselineJpeg,
@@ -269,33 +273,69 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     archiveMarker: {present: true, exact: true, format: "oscar-storage-profile", version: "3.9.2",
       dataChecksums: "on", initializedAt: "2026-10-17T12:00:00Z"},
     batchRewriteConfigured: true, batchRewriteObservedCalls: 2,
-    batchRewriteObservedRows: 100, dailyJournalConfigured: true, archiveIntervalMinutes: 1,
-    deleteHotAfterArchive: true, rollbackGraceDays: 1,
+    batchRewriteObservedRows: 100, dailyJournalConfigured: true, archiveEnabled: true,
+    storageMode: "PARQUET_PRIMARY", parquetPrimaryArchiveDelayMinutes: 5,
+    immutableStageWindowMinutes: 30, maximumFuturePhenomenonSkewMinutes: 5,
+    parquetPrimaryIntervalMinutes: 1, maximumStagePartitionsPerCycle: 8,
+    archiveIntervalMinutes: 60, maximumGenerationsPerCycle: 2,
+    maximumVerificationsPerCycle: 2, maximumDeletionsPerCycle: 2,
+    outputNames: ["gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"],
+    observationIndexes: {genericPayloadGinAbsent: true, requiredCount: 13,
+      requiredPresent: 13, missingNames: [], eventPathGinExact: true,
+      numericEventIndexesExact: true},
+    hotRetentionDays: 1, deleteHotAfterArchive: true, rollbackGraceDays: 1,
+    packagedDefaults: {archiveEnabled: true, storageMode: "PARQUET_PRIMARY",
+      parquetPrimaryArchiveDelayMinutes: 5, immutableStageWindowMinutes: 30,
+      maximumFuturePhenomenonSkewMinutes: 5, parquetPrimaryIntervalMinutes: 1,
+      maximumStagePartitionsPerCycle: 8, archiveIntervalMinutes: 60,
+      hotRetentionDays: 2, rollbackGraceDays: 3,
+      maximumGenerationsPerCycle: 2, maximumVerificationsPerCycle: 2,
+      maximumDeletionsPerCycle: 2,
+      outputNames: ["gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"],
+      deleteHotAfterArchive: true, videoRetentionDays: 0, videoQueryPeriodMinutes: 5,
+      maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
+      lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
+      reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,
+      occupancyStreamRefreshMinutes: 15, retainedFrameCount: 5,
+      jpegQuality: 85, sourceRollbackGraceHours: 24,
+      metadataReclamationWorkLimit: 200, maintenanceWorkLimit: 200,
+      frameRetentionEnabled: true, sealedJournalRetentionDays: 30,
+      requireBackupBeforeSealedJournalDeletion: false},
     archiveResources: {memoryLimitMegabytes: 256, threads: 2,
       maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
       sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"},
     archiveScratch: {present: true, realDirectory: true, ownerUid: 10001, ownerGid: 10001,
-      mode: "700", archiveDisjoint: true, entryCount: 0},
+      mode: "700", archiveDisjoint: true, leaseFilePresent: true, leaseFileRegular: true,
+      leaseFileOwnerUid: 10001, leaseFileOwnerGid: 10001, leaseFileMode: "600",
+      entryCount: 0, unexpectedEntryCount: 0},
     dailyJournal: {rootDirectory: "files", journalDirectory: ".dailyfile-journal",
       publicationDirectory: "dailyfiles", zoneId: "UTC", observationMode: "LATEST",
       fsyncIntervalMillis: 1000, maxUnforcedRecords: 128, maxUnforcedBytes: 1048576,
       maxSegmentBytes: 67108864, maxSegmentAgeSeconds: 900, maxRecordBytes: 4194304,
-      sealedJournalRetentionDays: 30, observationLifecycleDelegated: true, purgeWorkLimit: 50},
+      sealedJournalRetentionDays: 30, requireBackupBeforeSealedJournalDeletion: false,
+      observationLifecycleDelegated: true, purgeWorkLimit: 50},
     videoRetention: {enabled: true, timeToRetentionDays: 0, queryPeriodMinutes: 1,
+      maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
+      lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
+      reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,
+      occupancyStreamRefreshMinutes: 15,
       frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
-      metadataReclamationWorkLimit: 200}});
+      metadataReclamationWorkLimit: 200, maintenanceWorkLimit: 200}});
   assert.equal(platform.schemaVersion, 5);
   assert.equal(platform.appImage.imageId, platform.appImage.containerImageId);
   assert.equal(platform.archiveMarker.exact, true);
   assert.equal(platform.backupMode, "single");
   assert.equal(platform.nativeRuntime.nativeSizeBytes, 256 * 1024 * 1024);
   assert.deepEqual(platform.videoRetention, {enabled: true, timeToRetentionDays: 0,
-    queryPeriodMinutes: 1, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
-    metadataReclamationWorkLimit: 200});
+    queryPeriodMinutes: 1, maximumCatchUpHours: 6, lateArrivalOverlapHours: 24,
+    lateArrivalScanPeriodMinutes: 360, lateArrivalCatchUpHours: 2,
+    reconciliationCatchUpHours: 24, reconciliationPeriodHours: 24,
+    occupancyStreamRefreshMinutes: 15, frameCount: 5, jpegQuality: 85, sourceRollbackGraceHours: 24,
+    metadataReclamationWorkLimit: 200, maintenanceWorkLimit: 200});
   assert.deepEqual(platform.archiveResources, {memoryLimitMegabytes: 256, threads: 2,
     maximumTemporaryMegabytes: 4096, maximumConcurrentSessions: 2,
     sessionAcquireTimeoutSeconds: 30, temporaryDirectory: "/var/lib/oscar/duckdb-tmp"});
-  assert.equal(archiveScratchIsSafe(platform.archiveScratch, true), true);
+  assert.equal(archiveScratchIsSafe(platform.archiveScratch), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(platform, "3.9.2"), true);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, configuredRelease: "4.0.0"},
@@ -310,7 +350,7 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     "3.9.2",
   ), false);
   const activeScratch = {...platform.archiveScratch, entryCount: 1};
-  assert.equal(archiveScratchIsSafe(activeScratch, false), false);
+  assert.equal(archiveScratchIsSafe(activeScratch), false);
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, archiveScratch: activeScratch},
     "3.9.2",
@@ -327,6 +367,16 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     {...platform, dailyJournal: {...platform.dailyJournal, observationMode: "FULL"}},
     "3.9.2",
   ), false);
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, dailyJournal: {
+      ...platform.dailyJournal, requireBackupBeforeSealedJournalDeletion: true}},
+    "3.9.2",
+  ), false, "disabled-by-default backup must not leave private journals unbounded");
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...platform, packagedDefaults: {
+      ...platform.packagedDefaults, requireBackupBeforeSealedJournalDeletion: true}},
+    "3.9.2",
+  ), false, "the packaged lifecycle must expose the no-backup journal policy");
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, archiveMarker: {...platform.archiveMarker, initializedAt: "not-an-instant"}},
     "3.9.2",
@@ -399,22 +449,83 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
 });
 
 test("archive scratch and retained-media metadata contracts fail closed", () => {
-  assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
-    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), false), true);
-  assert.equal(archiveScratchIsSafe(assessArchiveScratch({present: false, realDirectory: false,
-    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true, entryCount: 0}), true), false);
+  const safeScratch = assessArchiveScratch({present: true, realDirectory: true,
+    ownerUid: 10001, ownerGid: 10001, mode: "700", archiveDisjoint: true,
+    leaseFilePresent: true, leaseFileRegular: true, leaseFileOwnerUid: 10001,
+    leaseFileOwnerGid: 10001, leaseFileMode: "600", entryCount: 0,
+    unexpectedEntryCount: 0});
+  assert.equal(archiveScratchIsSafe(safeScratch), true);
+  const absentScratch = assessArchiveScratch({present: false, realDirectory: false,
+    ownerUid: null, ownerGid: null, mode: "", archiveDisjoint: true,
+    leaseFilePresent: false, leaseFileRegular: false, leaseFileOwnerUid: null,
+    leaseFileOwnerGid: null, leaseFileMode: "", entryCount: 0, unexpectedEntryCount: 0});
+  assert.equal(archiveScratchIsSafe(absentScratch), false,
+    "the permanent product lease is required even before the first operation");
+  for (const unsafeLease of [
+    {...safeScratch, leaseFilePresent: false},
+    {...safeScratch, leaseFileRegular: false},
+    {...safeScratch, leaseFileOwnerUid: 0},
+    {...safeScratch, leaseFileOwnerGid: 0},
+    {...safeScratch, leaseFileMode: "644"},
+  ]) assert.equal(archiveScratchIsSafe(unsafeLease), false);
+  assert.equal(archiveScratchIsSafe({...safeScratch, unexpectedEntryCount: 1}), false);
+  assert.equal(archiveScratchIsSafe({...safeScratch, entryCount: 1}), false);
   const metadataHealth = assessMediaMetadataHealth({rootPresent: true, checkpointPresent: true,
-    checkpointValid: true, checkpointSchemaVersion: 2, processedIndexFiles: 1,
+    checkpointValid: true, checkpointSchemaVersion: 2,
+    totalEntries: 100_001, regularFiles: 90_001, directories: 10_000, processedIndexFiles: 1,
     processedIndexBytes: 52, deletionIndexFiles: 0, deletionIndexBytes: 0,
     retainedManifestFiles: 1, retainedJpegFiles: 5, legacyProcessedMarkerFiles: 0,
     legacyDeletionTombstones: 0, partialArtifacts: 0, unsafeEntries: 0,
     indexFormatFailures: 0});
   assert.equal(mediaMetadataHealthIsSafe(metadataHealth, true), true);
+  assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, totalEntries: 100_002}, true), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, indexFormatFailures: 1}, false), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointSchemaVersion: 1}, true), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, checkpointPresent: false,
     checkpointValid: false, checkpointSchemaVersion: null}, false), false);
   assert.equal(mediaMetadataHealthIsSafe({...metadataHealth, retainedJpegFiles: 4}, true), false);
+});
+
+test("restart scratch oracle rejects every surviving pre-restart identity", () => {
+  const before = "cold-query-11111111-1111-4111-8111-111111111111";
+  const afterOnly = "metadata-query-22222222-2222-4222-8222-222222222222";
+  const newOnly = assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 1,
+    staleScratchAfterRestartCount: 0,
+    scratchBeforeRestart: [before],
+    scratchAfterRestart: [afterOnly],
+    staleScratchAfterRestart: [],
+  });
+  assert.equal(archiveScratchRestartIsSafe(newOnly), true,
+    "a genuinely new post-start session must be allowed");
+
+  const survivor = assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 2,
+    staleScratchAfterRestartCount: 1,
+    scratchBeforeRestart: [before],
+    scratchAfterRestart: [before, afterOnly],
+    staleScratchAfterRestart: [before],
+  });
+  assert.equal(archiveScratchRestartIsSafe(survivor), false);
+
+  assert.throws(() => assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 2,
+    staleScratchAfterRestartCount: 0,
+    scratchBeforeRestart: [before],
+    scratchAfterRestart: [before, afterOnly],
+    staleScratchAfterRestart: [],
+  }), /exact pre\/post identity intersection/);
+  assert.throws(() => assessArchiveScratchRestart({
+    scratchBeforeRestartCount: 1,
+    scratchAfterRestartCount: 0,
+    staleScratchAfterRestartCount: 0,
+    scratchBeforeRestart: ["../unsafe"],
+    scratchAfterRestart: [],
+    staleScratchAfterRestart: [],
+  }), /canonical DuckDB scratch identity/);
 });
 
 test("retained-media runtime requires a valid current durable scan cursor", () => {
@@ -437,6 +548,31 @@ test("archive health counts partial archive and WAL artifacts independently", ()
     checksumVerificationPassed: true});
   assert.equal(health.archivePartialArtifacts, 1);
   assert.equal(health.walPartialArtifacts, 2);
+});
+
+test("immutable-stage health requires exact ownership and mutable-only parent rows", () => {
+  const healthy = assessImmutableStageHealth({
+    applicable: true, storageMode: "PARQUET_PRIMARY", attachedChildCount: 2,
+    detachedChildCount: 0, stageRowCount: 12,
+    oldestReceivedAt: "2026-10-25T12:00:00.000000Z", oldestReceivedAtAgeSeconds: 900,
+    stagingSloSeconds: 3600, stagingSloExceeded: false, exactSidecarOwnerCount: 8,
+    ownedStageRowCount: 8, attachedUnownedRowCount: 4, detachedUnownedRowCount: 0,
+    orphanRegistryOwnerCount: 0, orphanGenerationOwnerCount: 0,
+    ownersMissingPhysicalRowCount: 0, markerNonNullRowCount: 0,
+    immutableRouteMismatchRowCount: 0, parentOnlyRowCount: 3, parentImmutableRowCount: 0,
+    missingRelationCount: 0, inheritanceMismatchCount: 0, sampleConsistent: true,
+  });
+  assert.equal(immutableStageHealthIsSafe(healthy), true);
+  assert.equal(immutableStageHealthIsSafe({...healthy, markerNonNullRowCount: 1}), false);
+  assert.equal(immutableStageHealthIsSafe({...healthy, detachedUnownedRowCount: 1,
+    stageRowCount: 13}), false);
+  assert.equal(immutableStageHealthIsSafe({...healthy, parentImmutableRowCount: 1}), false);
+  assert.equal(immutableStageHealthIsSafe({...healthy, oldestReceivedAtAgeSeconds: 3601,
+    stagingSloExceeded: true}), false);
+
+  const hotRetention = assessImmutableStageHealth({applicable: false,
+    storageMode: "HOT_RETENTION"});
+  assert.equal(immutableStageHealthIsSafe(hotRetention), true);
 });
 
 test("OSH BigId encoding is deterministic and rejects unsafe IDs", () => {

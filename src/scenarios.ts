@@ -1,7 +1,7 @@
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
-import type {Locator, Page, Request} from "playwright";
+import type {Locator, Page, Request, Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
@@ -19,14 +19,24 @@ import {
   assessDashboardKnownClearTamper,
   assessHealthObservationBatches,
   connectionDataStreamIds,
+  DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
   DASHBOARD_HEALTH_MAX_BATCH_STREAMS,
   DASHBOARD_HEALTH_MAX_IN_FLIGHT,
   expectedDashboardConnectionIds,
   healthRowHasRpmConnectionState,
   forceConnectionObservationsOffline,
   forceSingleConnectionObservationOffline,
+  guardDashboardHealthFixtureRoute,
   parseHealthObservationBatch,
 } from "./dashboard-health.js";
+import {
+  ADVANCED_DATE_FILTER_MAX_BYTES,
+  assessAdvancedDateFilterResponses,
+  buildAdvancedDateFilterProbeUrls,
+  deriveExclusiveDateCutoff,
+  hasDashboardAlarmPredicate,
+  isEventObservationPageUrl,
+} from "./event-filter-oracle.js";
 import {
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
@@ -44,15 +54,19 @@ import {navigateWithBoundedRetry} from "./navigation.js";
 import {RunReporter} from "./reporter.js";
 import {StorageProbeClient} from "./storage-probe.js";
 import {
+  archiveScratchRestartIsSafe,
   archiveScratchIsSafe,
   assessArchiveHealth,
+  assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessImmutableStageHealth,
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
   encodeOshBigId,
+  immutableStageHealthIsSafe,
   MAX_RETAINED_FRAME_BYTES,
   mediaMetadataHealthIsSafe,
   OSCAR_STORAGE_SCHEMA_CHECKSUM,
@@ -63,12 +77,34 @@ import {
   storageMetricFromProbe,
 } from "./storage-oracles.js";
 import {isPublicObservationId} from "./public-observation-id.js";
+import {alarmRowMatchesTrigger, type AlarmTriggerIdentity} from "./alarm-trigger.js";
 import {
   assessDailyJournalStatus,
   type DailyJournalStatus,
 } from "./daily-journal-oracle.js";
 import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
+import {
+  assertNationalRefreshCompletedControl,
+  assertFreshNationalStatisticsObservation,
+  assertNationalRefreshPendingControl,
+  assessExactNationalStatisticsObservation,
+  assessLatestNationalStatisticsObservation,
+  assessNationalStatisticsCommandStatus,
+  assessNationalStatisticsCommandSubmission,
+  classifyNationalStatisticsViewerObservationResponse,
+  isNationalRefreshCompletedControl,
+  NATIONAL_REFRESH_CONTROL_SELECTOR,
+  NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS,
+  NATIONAL_STATISTICS_FIELDS,
+  NATIONAL_STATISTICS_OBSERVED_PROPERTY,
+  nationalStatisticsEqual,
+  parseRenderedNationalStatistics,
+  type NationalStatisticsCommandProgress,
+  type NationalStatisticsField,
+  type NationalStatisticsObservation,
+  type NationalRefreshControlState,
+} from "./national-statistics.js";
 
 interface ProbeResult<T = undefined> {
   passed: boolean;
@@ -107,6 +143,20 @@ function parseBoundedJson(response: BoundedFetchResult, context: string): unknow
   if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
   if (response.contentType !== "application/json") {
     throw new Error(`${context} returned ${response.contentType || "no content type"}, not application/json`);
+  }
+  const bytes = Buffer.from(response.bodyBase64, "base64");
+  if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
+  try {
+    return JSON.parse(new TextDecoder("utf-8", {fatal: true}).decode(bytes));
+  } catch (error) {
+    throw new Error(`${context} returned invalid bounded JSON`, {cause: error});
+  }
+}
+
+function parseBoundedEventApiJson(response: BoundedFetchResult, context: string): unknown {
+  if (!response.ok) throw new Error(`${context} returned HTTP ${response.status}`);
+  if (response.contentType !== "application/json" && response.contentType !== "application/om+json") {
+    throw new Error(`${context} returned ${response.contentType || "no content type"}, not an OSCAR JSON media type`);
   }
   const bytes = Buffer.from(response.bodyBase64, "base64");
   if (bytes.length !== response.byteCount) throw new Error(`${context} base64 length mismatch`);
@@ -180,10 +230,18 @@ const REGRESSION_MEDIA_RETENTION = {
   enabled: true,
   timeToRetentionDays: 0,
   queryPeriodMinutes: 1,
+  maximumCatchUpHours: 6,
+  lateArrivalOverlapHours: 24,
+  lateArrivalScanPeriodMinutes: 360,
+  lateArrivalCatchUpHours: 2,
+  reconciliationCatchUpHours: 24,
+  reconciliationPeriodHours: 24,
+  occupancyStreamRefreshMinutes: 15,
   frameCount: 5,
   jpegQuality: 85,
   sourceRollbackGraceHours: 24,
   metadataReclamationWorkLimit: 200,
+  maintenanceWorkLimit: 200,
 } as const;
 
 const REGRESSION_MEDIA_CURSOR_MAX_LAG_SECONDS = 180;
@@ -195,6 +253,58 @@ const REGRESSION_ARCHIVE_RESOURCES = {
   maximumConcurrentSessions: 2,
   sessionAcquireTimeoutSeconds: 30,
   temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
+} as const;
+
+const PARQUET_PRIMARY_OUTPUT_NAMES = [
+  "gammaCounts",
+  "gammaThreshold",
+  "neutronCounts",
+  "setupGamma",
+  "setupNeutron",
+] as const;
+
+const REGRESSION_ARCHIVE_POLICY = {
+  storageMode: "PARQUET_PRIMARY",
+  parquetPrimaryArchiveDelayMinutes: 5,
+  immutableStageWindowMinutes: 30,
+  maximumFuturePhenomenonSkewMinutes: 5,
+  parquetPrimaryIntervalMinutes: 1,
+  maximumStagePartitionsPerCycle: 8,
+  maximumGenerationsPerCycle: 2,
+  maximumVerificationsPerCycle: 2,
+  maximumDeletionsPerCycle: 2,
+} as const;
+
+const SHIPPING_STORAGE_POLICY = {
+  archiveEnabled: true,
+  storageMode: "PARQUET_PRIMARY",
+  parquetPrimaryArchiveDelayMinutes: 5,
+  immutableStageWindowMinutes: 30,
+  maximumFuturePhenomenonSkewMinutes: 5,
+  parquetPrimaryIntervalMinutes: 1,
+  maximumStagePartitionsPerCycle: 8,
+  archiveIntervalMinutes: 60,
+  hotRetentionDays: 2,
+  rollbackGraceDays: 3,
+  maximumGenerationsPerCycle: 2,
+  maximumVerificationsPerCycle: 2,
+  maximumDeletionsPerCycle: 2,
+  deleteHotAfterArchive: true,
+  videoRetentionDays: 0,
+  videoQueryPeriodMinutes: 5,
+  maximumCatchUpHours: 6,
+  lateArrivalOverlapHours: 24,
+  lateArrivalScanPeriodMinutes: 360,
+  lateArrivalCatchUpHours: 2,
+  reconciliationCatchUpHours: 24,
+  reconciliationPeriodHours: 24,
+  occupancyStreamRefreshMinutes: 15,
+  retainedFrameCount: 5,
+  jpegQuality: 85,
+  sourceRollbackGraceHours: 24,
+  metadataReclamationWorkLimit: 200,
+  maintenanceWorkLimit: 200,
+  frameRetentionEnabled: true,
 } as const;
 
 function isVisible(locator: Locator): Promise<boolean> {
@@ -211,6 +321,7 @@ export class RegressionScenarios {
   private alarmCameraUids: string[] | undefined;
   private alarmLaneUid: string | undefined;
   private readonly generatedAlarmMedia = new Map<string, GeneratedAlarmMedia>();
+  private readonly resolvedAlarmEventIds = new Set<string>();
   private cameraRecordingLogStartedAt: string | undefined;
   private readonly retainedBackupExpectations = new Map<string, string>();
   private retainedMediaProofDeferred = false;
@@ -670,29 +781,152 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "map-national-servers", category: "national", action: "refresh national statistics",
-        target: "/national-view", expected: "statistics refresh completes and renders the local node row",
+        target: "/national-view",
+        expected: "the refresh command reaches a successful durable terminal status and its exact new observation renders in the local node row",
       }, async () => {
+        const baselineResponsePromise = page.waitForResponse((response) => {
+          if (response.request().method() !== "GET") return false;
+          const url = new URL(response.url());
+          return /\/observations\/?$/.test(url.pathname) &&
+            url.searchParams.get("resultTime") === "latest" &&
+            url.searchParams.get("observedProperty") === NATIONAL_STATISTICS_OBSERVED_PROPERTY;
+        }, {timeout: this.config.eventTimeoutMs});
         await this.goto(page, "/national-view");
-        const refresh = page.getByRole("button", {name: "Refresh Statistics"});
-        await refresh.waitFor();
+        const baselineResponse = await baselineResponsePromise;
+        if (!baselineResponse.ok()) {
+          throw new Error(`National statistics baseline returned HTTP ${baselineResponse.status()}`);
+        }
+        const baseline = assessLatestNationalStatisticsObservation(await baselineResponse.json());
+        const refreshControl = page.locator(NATIONAL_REFRESH_CONTROL_SELECTOR);
+        await refreshControl.waitFor();
+        if (await refreshControl.count() !== 1) {
+          throw new Error("National statistics page must expose exactly one stable refresh control");
+        }
+        const readRefreshControl = (): Promise<NationalRefreshControlState> =>
+          refreshControl.evaluate((element) => ({
+            enabled: !(element as HTMLButtonElement).disabled,
+            ariaBusy: element.getAttribute("aria-busy"),
+          }));
         const commandResponse = page.waitForResponse(
           (response) => response.request().method() === "POST" &&
             /\/controlstreams\/[^/]+\/commands/.test(new URL(response.url()).pathname),
           {timeout: this.config.eventTimeoutMs},
         );
-        await refresh.click();
-        const response = await commandResponse;
-        await poll(
-          () => refresh.isEnabled(),
-          (enabled) => enabled,
-          {timeoutMs: 90_000, intervalMs: 1_000, description: "national statistics refresh to complete"},
-        );
-        const body = await page.locator("body").innerText();
-        const hasNode = /Local Node/i.test(body);
-        return {
-          passed: response.ok() && hasNode,
-          observed: `command HTTP ${response.status()}; Local Node rendered=${hasNode}`,
+        const exactUiObservationIds = new Set<string>();
+        const exactUiObservationFailures: string[] = [];
+        const captureExactUiObservation = (response: Response) => {
+          const classified = classifyNationalStatisticsViewerObservationResponse(
+            response.request().method(),
+            response.url(),
+            response.status(),
+            baselineResponse.url(),
+          );
+          if (!classified) return;
+          if (classified.successful) {
+            exactUiObservationIds.add(classified.observationId);
+          } else {
+            exactUiObservationFailures.push(
+              `${classified.observationId}: HTTP ${classified.status}`,
+            );
+          }
         };
+        page.on("response", captureExactUiObservation);
+        const requestStartedAt = Date.now();
+        try {
+          await page.getByRole("button", {name: "Refresh Statistics"}).click();
+          const response = await commandResponse;
+          if (!response.ok()) {
+            throw new Error(`National statistics command returned HTTP ${response.status()}`);
+          }
+
+          let progress: NationalStatisticsCommandProgress =
+            assessNationalStatisticsCommandSubmission(await response.json());
+          const commandsUrl = new URL(response.url());
+          const statusUrl = new URL(commandsUrl);
+          statusUrl.pathname = `${commandsUrl.pathname.replace(/\/+$/, "")}/${encodeURIComponent(progress.commandId)}/status`;
+          statusUrl.search = "format=application/json&offset=0&limit=100";
+
+          const completionDeadline = requestStartedAt + NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS;
+          while (progress.state !== "complete") {
+            assertNationalRefreshPendingControl(progress, await readRefreshControl());
+            if (Date.now() >= completionDeadline) {
+              throw new Error(
+                `National statistics command ${progress.commandId} did not reach a successful terminal status within ` +
+                `${NATIONAL_STATISTICS_COMPLETION_TIMEOUT_MS / 60_000} minutes`,
+              );
+            }
+            await sleep(2_000);
+            const statusResponse = await page.context().request.get(statusUrl.toString());
+            try {
+              if (!statusResponse.ok()) {
+                throw new Error(`National statistics command status returned HTTP ${statusResponse.status()}`);
+              }
+              progress = assessNationalStatisticsCommandStatus(
+                await statusResponse.json(),
+                progress.commandId,
+              );
+            } finally {
+              await statusResponse.dispose();
+            }
+          }
+
+          const observationId = progress.observationId;
+          if (!observationId) {
+            throw new Error(`National statistics command ${progress.commandId} omitted its observation result`);
+          }
+          const observationUrl = new URL(baselineResponse.url());
+          observationUrl.search = "";
+          observationUrl.pathname = `${observationUrl.pathname.replace(/\/+$/, "")}/${encodeURIComponent(observationId)}`;
+          const exactResponse = await page.context().request.get(observationUrl.toString());
+          let refreshed: NationalStatisticsObservation;
+          try {
+            if (!exactResponse.ok()) {
+              throw new Error(`Exact national statistics observation returned HTTP ${exactResponse.status()}`);
+            }
+            refreshed = assessExactNationalStatisticsObservation(await exactResponse.json(), observationId);
+          } finally {
+            await exactResponse.dispose();
+          }
+          assertFreshNationalStatisticsObservation(baseline, refreshed);
+
+          const rendered = await poll(async () => {
+            const localRow = page.locator(".MuiDataGrid-row").filter({
+              has: page.locator('[data-field="site"]', {hasText: "Local Node"}),
+            }).first();
+            await localRow.waitFor({timeout: this.config.uiTimeoutMs});
+            const values = {} as Record<NationalStatisticsField, string>;
+            for (const field of NATIONAL_STATISTICS_FIELDS) {
+              values[field] = await localRow.locator(`[data-field="${field}"]`).innerText();
+            }
+            const statistics = parseRenderedNationalStatistics(values);
+            return {
+              statistics,
+              exactObservationRequestedByViewer: exactUiObservationIds.has(observationId),
+              refreshControl: await readRefreshControl(),
+              viewerFetchFailures: [...exactUiObservationFailures],
+            };
+          }, candidate => candidate.exactObservationRequestedByViewer &&
+              isNationalRefreshCompletedControl(candidate.refreshControl) &&
+              nationalStatisticsEqual(candidate.statistics, refreshed.statistics), {
+            timeoutMs: this.config.eventTimeoutMs,
+            intervalMs: 250,
+            description: `Viewer to render exact national statistics observation ${observationId}`,
+          });
+
+          assertNationalRefreshCompletedControl(rendered.refreshControl);
+          const passed = rendered.exactObservationRequestedByViewer &&
+              nationalStatisticsEqual(rendered.statistics, refreshed.statistics);
+          return {
+            passed,
+            observed: `command HTTP ${response.status()}; command=${progress.commandId}; ` +
+              `terminal=${progress.statusCode}; legacy accepted result=${progress.legacyAcceptedResult}; ` +
+              `baseline=${baseline?.id ?? "none"}; refreshed=${refreshed.id}; exact Viewer fetch=` +
+              `${rendered.exactObservationRequestedByViewer}; Viewer fetch failures=` +
+              `${JSON.stringify(rendered.viewerFetchFailures)}; rendered=${JSON.stringify(rendered.statistics)}`,
+          };
+        } finally {
+          page.off("response", captureExactUiObservation);
+        }
       });
 
       await this.check({
@@ -926,6 +1160,7 @@ export class RegressionScenarios {
     let probeEnabled = true;
     let currentHealthRequests = 0;
     let peakHealthRequests = 0;
+    let fixtureRouteFailure: unknown;
     const trackedRequests = new Set<Request>();
     const batches: Array<{streamIds: string[]; limit: number | null}> = [];
 
@@ -963,16 +1198,35 @@ export class RegressionScenarios {
         return;
       }
 
-      const response = await route.fetch();
-      const payload: unknown = await response.json();
-      if (fixtureMode === "mixed") {
-        const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
-        mixedConnectionObservations += summary.matched;
-        mixedOfflineObservations += summary.offlineMatched;
-      } else {
-        forcedConnectionObservations += forceConnectionObservationsOffline(payload);
-      }
-      await route.fulfill({response, json: payload});
+      await guardDashboardHealthFixtureRoute(async () => {
+        const response = await route.fetch({timeout: DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS});
+        const payload: unknown = await response.json();
+        if (fixtureMode === "mixed") {
+          const summary = forceSingleConnectionObservationOffline(payload, mixedTargetStreamId);
+          mixedConnectionObservations += summary.matched;
+          mixedOfflineObservations += summary.offlineMatched;
+        } else {
+          forcedConnectionObservations += forceConnectionObservationsOffline(payload);
+        }
+        await route.fulfill({response, json: payload});
+      }, (error) => {
+        if (fixtureRouteFailure !== undefined) return;
+        fixtureRouteFailure = error;
+        const observed = `intercepted latest-observation request failed: ${describeError(error)}`;
+        this.reporter.error("dashboard-health", "fixture-route", observed);
+        this.reporter.outcome(
+          "dashboard-health",
+          "dashboard-health",
+          "complete bounded fixture observation request",
+          route.request().url(),
+          `the intercepted request completes within ${DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS} ms`,
+          observed,
+          "incorrect",
+          DASHBOARD_HEALTH_FIXTURE_ROUTE_TIMEOUT_MS,
+          "",
+          describeError(error),
+        );
+      }, () => route.abort("timedout"));
     });
 
     try {
@@ -1411,6 +1665,72 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
+  private waitForEventObservationPage(
+    page: Page,
+    expected: "event-log" | "dashboard-alarms",
+  ): Promise<Response> {
+    return page.waitForResponse(response => {
+      if (response.request().method() !== "GET" || response.status() < 200 || response.status() >= 300 ||
+          !isEventObservationPageUrl(response.url(), this.config.oscarBaseUrl)) return false;
+      const sourceFilter = new URL(response.url()).searchParams.get("filter") ?? "";
+      return expected === "dashboard-alarms"
+        ? hasDashboardAlarmPredicate(response.url())
+        : sourceFilter === "";
+    }, {timeout: this.config.eventTimeoutMs});
+  }
+
+  private async advancedDateFilterApiOracle(
+    page: Page,
+    sourceResponse: Response,
+    requireDashboardAlarmPredicate: boolean,
+  ): Promise<ProbeResult> {
+    const sourcePayload = await sourceResponse.json();
+    const cutoff = deriveExclusiveDateCutoff(sourcePayload);
+    const urls = buildAdvancedDateFilterProbeUrls(
+      sourceResponse.url(),
+      this.config.oscarBaseUrl,
+      cutoff,
+    );
+    if (requireDashboardAlarmPredicate && !hasDashboardAlarmPredicate(sourceResponse.url())) {
+      throw new Error("Dashboard date-filter source omitted its unadjudicated alarm predicate");
+    }
+
+    const [countResponse, pageResponse] = await Promise.all([
+      page.evaluate(boundedFetch, {
+        url: urls.countUrl,
+        maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES,
+        decodeImage: false,
+      }),
+      page.evaluate(boundedFetch, {
+        url: urls.pageUrl,
+        maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES,
+        decodeImage: false,
+      }),
+    ]);
+    const countPayload = countResponse.ok
+      ? parseBoundedEventApiJson(countResponse, "advanced date-filter count")
+      : null;
+    const pagePayload = pageResponse.ok
+      ? parseBoundedEventApiJson(pageResponse, "advanced date-filter page")
+      : null;
+    const assessment = assessAdvancedDateFilterResponses(
+      countResponse.status,
+      countPayload,
+      pageResponse.status,
+      pagePayload,
+      urls.cutoff,
+    );
+    return {
+      passed: assessment.passed,
+      observed: `count HTTP=${countResponse.status}; page HTTP=${pageResponse.status}; ` +
+        `count=${assessment.count ?? "invalid"}; page items=${assessment.pageItems}; ` +
+        `before cutoff=${assessment.beforeCutoff}/${assessment.validStartTimes}; ` +
+        `datastreams=${urls.datastreamCount}; cutoff=${urls.cutoff}; ` +
+        `source predicate=${urls.sourceFilter ? "present" : "none"}; ` +
+        `reason=${assessment.reason || "none"}`,
+    };
+  }
+
   private async eventFiltering(): Promise<void> {
     const page = await this.browser.oscarPage();
     try {
@@ -1424,6 +1744,16 @@ export class RegressionScenarios {
         await rows.first().waitFor({timeout: this.config.eventTimeoutMs});
         const count = await rows.count();
         return {passed: count > 0, observed: `${count} visible rows`};
+      });
+      await this.check({
+        scenario: "event-filtering", category: "events", action: "apply read-only start-time filter",
+        target: "Event Log authenticated observations API",
+        expected: "a known nonempty occupancy page yields HTTP 200 for count and page, a positive count, and only start times before the exclusive cutoff",
+      }, async () => {
+        const sourcePromise = this.waitForEventObservationPage(page, "event-log");
+        await this.goto(page, "/event-log");
+        const sourceResponse = await sourcePromise;
+        return this.advancedDateFilterApiOracle(page, sourceResponse, false);
       });
       await this.check({
         scenario: "event-filtering", category: "events", action: "apply full-database lane filter",
@@ -2526,11 +2856,15 @@ export class RegressionScenarios {
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
       const eventId = (await uuidValue.innerText()).trim();
       const url = new URL(page.url());
-      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId;
+      const alreadyResolved = this.resolvedAlarmEventIds.has(eventId);
+      const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId &&
+        !alreadyResolved;
+      if (passed) this.resolvedAlarmEventIds.add(eventId);
       return {
         passed,
         value: passed ? eventId : undefined,
-        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}`,
+        observed: `UUID=${eventId || "missing"}; URL identity matches=${url.searchParams.get("eventId") === eventId}; ` +
+          `new to this run=${!alreadyResolved}`,
         evidence: passed ? "" : await this.screenshotOnFailure(page, `${scenario}-${type}-uuid`),
       };
     });
@@ -2681,9 +3015,10 @@ export class RegressionScenarios {
   private async triggerAlarm(
     type: "gamma" | "neutron",
     scenario = "rpm-alarms",
-  ): Promise<number | undefined> {
+  ): Promise<AlarmTriggerIdentity | undefined> {
     await this.ensureAlarmMediaBaseline(scenario);
     const before = await this.emulator.waitForIdle(this.config.testRpmId);
+    const initiatedAtEpochMs = Date.now();
     await this.emulator.trigger(this.config.testRpmId, type === "gamma", type === "neutron");
     const active = await this.emulator.waitForStatus(
       this.config.testRpmId,
@@ -2698,10 +3033,14 @@ export class RegressionScenarios {
       active.occupancy_count > before.occupancy_count ? "correct" : "incorrect", 0,
     );
     await this.emulator.waitForIdle(this.config.testRpmId, this.config.eventTimeoutMs);
-    return active.occupancy_count;
+    return {occupancyCount: active.occupancy_count, initiatedAtEpochMs};
   }
 
-  private async findAlarmRow(page: Page, statusText: RegExp, occupancyCount: number): Promise<Locator> {
+  private async findAlarmRow(
+    page: Page,
+    statusText: RegExp,
+    trigger: AlarmTriggerIdentity,
+  ): Promise<Locator> {
     await this.goto(page, "/event-log");
     await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
     await this.applyLaneEventFilter(page);
@@ -2710,8 +3049,10 @@ export class RegressionScenarios {
       const count = await laneRows.count();
       for (let index = 0; index < count; index++) {
         const candidate = laneRows.nth(index);
-        const occupancy = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
-        if (occupancy.trim() === String(occupancyCount) && statusText.test(await candidate.innerText())) {
+        const occupancyCount = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
+        const startTime = await candidate.locator('[data-field="startTime"]').innerText().catch(() => "");
+        const text = await candidate.innerText();
+        if (alarmRowMatchesTrigger({occupancyCount, startTime, text}, statusText, trigger)) {
           return candidate;
         }
       }
@@ -2719,18 +3060,31 @@ export class RegressionScenarios {
     }, (candidate): candidate is Locator => candidate !== null, {
       timeoutMs: this.config.eventTimeoutMs,
       intervalMs: 1_000,
-      description: `${statusText} occupancy ${occupancyCount} for ${this.config.testLaneLabel}`,
+      description: `${statusText} occupancy ${trigger.occupancyCount} created after its trigger for ${this.config.testLaneLabel}`,
     });
     if (!row) throw new Error(
-      `No ${statusText} occupancy ${occupancyCount} found for ${this.config.testLaneLabel}`,
+      `No new ${statusText} occupancy ${trigger.occupancyCount} found for ${this.config.testLaneLabel}`,
     );
     return row;
+  }
+
+  private async verifyDashboardAlarmDateFilter(page: Page): Promise<void> {
+    await this.check({
+      scenario: "rpm-alarms", category: "events", action: "apply Dashboard alarm start-time filter",
+      target: "Dashboard authenticated observations API",
+      expected: "after generated alarms exist, the Dashboard's unadjudicated alarm predicate plus an exclusive start-time cutoff returns HTTP 200, a positive count, and only matching rows",
+    }, async () => {
+      const sourcePromise = this.waitForEventObservationPage(page, "dashboard-alarms");
+      await this.goto(page, "/");
+      const sourceResponse = await sourcePromise;
+      return this.advancedDateFilterApiOracle(page, sourceResponse, true);
+    });
   }
 
   private async alarms(): Promise<void> {
     if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
     const page = await this.browser.oscarPage();
-    const generated: Array<{type: "gamma" | "neutron"; occupancyCount: number}> = [];
+    const generated: Array<{type: "gamma" | "neutron"; trigger: AlarmTriggerIdentity}> = [];
     const quiet = this.emulator.quietConfig(this.originalRpmConfig);
     try {
       await this.ensureAlarmMediaBaseline("rpm-alarms");
@@ -2743,25 +3097,27 @@ export class RegressionScenarios {
       // resolving the events afterwards also proves that neither generation inherited the
       // other's authoritative camera path.
       for (const type of ["gamma", "neutron"] as const) {
-        const occupancyCount = await this.triggerAlarm(type);
-        if (occupancyCount === undefined) throw new Error(`${type} trigger returned no occupancy count`);
-        generated.push({type, occupancyCount});
+        const trigger = await this.triggerAlarm(type);
+        if (trigger === undefined) throw new Error(`${type} trigger returned no occupancy identity`);
+        generated.push({type, trigger});
       }
-      for (const {type, occupancyCount} of generated) {
+      for (const {type, trigger} of generated) {
+        const {occupancyCount} = trigger;
         const ingested = await this.check({
           scenario: "rpm-alarms", category: "event-ingestion", action: `ingest ${type} alarm`,
           target: this.config.testLaneLabel, expected: `Event Log shows a new ${type} event on the reserved lane`,
         }, async () => {
-          const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+          const row = await this.findAlarmRow(page, new RegExp(type, "i"), trigger);
           const text = await row.innerText();
           const passed = new RegExp(type, "i").test(text);
           return {passed, value: passed, observed: text};
         });
         if (!ingested) continue;
-        const row = await this.findAlarmRow(page, new RegExp(type, "i"), occupancyCount);
+        const row = await this.findAlarmRow(page, new RegExp(type, "i"), trigger);
         const eventId = await this.resolveAlarmEventUuid(page, row, type, occupancyCount, "rpm-alarms");
         if (eventId) await this.captureAlarmMedia(page, eventId, type, occupancyCount, "rpm-alarms");
       }
+      await this.verifyDashboardAlarmDateFilter(page);
       if (this.alarmMediaProbe && this.cameraRecordingLogStartedAt) {
         await this.check({
           scenario: "rpm-alarms",
@@ -2866,9 +3222,10 @@ export class RegressionScenarios {
         metadata.expected, "UUID search input and submit controls detected", "correct", 0,
       );
 
-      const occupancyCount = await this.triggerAlarm("gamma", "event-uuid");
-      if (occupancyCount === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy count");
-      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      const trigger = await this.triggerAlarm("gamma", "event-uuid");
+      if (trigger === undefined) throw new Error("UUID workflow alarm trigger returned no occupancy identity");
+      const {occupancyCount} = trigger;
+      const row = await this.findAlarmRow(page, /Gamma/i, trigger);
       await Promise.all([
         page.waitForURL(
           (url) => normalizePathname(url.pathname) === "/event-details",
@@ -2889,12 +3246,15 @@ export class RegressionScenarios {
         const validIdentity = isPublicObservationId(uuid);
         const canonical = current.searchParams.get("eventId") === uuid &&
           Boolean(current.searchParams.get("nodeId"));
-        const passed = validIdentity && canonical;
+        const alreadyResolved = this.resolvedAlarmEventIds.has(uuid);
+        const passed = validIdentity && canonical && !alreadyResolved;
+        if (passed) this.resolvedAlarmEventIds.add(uuid);
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "event-uuid-detail");
         return {
           passed,
-          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; nodeId=${current.searchParams.get("nodeId") ?? "missing"}`,
-          value: validIdentity ? uuid : undefined,
+          observed: `uuid=${uuid || "missing"}; canonical eventId=${canonical}; ` +
+            `nodeId=${current.searchParams.get("nodeId") ?? "missing"}; new to this run=${!alreadyResolved}`,
+          value: passed ? uuid : undefined,
           evidence,
         };
       });
@@ -3205,11 +3565,12 @@ export class RegressionScenarios {
   }
 
   private async adjudicationAndAlarmTransfer(): Promise<void> {
-    const occupancyCount = await this.triggerAlarm("gamma");
-    if (occupancyCount === undefined) throw new Error("gamma trigger returned no occupancy count");
+    const trigger = await this.triggerAlarm("gamma");
+    if (trigger === undefined) throw new Error("gamma trigger returned no occupancy identity");
+    const {occupancyCount} = trigger;
     const page = await this.browser.oscarPage();
     try {
-      const row = await this.findAlarmRow(page, /Gamma/i, occupancyCount);
+      const row = await this.findAlarmRow(page, /Gamma/i, trigger);
       await Promise.all([
         page.waitForURL(/\/event-details/, {waitUntil: "domcontentloaded"}),
         row.dblclick(),
@@ -3240,6 +3601,7 @@ export class RegressionScenarios {
         };
         const observationId = parsed.payload?.event?.observationId ?? "";
         const exportedOccupancyId = parsed.payload?.event?.occupancyId ?? "";
+        const alreadyResolved = this.resolvedAlarmEventIds.has(observationId);
         const schemaValid = parsed.payload?.schema === "org.oscar.alarm-transfer" &&
           parsed.payload.version === 1 &&
           parsed.payload.source?.laneId === this.config.testLaneLabel &&
@@ -3247,16 +3609,22 @@ export class RegressionScenarios {
           isPublicObservationId(observationId) &&
           parsed.integrity?.algorithm === "SHA-256" &&
           /^[a-f0-9]{64}$/i.test(parsed.integrity.digest ?? "") &&
-          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true;
+          parsed.transport?.startsWith("OSCAR-ALARM:1:") === true &&
+          !alreadyResolved;
         const pngValid = qrBytes.length > 100 &&
           qrBytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
         const expectedChartSeries: AlarmChartSeries[] = [];
         if ((parsed.payload?.series?.gamma?.exportedCount ?? 0) > 0) expectedChartSeries.push("gamma");
         if ((parsed.payload?.series?.neutron?.exportedCount ?? 0) > 0) expectedChartSeries.push("neutron");
+        const passed = bytes.length > 100 && schemaValid && pngValid;
+        if (passed) this.resolvedAlarmEventIds.add(observationId);
         return {
-          passed: bytes.length > 100 && schemaValid && pngValid,
-          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; schema/lane/occupancy/integrity valid=${schemaValid}; PNG valid=${pngValid}`,
-          value: {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries},
+          passed,
+          observed: `JSON=${bytes.length} bytes; PNG=${qrBytes.length} bytes; ` +
+            `schema/lane/occupancy/integrity/fresh UUID valid=${schemaValid}; PNG valid=${pngValid}`,
+          value: passed
+            ? {...artifacts, observationId, occupancyId: exportedOccupancyId, expectedChartSeries}
+            : undefined,
           evidence: join("downloads", basename(artifacts.qrImage)),
         };
       });
@@ -3846,13 +4214,25 @@ export class RegressionScenarios {
         const value = assessStoragePlatform(await probe.runJson("platform"));
         const release = this.config.storageExpectedRelease;
         const resources = value.archiveResources;
+        const indexes = value.observationIndexes;
         const passed = storagePlatformHasExactReleaseIdentity(
           value, release, this.config.storageBackupMode,
         ) && value.dataChecksums === "on" &&
           value.pgStatStatementsInstalled && value.pgStatStatementsPreloaded &&
           value.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
           value.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM && value.batchRewriteConfigured &&
-          value.dailyJournalConfigured &&
+          value.archiveEnabled === true &&
+          value.dailyJournalConfigured && value.deleteHotAfterArchive === true &&
+          Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
+            value[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
+          Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
+            value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
+          JSON.stringify(value.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+          JSON.stringify(value.packagedDefaults.outputNames) ===
+            JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+          indexes.genericPayloadGinAbsent && indexes.requiredCount === 13 &&
+          indexes.requiredPresent === indexes.requiredCount && indexes.missingNames.length === 0 &&
+          indexes.eventPathGinExact && indexes.numericEventIndexesExact &&
           resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
           resources.threads === REGRESSION_ARCHIVE_RESOURCES.threads &&
           resources.maximumTemporaryMegabytes ===
@@ -3862,6 +4242,26 @@ export class RegressionScenarios {
           resources.sessionAcquireTimeoutSeconds ===
             REGRESSION_ARCHIVE_RESOURCES.sessionAcquireTimeoutSeconds &&
           resources.temporaryDirectory === REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory;
+        return {passed, value, observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "hot-stage",
+        action: "verify immutable observation staging lifecycle",
+        target: "oscar_obs_stage_partition/oscar_obs_stage_owner",
+        expected: "PARQUET_PRIMARY reports exact attached/detached children and sidecar ownership, no orphan or missing ownership, NULL legacy markers, mutable-only parent rows, and an oldest received_at within the one-hour staging SLO; HOT_RETENTION remains not applicable",
+      }, async () => {
+        const value = await poll(
+          async () => assessImmutableStageHealth(await probe.runJson("stage-health")),
+          candidate => candidate.storageMode === "PARQUET_PRIMARY"
+            ? immutableStageHealthIsSafe(candidate)
+            : !candidate.applicable,
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "immutable staging catalog to reach a consistent read-only boundary"},
+        );
+        const passed = value.storageMode === "PARQUET_PRIMARY"
+          ? immutableStageHealthIsSafe(value)
+          : !value.applicable;
         return {passed, value, observed: JSON.stringify(value)};
       });
 
@@ -3896,15 +4296,15 @@ export class RegressionScenarios {
       await this.check({
         scenario: "storage-health", category: "cold-archive", action: "verify bounded DuckDB scratch hygiene",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "the configured scratch root is absent or a private archive-disjoint empty runtime directory",
+        expected: "the private archive-disjoint scratch root contains its exact 0600 lease and no operation or unexpected entries",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, false),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "DuckDB scratch to become empty between bounded operations"},
+            description: "DuckDB scratch to retain only its safe lease between bounded operations"},
         );
-        const clean = archiveScratchIsSafe(value, false);
+        const clean = archiveScratchIsSafe(value);
         return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
 
@@ -3913,9 +4313,15 @@ export class RegressionScenarios {
         target: "retained-media/v1",
         expected: "checkpoint schema 2 and compact hourly/deletion indexes are structurally valid, with no legacy markers, tombstones, partials, or unsafe entries",
       }, async () => {
-        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
+        const requirePopulated = Boolean(this.config.storageRetainedEventId);
+        const value = await poll(
+          async () => assessMediaMetadataHealth(await probe.runJson("media-metadata-health")),
+          candidate => mediaMetadataHealthIsSafe(candidate, requirePopulated),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "retained-media metadata to reach an atomic clean boundary"},
+        );
         return {
-          passed: mediaMetadataHealthIsSafe(value, Boolean(this.config.storageRetainedEventId)),
+          passed: mediaMetadataHealthIsSafe(value, requirePopulated),
           observed: JSON.stringify(value),
         };
       });
@@ -3977,19 +4383,12 @@ export class RegressionScenarios {
           });
         } finally { await page.close(); }
       }
-      if (platform?.deleteHotAfterArchive === true && this.config.profile === "smoke") {
-        this.reporter.error("storage-health", "configuration",
-          "deleteHotAfterArchive is enabled on a smoke-only target; require a successful lifecycle/restore qualification before production rollout",
-          "", "warning");
-      }
     } finally { await probe.cleanup(); }
   }
 
   private async storageLifecycle(): Promise<void> {
     if (this.storageUnavailable("storage-lifecycle")) return;
     const probe = this.alarmMediaProbe ?? new StorageProbeClient(this.config, this.reporter.runId);
-    const fixtureRun = safeName(this.reporter.runId).replaceAll("-", "_").slice(-80);
-    let fixtureCreateAttempted = false;
     let apiPage: Page | undefined;
     let directJournalLaneUid: string | undefined;
     let directJournalAfterAppend: DirectJournalLaneState | undefined;
@@ -3997,14 +4396,22 @@ export class RegressionScenarios {
       const platform = assessStoragePlatform(await probe.runJson("platform"));
       const profileAccepted = await this.check({scenario: "storage-lifecycle", category: "configuration", action: "verify accelerated disposable profile",
         target: this.config.targetHost,
-        expected: "the exact OSCAR 3.9.2 release, isolated JVM native/data temp contract, one-day archive profile, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
+        expected: "the exact OSCAR 3.9.2 release, fresh 30-minute PARQUET_PRIMARY staging profile, lean mutable-parent indexes, and explicit zero-day/five-frame alarm-media test profile are running"}, async () => {
         const media = platform.videoRetention;
         const resources = platform.archiveResources;
         const passed = storagePlatformHasExactReleaseIdentity(
           platform, this.config.storageExpectedRelease, this.config.storageBackupMode,
         ) &&
-            platform.deleteHotAfterArchive === true && platform.rollbackGraceDays === 1 &&
-            platform.archiveIntervalMinutes === 1 &&
+            platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
+            Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
+              platform[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
+            JSON.stringify(platform.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+            platform.observationIndexes.genericPayloadGinAbsent &&
+            platform.observationIndexes.requiredPresent ===
+              platform.observationIndexes.requiredCount &&
+            platform.observationIndexes.missingNames.length === 0 &&
+            platform.observationIndexes.eventPathGinExact &&
+            platform.observationIndexes.numericEventIndexesExact &&
             platform.schemaVersion === OSCAR_STORAGE_SCHEMA_VERSION &&
             platform.schemaChecksum === OSCAR_STORAGE_SCHEMA_CHECKSUM &&
             resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
@@ -4019,11 +4426,23 @@ export class RegressionScenarios {
             media.enabled === REGRESSION_MEDIA_RETENTION.enabled &&
             media.timeToRetentionDays === REGRESSION_MEDIA_RETENTION.timeToRetentionDays &&
             media.queryPeriodMinutes === REGRESSION_MEDIA_RETENTION.queryPeriodMinutes &&
+            media.maximumCatchUpHours === REGRESSION_MEDIA_RETENTION.maximumCatchUpHours &&
+            media.lateArrivalOverlapHours === REGRESSION_MEDIA_RETENTION.lateArrivalOverlapHours &&
+            media.lateArrivalScanPeriodMinutes ===
+              REGRESSION_MEDIA_RETENTION.lateArrivalScanPeriodMinutes &&
+            media.lateArrivalCatchUpHours === REGRESSION_MEDIA_RETENTION.lateArrivalCatchUpHours &&
+            media.reconciliationCatchUpHours ===
+              REGRESSION_MEDIA_RETENTION.reconciliationCatchUpHours &&
+            media.reconciliationPeriodHours ===
+              REGRESSION_MEDIA_RETENTION.reconciliationPeriodHours &&
+            media.occupancyStreamRefreshMinutes ===
+              REGRESSION_MEDIA_RETENTION.occupancyStreamRefreshMinutes &&
             media.frameCount === REGRESSION_MEDIA_RETENTION.frameCount &&
             media.jpegQuality === REGRESSION_MEDIA_RETENTION.jpegQuality &&
             media.sourceRollbackGraceHours === REGRESSION_MEDIA_RETENTION.sourceRollbackGraceHours &&
             media.metadataReclamationWorkLimit ===
-              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit;
+              REGRESSION_MEDIA_RETENTION.metadataReclamationWorkLimit &&
+            media.maintenanceWorkLimit === REGRESSION_MEDIA_RETENTION.maintenanceWorkLimit;
         return {
           passed,
           value: passed,
@@ -4032,7 +4451,7 @@ export class RegressionScenarios {
       });
       if (!profileAccepted) {
         throw new Error(
-          "Storage lifecycle mutation refused because the exact accelerated 3.9.2 archive/media test profile failed",
+          "Storage lifecycle refused because the exact 3.9.2 stage/archive/media test profile failed",
         );
       }
 
@@ -4082,17 +4501,17 @@ export class RegressionScenarios {
 
       const scratchAccepted = await this.check({
         scenario: "storage-lifecycle", category: "cold-archive",
-        action: "verify clean DuckDB scratch before fixture mutation",
+        action: "verify clean DuckDB scratch before stage observation",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "the configured private archive-disjoint scratch root is empty between archive operations",
+        expected: "the private archive-disjoint scratch root contains only its exact safe lease between archive operations",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, false),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "pre-lifecycle DuckDB scratch to become empty"},
+            description: "pre-lifecycle DuckDB scratch to retain only its safe lease"},
         );
-        const clean = archiveScratchIsSafe(value, false);
+        const clean = archiveScratchIsSafe(value);
         return {passed: clean, value: clean, observed: JSON.stringify(value)};
       });
       if (!scratchAccepted) {
@@ -4184,51 +4603,185 @@ export class RegressionScenarios {
         target: "retained-media/v1",
         expected: "generated five-frame media has schema-2 checkpoint state and compact hourly processed indexes with no legacy or unsafe metadata",
       }, async () => {
-        const value = assessMediaMetadataHealth(await probe.runJson("media-metadata-health"));
         const requirePopulated = this.generatedAlarmMedia.size > 0;
+        const value = await poll(
+          async () => assessMediaMetadataHealth(await probe.runJson("media-metadata-health")),
+          candidate => mediaMetadataHealthIsSafe(candidate, requirePopulated),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "retained-media metadata to reach an atomic clean boundary"},
+        );
         return {passed: mediaMetadataHealthIsSafe(value, requirePopulated), observed: JSON.stringify(value)};
       });
-      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-before", await probe.runJson("snapshot")));
-      fixtureCreateAttempted = true;
-      const fixture = await probe.runJson<{coldId: string; hotId: string; datastreamId: number;
-        coldTime: string; hotTime: string; activationBlocked: boolean; sourceMutated: boolean;
-        staleActivationRejected: boolean; staleRowUnmarked: boolean}>(
-          "fixture-create-race", [fixtureRun, String(this.config.storageHotRetentionDays)]);
-      await this.check({scenario: "storage-lifecycle", category: "cold-archive",
-        action: "reject concurrent source change during archive activation", target: String(fixture.coldId),
-        expected: "a controlled source-row change after export makes activation roll back without marking the stale row"}, async () => ({
-        passed: fixture.activationBlocked && fixture.sourceMutated && fixture.staleActivationRejected &&
-          fixture.staleRowUnmarked,
-        observed: JSON.stringify(fixture),
-      }));
-      const archived = await poll(
-        () => probe.runJson<{generationId: string | null; generationState: string | null;
-          parityVerified: boolean; generationRows: number; generationMinId: string | null;
-          generationMaxId: string | null; markedRows: number; fixtureColdMarked: boolean;
-          fixtureHotUnmarked: boolean; exactRowOwnership: boolean}>(
-          "fixture-status", [fixtureRun]),
-        value => Boolean(value.generationId && value.generationState === "ACTIVE" &&
-          value.parityVerified && value.generationRows === 1 && value.markedRows === 1 &&
-          value.fixtureColdMarked && value.fixtureHotUnmarked && value.exactRowOwnership),
-        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "the retried exact source row to enter one parity-verified archive generation"},
+      const lifecycleBefore = storageMetricFromProbe(
+        "storage-lifecycle-before",
+        await probe.runJson("snapshot"),
       );
-      await this.check({scenario: "storage-lifecycle", category: "cold-archive", action: "archive deterministic fixture",
-        target: String(fixture.coldId),
-        expected: "only the exact exported cold row is marked into an ACTIVE parity-verified generation; the hot control remains unmarked"}, async () => ({
-          passed: Boolean(archived.generationId && archived.parityVerified && archived.exactRowOwnership &&
-            archived.markedRows === 1 && archived.generationMinId === fixture.coldId &&
-            archived.generationMaxId === fixture.coldId), observed: JSON.stringify(archived),
-        }));
+      this.reporter.storageMetric(lifecycleBefore);
+      type PrimaryStageSample = {
+        available: boolean;
+        storeKey: string;
+        idScope: number;
+        parentTable: string;
+        childTable: string;
+        windowStart: string;
+        windowEnd: string;
+        rowCount: number;
+        ownerCount: number;
+        markerNonNullRowCount: number;
+        coldId: string;
+        datastreamId: number;
+        coldTime: string;
+        oldestReceivedAt: string;
+      };
+      type PrimaryStageStatus = {
+        registryState: "ATTACHED" | "DETACHED" | null;
+        relationPresent: boolean;
+        inheritsParent: boolean;
+        rowCount: number;
+        ownerCount: number;
+        markerNonNullRowCount: number;
+        coldHotPresent: boolean;
+        sampleConsistent: boolean;
+        selectedGeneration: {
+          generationId: string | null;
+          generationState: string | null;
+          parityVerified: boolean;
+          generationRowCount: number | null;
+        };
+        windowGenerations: {
+          generationCount: number;
+          generationIds: string[];
+          invalidGenerationCount: number;
+          nonSealedGenerationCount: number;
+          generationRowCount: number;
+        };
+      };
+      type PrimaryStageWitness = {
+        relationPresent: boolean;
+        fullOwnershipObserved: boolean;
+        rowCount: number;
+        ownerCount: number;
+        ownerGenerationCount: number;
+        invalidOwnerGenerationCount: number;
+        ownerGenerationRowCount: number;
+        generationIds: string[];
+        selectedGenerationId: string | null;
+        selectedGenerationState: string | null;
+        selectedGenerationParityVerified: boolean;
+      };
+      const stageSample = await poll(
+        () => probe.runJson<PrimaryStageSample>("stage-lifecycle-select"),
+        value => value.available,
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
+          description: "a completed nonempty 30-minute immutable stage child"},
+      );
+      const stageSampleAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "select a newly completed immutable stage child without mutation",
+        target: stageSample.childTable,
+        expected: "a completed attached LOGGED child still inside its archive-delay window contains only NULL legacy markers and has bounded exact sidecar ownership",
+      }, async () => {
+        const passed = stageSample.available && stageSample.idScope === this.config.storageDatabaseScope &&
+          stageSample.parentTable === "obs" && stageSample.rowCount > 0 &&
+          stageSample.ownerCount >= 0 && stageSample.ownerCount <= stageSample.rowCount &&
+          stageSample.markerNonNullRowCount === 0 &&
+          Number.isFinite(Date.parse(stageSample.windowStart)) &&
+          Number.isFinite(Date.parse(stageSample.windowEnd)) &&
+          Number.isFinite(Date.parse(stageSample.coldTime)) &&
+          Number.isFinite(Date.parse(stageSample.oldestReceivedAt));
+        return {passed, value: passed, observed: JSON.stringify(stageSample)};
+      });
+      if (!stageSampleAccepted) {
+        throw new Error("PARQUET_PRIMARY lifecycle refused an invalid immutable stage sample");
+      }
+      const witness = await probe.runJson<PrimaryStageWitness>("stage-lifecycle-witness", [
+        stageSample.childTable, stageSample.storeKey, String(stageSample.idScope),
+        String(stageSample.rowCount), stageSample.coldId,
+        String(Math.min(7_200, Math.ceil(this.config.storageArchiveTimeoutMs / 1_000))),
+      ]);
+      const ownershipWitnessAccepted = await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "witness exact multi-generation ownership before retirement",
+        target: stageSample.childTable,
+        expected: "while a read-only ACCESS SHARE lock keeps the child present, every exact row has one compact sidecar owner and every distinct owner generation is parity-verified ACTIVE or SEALED",
+      }, async () => {
+        const passed = witness.relationPresent && witness.fullOwnershipObserved &&
+          witness.rowCount === stageSample.rowCount &&
+          witness.ownerCount === stageSample.rowCount &&
+          witness.ownerGenerationCount > 0 &&
+          witness.ownerGenerationCount === witness.generationIds.length &&
+          new Set(witness.generationIds).size === witness.generationIds.length &&
+          witness.invalidOwnerGenerationCount === 0 &&
+          witness.ownerGenerationRowCount === stageSample.rowCount &&
+          witness.generationIds.every(id =>
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) &&
+          typeof witness.selectedGenerationId === "string" &&
+          witness.generationIds.includes(witness.selectedGenerationId) &&
+          ["ACTIVE", "SEALED"].includes(witness.selectedGenerationState ?? "") &&
+          witness.selectedGenerationParityVerified;
+        return {passed, value: passed, observed: JSON.stringify({stageSample, witness})};
+      });
+      if (!ownershipWitnessAccepted) {
+        throw new Error("PARQUET_PRIMARY lifecycle did not witness exact verified child ownership");
+      }
+      const sameWitnessedGenerationIds = (ids: string[]): boolean =>
+        ids.length === witness.generationIds.length &&
+        ids.every((id, index) => id === witness.generationIds[index]);
+      const retired = await poll(
+        () => probe.runJson<PrimaryStageStatus>("stage-lifecycle-status", [
+          stageSample.childTable, stageSample.storeKey, String(stageSample.idScope),
+          stageSample.coldId, String(stageSample.datastreamId),
+          stageSample.windowStart, stageSample.windowEnd, witness.selectedGenerationId!,
+        ]),
+        value => value.sampleConsistent && value.registryState === null &&
+          !value.relationPresent && !value.coldHotPresent &&
+          value.selectedGeneration.generationState === "SEALED" &&
+          value.selectedGeneration.parityVerified &&
+          value.windowGenerations.generationCount === witness.ownerGenerationCount &&
+          sameWitnessedGenerationIds(value.windowGenerations.generationIds) &&
+          value.windowGenerations.invalidGenerationCount === 0 &&
+          value.windowGenerations.nonSealedGenerationCount === 0 &&
+          value.windowGenerations.generationRowCount === stageSample.rowCount,
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 2_000,
+          description: "checksum/parity-verified whole-child retirement"},
+      );
+      const archived = retired.selectedGeneration;
+      await this.check({
+        scenario: "storage-lifecycle", category: "cold-archive",
+        action: "retire one verified immutable child as a whole relation",
+        target: stageSample.childTable,
+        expected: "the catalog entry and physical child disappear only after every witnessed generation passes parity and the selected observation remains in sealed Parquet; no row marker is used",
+      }, async () => {
+        const passed = retired.sampleConsistent && retired.registryState === null &&
+          !retired.relationPresent && !retired.inheritsParent && !retired.coldHotPresent &&
+          retired.markerNonNullRowCount === 0 && archived.parityVerified &&
+          archived.generationState === "SEALED" &&
+          archived.generationId === witness.selectedGenerationId &&
+          retired.windowGenerations.generationCount === witness.ownerGenerationCount &&
+          sameWitnessedGenerationIds(retired.windowGenerations.generationIds) &&
+          retired.windowGenerations.invalidGenerationCount === 0 &&
+          retired.windowGenerations.nonSealedGenerationCount === 0 &&
+          retired.windowGenerations.generationRowCount === stageSample.rowCount &&
+          typeof archived.generationId === "string";
+        return {passed, value: passed, observed: JSON.stringify({stageSample, witness, retired})};
+      });
+      if (!archived.generationId) {
+        throw new Error("Whole-child retirement produced no queryable archive generation");
+      }
+      this.reporter.storageMetric(storageMetricFromProbe(
+        "storage-lifecycle-after-whole-child-retirement",
+        await probe.runJson("snapshot"),
+      ));
       const exportDisruptionPhase = "storage-lifecycle-export-disruption";
       await this.metrics.sample();
       this.reporter.expectRemoteMetricDisruptionPhase(exportDisruptionPhase);
       this.metrics.setPhase(exportDisruptionPhase);
       try {
         await this.check({scenario: "storage-lifecycle", category: "portability", action: "export portable archive",
-          target: archived.generationId ?? "fixture generation",
+          target: archived.generationId,
           expected: "export contains hash-valid Parquet, manifests, schema material, query.sql, and README"}, async () => {
-          const value = await probe.runJson<Record<string, unknown>>("export-check", [fixtureRun]);
+          const value = await probe.runJson<Record<string, unknown>>(
+            "export-check", [archived.generationId!]);
           return {passed: value.checksumVerified === true && Number(value.parquetFiles) > 0 &&
             value.querySql === true && value.readme === true, observed: JSON.stringify(value)};
         });
@@ -4237,36 +4790,57 @@ export class RegressionScenarios {
         await this.metrics.sample();
       }
       await this.check({scenario: "storage-lifecycle", category: "portability",
-        action: "exercise deployed archive-object helper", target: archived.generationId ?? "fixture generation",
+        action: "exercise deployed archive-object helper", target: archived.generationId,
         expected: "the image helper verifies and copies a cataloged object by hash and rejects checksum mismatch and traversal"}, async () => {
-        const value = await probe.runJson<Record<string, unknown>>("archive-helper-check", [fixtureRun]);
+        const value = await probe.runJson<Record<string, unknown>>(
+          "archive-helper-check", [archived.generationId!]);
         const passed = ["verified", "copied", "copyChecksumValid", "mismatchRejected", "traversalRejected"]
           .every(field => value[field] === true);
         return {passed, observed: JSON.stringify(value)};
       });
       apiPage = await this.browser.oscarPage();
       const request = apiPage.context().request;
-      const coldPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.coldId));
-      const hotPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.hotId));
-      const streamPublicId = encodeOshBigId(this.config.storageDatabaseScope, BigInt(fixture.datastreamId));
-      await probe.runJson("fixture-accelerate", [fixtureRun]);
-      const sealed = await poll(
-        () => probe.runJson<{generationState: string | null; coldHotPresent: boolean; hotPresent: boolean}>(
-          "fixture-status", [fixtureRun]),
-        value => value.generationState === "SEALED" && !value.coldHotPresent && value.hotPresent,
-        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 5_000,
-          description: "parity-verified fixture generation to seal and delete only its cold hot-store row"},
-      );
+      const coldPublicId = encodeOshBigId(
+        this.config.storageDatabaseScope, BigInt(stageSample.coldId));
+      const streamPublicId = encodeOshBigId(
+        this.config.storageDatabaseScope, BigInt(stageSample.datastreamId));
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query cold event by ID",
-        target: coldPublicId, expected: "the cold observation remains queryable after its PostgreSQL row is removed"}, async () => {
+        target: coldPublicId, expected: "the archived observation remains queryable by its exact public ID after its whole PostgreSQL child is dropped"}, async () => {
         const response = await request.get(this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(coldPublicId)}`));
-        return {passed: sealed.generationState === "SEALED" && response.ok(),
-          observed: `generation=${sealed.generationState}; hot row=${sealed.coldHotPresent}; HTTP ${response.status()}`};
+        try {
+          const status = response.status();
+          if (!response.ok()) {
+            return {passed: false,
+              observed: `generation=${archived.generationState}; child present=${retired.relationPresent}; HTTP ${status}`};
+          }
+          const body = await response.json();
+          const record = body && typeof body === "object" ? body as Record<string, unknown> : null;
+          const idMatches = record?.id === coldPublicId;
+          const streamMatches = record?.["datastream@id"] === streamPublicId;
+          return {passed: archived.generationState === "SEALED" && idMatches && streamMatches,
+            observed: `generation=${archived.generationState}; child present=${retired.relationPresent}; HTTP ${status}; id=${String(record?.id)}; datastream=${String(record?.["datastream@id"])}`};
+        } finally {
+          await response.dispose();
+        }
       });
+      const hotSample = await poll(
+        () => probe.runJson<{available: boolean; hotId: string | null; hotTime: string | null}>(
+          "stage-lifecycle-hot", [String(stageSample.datastreamId), stageSample.coldId]),
+        value => value.available && typeof value.hotId === "string" &&
+          typeof value.hotTime === "string",
+        {timeoutMs: this.config.storageArchiveTimeoutMs, intervalMs: 2_000,
+          description: "a current attached hot sample for the archived datastream"},
+      );
+      if (!hotSample.hotId || !hotSample.hotTime) {
+        throw new Error("Mixed-tier retrieval found no current attached hot sample");
+      }
+      const hotPublicId = encodeOshBigId(
+        this.config.storageDatabaseScope, BigInt(hotSample.hotId));
+      const hotTime = hotSample.hotTime;
       await this.check({scenario: "storage-lifecycle", category: "mixed-tier-query", action: "query mixed hot/cold range",
-        target: streamPublicId, expected: "bounded ascending and descending pages over one range expose the cold and hot fixture IDs"}, async () => {
-        const start = new Date(Date.parse(fixture.coldTime) - 60_000).toISOString();
-        const end = new Date(Date.parse(fixture.hotTime) + 60_000).toISOString();
+        target: streamPublicId, expected: "bounded ascending and descending filters over one datastream expose the exact cold Parquet ID and a current attached-stage ID"}, async () => {
+        const start = new Date(Date.parse(stageSample.coldTime) - 60_000).toISOString();
+        const end = new Date(Date.parse(hotTime) + 60_000).toISOString();
         const base = `/sensorhub/api/datastreams/${encodeURIComponent(streamPublicId)}/observations?phenomenonTime=${encodeURIComponent(`${start}/${end}`)}&limit=10000`;
         const ascending = await request.get(this.viewerUrl(`${base}&order=asc`));
         const descending = await request.get(this.viewerUrl(`${base}&order=desc`));
@@ -4277,99 +4851,21 @@ export class RegressionScenarios {
           }
           const ascendingIds = parseCollectionIds(await ascending.json());
           const descendingIds = parseCollectionIds(await descending.json());
-          const coldFound = ascendingIds.includes(coldPublicId);
-          const hotFound = descendingIds.includes(hotPublicId);
-          return {passed: coldFound && hotFound,
-            observed: `ascending=${ascendingIds.length}, cold=${coldFound}; descending=${descendingIds.length}, hot=${hotFound}`};
+          const ascColdIndex = ascendingIds.indexOf(coldPublicId);
+          const ascHotIndex = ascendingIds.indexOf(hotPublicId);
+          const descHotIndex = descendingIds.indexOf(hotPublicId);
+          const descColdIndex = descendingIds.indexOf(coldPublicId);
+          const coldFound = ascColdIndex >= 0 && descColdIndex >= 0;
+          const hotFound = ascHotIndex >= 0 && descHotIndex >= 0;
+          const ordered = coldFound && hotFound &&
+            ascColdIndex < ascHotIndex && descHotIndex < descColdIndex;
+          return {passed: ordered,
+            observed: `ascending=${ascendingIds.length}, cold=${ascColdIndex}, hot=${ascHotIndex}; descending=${descendingIds.length}, hot=${descHotIndex}, cold=${descColdIndex}`};
         } finally {
           await ascending.dispose();
           await descending.dispose();
-        }
+          }
       });
-      const hotHold = await probe.runJson<{
-        holdId: string;
-        hotId: string;
-        resolution: string;
-        listed: boolean;
-      }>("fixture-hot-hold-create", [fixtureRun]);
-      try {
-        await this.check({
-          scenario: "storage-lifecycle", category: "retention",
-          action: "enforce exact hot-observation legal hold",
-          target: hotPublicId,
-          expected: "a listed HOT_EXACT hold rejects authenticated observation deletion and leaves the hot row queryable",
-        }, async () => {
-          const deletion = await request.delete(
-            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-          );
-          const deletionStatus = deletion.status();
-          const deletionRejected = !deletion.ok();
-          await deletion.dispose();
-          const stillPresent = await request.get(
-            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-          );
-          const queryStatus = stillPresent.status();
-          const queryable = stillPresent.ok();
-          await stillPresent.dispose();
-          const passed = hotHold.resolution === "HOT_EXACT" && hotHold.listed &&
-            hotHold.hotId === fixture.hotId && deletionRejected && queryable;
-          return {
-            passed,
-            observed: `resolution=${hotHold.resolution}; listed=${hotHold.listed}; ` +
-              `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
-          };
-        });
-      } finally {
-        const release = await probe.runJson<{released: boolean}>(
-          "fixture-hot-hold-release",
-          [fixtureRun, hotHold.holdId],
-        );
-        if (!release.released) throw new Error("Disposable HOT_EXACT hold was not released");
-      }
-      await this.check({
-        scenario: "storage-lifecycle", category: "retention",
-        action: "delete hot observation after hold release",
-        target: hotPublicId,
-        expected: "the same authenticated delete succeeds only after release and the observation is no longer queryable",
-      }, async () => {
-        const deletion = await request.delete(
-          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-        );
-        const deletionStatus = deletion.status();
-        const deleted = deletion.ok();
-        await deletion.dispose();
-        const missing = await request.get(
-          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(hotPublicId)}`),
-        );
-        const queryStatus = missing.status();
-        await missing.dispose();
-        return {
-          passed: deleted && queryStatus === 404,
-          observed: `DELETE HTTP ${deletionStatus}; follow-up GET HTTP ${queryStatus}`,
-        };
-      });
-      const purgeDisruptionPhase = "storage-lifecycle-purge-disruption";
-      await this.metrics.sample();
-      this.reporter.expectRemoteMetricDisruptionPhase(purgeDisruptionPhase);
-      this.metrics.setPhase(purgeDisruptionPhase);
-      try {
-        await this.check({scenario: "storage-lifecycle", category: "retention", action: "exercise holds and tokenized purge",
-          target: archived.generationId ?? "fixture generation",
-          expected: "GENERATION_EXACT and COLD_RANGE_CONSERVATIVE holds are listed and exclude the fixture generation from dry-run plans; wrong token changes nothing; exact fixture purge leaves ledger and tombstone"}, async () => {
-          const value = await probe.runJson<Record<string, unknown>>("fixture-controls", [fixtureRun]);
-          const passed = ["holdCreated", "holdListed", "holdReleased", "generationHoldCreated",
-            "generationHoldListed", "generationHoldEnforced", "observationHoldCreated",
-            "observationHoldListed", "coldObservationHoldEnforced", "wrongTokenRejected", "purged",
-            "objectsDeleted", "tombstonePresent", "ledgerPresent", "tokenReplayRejected"]
-            .every(key => value[key] === true) &&
-            value.generationHoldResolution === "GENERATION_EXACT" &&
-            value.observationHoldResolution === "COLD_RANGE_CONSERVATIVE";
-          return {passed, observed: JSON.stringify(value)};
-        });
-      } finally {
-        this.metrics.setPhase("storage-lifecycle-post-purge");
-        await this.metrics.sample();
-      }
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
         expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
@@ -4383,15 +4879,15 @@ export class RegressionScenarios {
         scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify DuckDB operation scratch cleanup",
         target: REGRESSION_ARCHIVE_RESOURCES.temporaryDirectory,
-        expected: "archive/export/query/count/delete sessions leave the private archive-disjoint scratch root empty",
+        expected: "archive/export/query/count/delete sessions remove every operation directory while preserving the exact safe lease",
       }, async () => {
         const value = await poll(
           async () => assessArchiveScratch(await probe.runJson("archive-scratch-health")),
-          scratch => archiveScratchIsSafe(scratch, true),
+          scratch => archiveScratchIsSafe(scratch),
           {timeoutMs: 60_000, intervalMs: 1_000,
-            description: "post-lifecycle DuckDB scratch to become empty"},
+            description: "post-lifecycle DuckDB scratch to retain only its safe lease"},
         );
-        return {passed: archiveScratchIsSafe(value, true), observed: JSON.stringify(value)};
+        return {passed: archiveScratchIsSafe(value), observed: JSON.stringify(value)};
       });
       const lifecycleRestartPhase = "storage-lifecycle-restart-disruption";
       // Finish any interval sample that captured the steady-state phase before allowing the
@@ -4412,7 +4908,14 @@ export class RegressionScenarios {
           recoveryErrors: number;
           shutdownErrors: number;
           cameraRecordingErrors: number;
+          scratchBeforeRestartCount: number;
+          scratchAfterRestartCount: number;
+          staleScratchAfterRestartCount: number;
+          scratchBeforeRestart: string[];
+          scratchAfterRestart: string[];
+          staleScratchAfterRestart: string[];
         }>("journal-restart", [directJournalLaneUid!]);
+        const scratchRestart = assessArchiveScratchRestart(value);
         const lane = await probe.runJson<DirectJournalLaneState>(
           "journal-lane-state",
           [directJournalLaneUid!],
@@ -4426,8 +4929,10 @@ export class RegressionScenarios {
           value.segmentFailures === 0;
           return {passed: value.healthy && exactRestartPreservation &&
             value.partialFiles === 0 && value.recoveryErrors === 0 &&
-            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable,
-          observed: JSON.stringify({restart: value, lane, preRestart: directJournalAfterAppend})};
+            value.shutdownErrors === 0 && value.cameraRecordingErrors === 0 && laneDurable &&
+            archiveScratchRestartIsSafe(scratchRestart),
+          observed: JSON.stringify({restart: value, scratchRestart, lane,
+            preRestart: directJournalAfterAppend})};
         });
       } finally {
         this.metrics.setPhase("storage-lifecycle-post-restart");
@@ -4453,7 +4958,7 @@ export class RegressionScenarios {
               stableMetadataSamples = signature === stableMetadataSignature
                 ? stableMetadataSamples + 1 : 1;
               stableMetadataSignature = signature;
-              return value.processedIndexFiles > 0 && stableMetadataSamples >= 3;
+              return mediaMetadataHealthIsSafe(value, true) && stableMetadataSamples >= 3;
             },
             {timeoutMs: 120_000, intervalMs: 2_000,
               description: "retained-media indexes to repopulate and stabilize after restart"},
@@ -4514,11 +5019,56 @@ export class RegressionScenarios {
       }
       await apiPage.close();
       apiPage = undefined;
-      this.reporter.storageMetric(storageMetricFromProbe("storage-lifecycle-after", await probe.runJson("snapshot")));
+      const lifecycleAfter = storageMetricFromProbe(
+        "storage-lifecycle-after",
+        await probe.runJson("snapshot"),
+      );
+      this.reporter.storageMetric(lifecycleAfter);
+      await this.check({
+        scenario: "storage-lifecycle",
+        category: "performance",
+        action: "verify bounded database work amplification",
+        target: "PostgreSQL observation lifecycle",
+        expected: "whole-child raw retirement adds no observation-row DELETE calls and uses at most 512 MiB of PostgreSQL temporary data",
+      }, async () => {
+        const delta = (field: keyof typeof lifecycleBefore): number | null => {
+          const before = lifecycleBefore[field];
+          const after = lifecycleAfter[field];
+          return typeof before === "number" && typeof after === "number" ? after - before : null;
+        };
+        const tempBytes = delta("tempBytes");
+        const tempBlocks = delta("statementTempBlocksWritten");
+        const deleteCalls = delta("observationDeleteCalls");
+        const deleteRows = delta("observationDeleteRows");
+        const singletonDeletes = delta("legacySingletonObservationDeleteCalls");
+        const batchedDeleteCalls = delta("batchedObservationDeleteCalls");
+        const batchedDeleteRows = delta("batchedObservationDeleteRows");
+        const unaccountedSingletonDeletes = singletonDeletes === null
+          ? null
+          : singletonDeletes;
+        const countersMonotonic = [tempBytes, tempBlocks, deleteCalls, deleteRows,
+          singletonDeletes, batchedDeleteCalls, batchedDeleteRows,
+          unaccountedSingletonDeletes]
+          .every(value => value !== null && value >= 0);
+        const passed = countersMonotonic && tempBytes! <= 512 * 1024 * 1024 &&
+          tempBlocks! <= 65_536 &&
+          deleteCalls === 0 && deleteRows === 0 &&
+          singletonDeletes === 0 &&
+          batchedDeleteCalls === 0 && batchedDeleteRows === 0 &&
+          unaccountedSingletonDeletes === 0;
+        return {passed, observed: JSON.stringify({
+          tempBytes, statementTempBlocksWritten: tempBlocks,
+          observationDeleteCalls: deleteCalls,
+          observationDeleteRows: deleteRows,
+          legacySingletonObservationDeleteCalls: singletonDeletes,
+          batchedObservationDeleteCalls: batchedDeleteCalls,
+          batchedObservationDeleteRows: batchedDeleteRows,
+          expectedAuthorizedHotDeleteSingletonCalls: 0,
+          unaccountedSingletonDeletes,
+        })};
+      });
     } finally {
       if (apiPage) await apiPage.close().catch(() => undefined);
-      if (fixtureCreateAttempted) await probe.runJson("fixture-cleanup", [fixtureRun]).catch(error =>
-        this.reporter.error("storage-lifecycle", "fixture-cleanup", error));
       await probe.cleanup();
       if (this.alarmMediaProbe === probe) this.alarmMediaProbe = undefined;
     }
