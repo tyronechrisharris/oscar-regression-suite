@@ -1304,3 +1304,21 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   assert.match(generated, /"render self-seeded retained-media gallery"/);
   assert.match(generated, /await this\.verifyRetainedMediaGallery\(/);
 });
+
+test("storage-health and storage-lifecycle verify ConSys API query latency and datastream bloat in the moment and over time", () => {
+  const healthStart = scenarios.indexOf("private async storageHealth");
+  const lifecycleStart = scenarios.indexOf("private async storageLifecycle", healthStart);
+  const restoreStart = scenarios.indexOf("private async storageRestoreDrill", lifecycleStart);
+  const health = scenarios.slice(healthStart, lifecycleStart);
+  const lifecycle = scenarios.slice(lifecycleStart, restoreStart);
+
+  assert.match(health, /verify ConSys API and browser observation query latency and database bloat/);
+  assert.match(health, /this\.measureConSysQueryLatencies\(latencyPage\)/);
+  assert.match(health, /dsBytes <= 32 \* 1024 \* 1024/);
+  assert.match(health, /connRows <= 18_000/);
+
+  assert.match(lifecycle, /verify bounded datastream bloat and query latency drift across archival/);
+  assert.match(lifecycle, /latencyBefore = await this\.measureConSysQueryLatencies\(beforeLatencyPage\)/);
+  assert.match(lifecycle, /const latencyAfter = await this\.measureConSysQueryLatencies\(apiPage\)/);
+  assert.match(lifecycle, /dsDelta <= 4 \* 1024 \* 1024/);
+});

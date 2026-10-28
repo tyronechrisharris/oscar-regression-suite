@@ -4344,7 +4344,46 @@ export class RegressionScenarios {
       });
 
       const snapshot = await probe.runJson<unknown>("snapshot");
-      this.reporter.storageMetric(storageMetricFromProbe("storage-health", snapshot));
+      const healthMetric = storageMetricFromProbe("storage-health", snapshot);
+      this.reporter.storageMetric(healthMetric);
+
+      const latencyPage = await this.browser.oscarPage();
+      try {
+        await this.check({
+          scenario: "storage-health",
+          category: "performance",
+          action: "verify ConSys API and browser observation query latency and database bloat",
+          target: this.config.targetHost,
+          expected: "obs_datastreams stays <= 32 MiB, connectionStatus <= 18000 rows/h, oscar_archive_schema_datastream_idx is present, single observation queries complete in <= 500 ms, datastreams?limit=1000 in <= 1000 ms, and 50-stream latest burst in <= 2500 ms",
+        }, async () => {
+          const latencies = await this.measureConSysQueryLatencies(latencyPage);
+          const dsBytes = healthMetric.datastreamsTableBytes ?? null;
+          const connRows = healthMetric.connectionStatusRowsLastHour ?? null;
+          const idxPresent = healthMetric.archiveSchemaDatastreamIndexPresent ?? null;
+          const passed = idxPresent === 1 &&
+            dsBytes !== null && dsBytes <= 32 * 1024 * 1024 &&
+            connRows !== null && connRows <= 18_000 &&
+            latencies.allSucceeded &&
+            latencies.datastreamsListMs <= 1_000 &&
+            latencies.latestNonArchivedMs <= 500 &&
+            latencies.latestPhenomenonNonArchivedMs <= 500 &&
+            latencies.latestArchivedMs <= 500 &&
+            latencies.latestPhenomenonArchivedMs <= 500 &&
+            latencies.unboundedWindowNonArchivedMs <= 500 &&
+            latencies.fiftyLaneBurstMs <= 2_500;
+          return {
+            passed,
+            observed: JSON.stringify({
+              datastreamsTableBytes: dsBytes,
+              connectionStatusRowsLastHour: connRows,
+              archiveSchemaDatastreamIndexPresent: idxPresent,
+              ...latencies,
+            }),
+          };
+        });
+      } finally {
+        await latencyPage.close();
+      }
 
       const eventId = this.config.storageRetainedEventId;
       if (!eventId) {
@@ -4617,6 +4656,13 @@ export class RegressionScenarios {
         await probe.runJson("snapshot"),
       );
       this.reporter.storageMetric(lifecycleBefore);
+      const beforeLatencyPage = await this.browser.oscarPage();
+      let latencyBefore: Awaited<ReturnType<typeof this.measureConSysQueryLatencies>>;
+      try {
+        latencyBefore = await this.measureConSysQueryLatencies(beforeLatencyPage);
+      } finally {
+        await beforeLatencyPage.close();
+      }
       type PrimaryStageSample = {
         available: boolean;
         storeKey: string;
@@ -5017,6 +5063,7 @@ export class RegressionScenarios {
           observed: JSON.stringify({backup: value, mediaBeforeBackup})};
         });
       }
+      const latencyAfter = await this.measureConSysQueryLatencies(apiPage);
       await apiPage.close();
       apiPage = undefined;
       const lifecycleAfter = storageMetricFromProbe(
@@ -5066,6 +5113,47 @@ export class RegressionScenarios {
           expectedAuthorizedHotDeleteSingletonCalls: 0,
           unaccountedSingletonDeletes,
         })};
+      });
+      await this.check({
+        scenario: "storage-lifecycle",
+        category: "performance",
+        action: "verify bounded datastream bloat and query latency drift across archival",
+        target: this.config.targetHost,
+        expected: "across whole-child archival, obs_datastreams stays <= 32 MiB with <= 4 MiB growth, connectionStatus stays <= 18000 rows/h, and post-archival ConSys API observation latencies remain within SLO",
+      }, async () => {
+        const dsBefore = lifecycleBefore.datastreamsTableBytes ?? null;
+        const dsAfter = lifecycleAfter.datastreamsTableBytes ?? null;
+        const dsDelta = dsBefore !== null && dsAfter !== null ? dsAfter - dsBefore : null;
+        const updBefore = lifecycleBefore.datastreamsUpdates ?? null;
+        const updAfter = lifecycleAfter.datastreamsUpdates ?? null;
+        const updDelta = updBefore !== null && updAfter !== null ? updAfter - updBefore : null;
+        const connRows = lifecycleAfter.connectionStatusRowsLastHour ?? null;
+        const idxPresent = lifecycleAfter.archiveSchemaDatastreamIndexPresent ?? null;
+        const passed = idxPresent === 1 &&
+          dsAfter !== null && dsAfter <= 32 * 1024 * 1024 &&
+          dsDelta !== null && dsDelta <= 4 * 1024 * 1024 &&
+          connRows !== null && connRows <= 18_000 &&
+          latencyAfter.allSucceeded &&
+          latencyAfter.datastreamsListMs <= 1_000 &&
+          latencyAfter.latestNonArchivedMs <= 500 &&
+          latencyAfter.latestPhenomenonNonArchivedMs <= 500 &&
+          latencyAfter.latestArchivedMs <= 500 &&
+          latencyAfter.latestPhenomenonArchivedMs <= 500 &&
+          latencyAfter.unboundedWindowNonArchivedMs <= 500 &&
+          latencyAfter.fiftyLaneBurstMs <= 2_500;
+        return {
+          passed,
+          observed: JSON.stringify({
+            datastreamsTableBytesBefore: dsBefore,
+            datastreamsTableBytesAfter: dsAfter,
+            datastreamsTableBytesDelta: dsDelta,
+            datastreamsUpdatesDelta: updDelta,
+            connectionStatusRowsLastHour: connRows,
+            archiveSchemaDatastreamIndexPresent: idxPresent,
+            latencyBefore,
+            latencyAfter,
+          }),
+        };
       });
     } finally {
       if (apiPage) await apiPage.close().catch(() => undefined);
@@ -5231,5 +5319,90 @@ export class RegressionScenarios {
       return {passed: count === 0, observed: `remaining indicators=${count}`};
     });
     await page.close();
+  }
+
+  private async measureConSysQueryLatencies(page: Page): Promise<{
+    allSucceeded: boolean;
+    datastreamsListMs: number;
+    latestNonArchivedMs: number;
+    latestPhenomenonNonArchivedMs: number;
+    latestArchivedMs: number;
+    latestPhenomenonArchivedMs: number;
+    unboundedWindowNonArchivedMs: number;
+    fiftyLaneBurstMs: number;
+  }> {
+    const timedGet = async (path: string, parseJson = false): Promise<{ok: boolean; ms: number; body?: unknown}> => {
+      const start = performance.now();
+      const response = await page.context().request.get(this.viewerUrl(path), {
+        headers: {Accept: "application/json"},
+      });
+      const body = parseJson && response.ok() ? await response.json() : await response.body();
+      const ms = Number((performance.now() - start).toFixed(1));
+      const ok = response.ok();
+      await response.dispose();
+      return {ok, ms, body};
+    };
+
+    const dsRes = await timedGet("/sensorhub/api/datastreams?limit=1000", true);
+    const items = dsRes.body && typeof dsRes.body === "object" && Array.isArray((dsRes.body as {items?: unknown[]}).items)
+      ? (dsRes.body as {items: Array<{id?: string; outputName?: string}>}).items
+      : [];
+    const byOutput = new Map<string, string[]>();
+    for (const item of items) {
+      if (typeof item?.id === "string" && typeof item?.outputName === "string") {
+        const list = byOutput.get(item.outputName) ?? [];
+        list.push(item.id);
+        byOutput.set(item.outputName, list);
+      }
+    }
+    const nonArchivedId = (byOutput.get("occupancy") ?? byOutput.get("connectionStatus") ?? [])[0] ?? "";
+    const archivedId = (byOutput.get("gammaCounts") ?? byOutput.get("neutronCounts") ?? [])[0] ?? "";
+    if (!dsRes.ok || !nonArchivedId || !archivedId) {
+      return {
+        allSucceeded: false,
+        datastreamsListMs: dsRes.ms,
+        latestNonArchivedMs: -1,
+        latestPhenomenonNonArchivedMs: -1,
+        latestArchivedMs: -1,
+        latestPhenomenonArchivedMs: -1,
+        unboundedWindowNonArchivedMs: -1,
+        fiftyLaneBurstMs: -1,
+      };
+    }
+
+    const encNa = encodeURIComponent(nonArchivedId);
+    const encAr = encodeURIComponent(archivedId);
+    const latestNa = await timedGet(`/sensorhub/api/datastreams/${encNa}/observations?resultTime=latest`);
+    const latestPhenomNa = await timedGet(`/sensorhub/api/datastreams/${encNa}/observations?phenomenonTime=latest`);
+    const latestAr = await timedGet(`/sensorhub/api/datastreams/${encAr}/observations?resultTime=latest`);
+    const latestPhenomAr = await timedGet(`/sensorhub/api/datastreams/${encAr}/observations?phenomenonTime=latest`);
+    const windowNa = await timedGet(`/sensorhub/api/datastreams/${encNa}/observations?limit=10`);
+
+    const burstIds: string[] = [];
+    for (const name of ["gammaCounts", "neutronCounts", "gammaThreshold", "occupancy", "connectionStatus"]) {
+      for (const id of (byOutput.get(name) ?? []).slice(0, 10)) {
+        burstIds.push(id);
+        if (burstIds.length >= 50) break;
+      }
+      if (burstIds.length >= 50) break;
+    }
+    const burstStart = performance.now();
+    const burstResults = await Promise.all(
+      burstIds.map(id => timedGet(`/sensorhub/api/datastreams/${encodeURIComponent(id)}/observations?resultTime=latest`)),
+    );
+    const fiftyLaneBurstMs = Number((performance.now() - burstStart).toFixed(1));
+    const allSucceeded = dsRes.ok && latestNa.ok && latestPhenomNa.ok &&
+      latestAr.ok && latestPhenomAr.ok && windowNa.ok &&
+      burstResults.length > 0 && burstResults.every(res => res.ok);
+    return {
+      allSucceeded,
+      datastreamsListMs: dsRes.ms,
+      latestNonArchivedMs: latestNa.ms,
+      latestPhenomenonNonArchivedMs: latestPhenomNa.ms,
+      latestArchivedMs: latestAr.ms,
+      latestPhenomenonArchivedMs: latestPhenomAr.ms,
+      unboundedWindowNonArchivedMs: windowNa.ms,
+      fiftyLaneBurstMs,
+    };
   }
 }

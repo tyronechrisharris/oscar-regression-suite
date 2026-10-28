@@ -1538,7 +1538,8 @@ export function storageMetricFromProbe(
     "retainedMediaManifestFiles", "retainedMediaJpegFiles", "processedObservationIndexFiles",
     "processedObservationIndexBytes", "deletionIndexFiles", "deletionIndexBytes",
     "legacyProcessedMarkerFiles", "legacyDeletionTombstones", "mediaMetadataCheckpointBytes",
-    "backupBytes",
+    "backupBytes", "datastreamsTableBytes", "datastreamsUpdates", "datastreamsHotUpdates",
+    "connectionStatusRowsLastHour", "archiveSchemaDatastreamIndexPresent",
   ] as const;
   const numbers = Object.fromEntries(fields.map(field => [field, nullableNumber(probe[field])])) as
     Record<typeof fields[number], number | null>;

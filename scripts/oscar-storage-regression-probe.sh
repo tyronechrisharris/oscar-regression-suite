@@ -2128,7 +2128,14 @@ COMMANDS
     jobs AS (SELECT count(*) FILTER(WHERE state='FAILED') failed FROM oscar_archive_job),
     parity AS (SELECT count(*) FILTER(WHERE status<>'PASSED') failed FROM oscar_archive_verification WHERE verification_type='PARITY'),
     holds AS (SELECT count(*) FILTER(WHERE released_at IS NULL) active FROM oscar_retention_hold),
-    backups AS (SELECT count(*) FILTER(WHERE state='VERIFIED') verified FROM oscar_backup_epoch)
+    backups AS (SELECT count(*) FILTER(WHERE state='VERIFIED') verified FROM oscar_backup_epoch),
+    ds_bloat AS (
+      SELECT coalesce(pg_total_relation_size(to_regclass('oscar.obs_datastreams')),0) ds_total,
+        coalesce((SELECT n_tup_upd FROM pg_stat_user_tables WHERE schemaname='oscar' AND relname='obs_datastreams'),0) ds_updates,
+        coalesce((SELECT n_tup_hot_upd FROM pg_stat_user_tables WHERE schemaname='oscar' AND relname='obs_datastreams'),0) ds_hot_updates,
+        coalesce((SELECT count(*) * 12 FROM ONLY oscar.obs o JOIN oscar.obs_datastreams d ON d.id=o.datastreamid WHERE d.data->>'outputName'='connectionStatus' AND o.phenomenontime >= (now() AT TIME ZONE 'UTC') - interval '5 minutes'),0) conn_status_rows_last_hour,
+        (to_regclass('oscar.oscar_archive_schema_datastream_idx') IS NOT NULL)::int archive_schema_ds_idx
+    )
     SELECT json_build_object('databaseSizeBytes',db.database_size,'observationTableBytes',db.obs_heap,
       'observationIndexBytes',db.obs_total-db.obs_heap,'walBytes',wal.wal_bytes,'tempBytes',stats.temp_bytes,
       'tuplesInserted',stats.tup_inserted,'tuplesUpdated',stats.tup_updated,'tuplesDeleted',stats.tup_deleted,
@@ -2152,8 +2159,12 @@ COMMANDS
       'processedObservationIndexFiles',$processed_indexes,'processedObservationIndexBytes',$processed_index_bytes,
       'deletionIndexFiles',$deletion_indexes,'deletionIndexBytes',$deletion_index_bytes,
       'legacyProcessedMarkerFiles',$legacy_markers,'legacyDeletionTombstones',$legacy_tombstones,
-      'mediaMetadataCheckpointBytes',$metadata_checkpoint_bytes,'backupBytes',$backup_bytes)
-    FROM db,stats,wal,statements,statement_io,catalog,jobs,parity,holds,backups;"
+      'mediaMetadataCheckpointBytes',$metadata_checkpoint_bytes,'backupBytes',$backup_bytes,
+      'datastreamsTableBytes',ds_bloat.ds_total,'datastreamsUpdates',ds_bloat.ds_updates,
+      'datastreamsHotUpdates',ds_bloat.ds_hot_updates,
+      'connectionStatusRowsLastHour',ds_bloat.conn_status_rows_last_hour,
+      'archiveSchemaDatastreamIndexPresent',ds_bloat.archive_schema_ds_idx)
+    FROM db,stats,wal,statements,statement_io,catalog,jobs,parity,holds,backups,ds_bloat;"
     ;;
 
   stage-health)

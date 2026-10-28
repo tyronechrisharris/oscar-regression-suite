@@ -162,6 +162,11 @@ export interface StorageMetricSample {
   legacyDeletionTombstones: number | null;
   mediaMetadataCheckpointBytes: number | null;
   backupBytes: number | null;
+  datastreamsTableBytes?: number | null;
+  datastreamsUpdates?: number | null;
+  datastreamsHotUpdates?: number | null;
+  connectionStatusRowsLastHour?: number | null;
+  archiveSchemaDatastreamIndexPresent?: number | null;
   note: string;
 }
 
