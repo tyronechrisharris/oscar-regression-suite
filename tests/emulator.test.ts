@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {assessKnownClearTamperBaseline, RpmEmulatorClient} from "../src/emulator.js";
-import type {RpmConfig} from "../src/types.js";
+import type {RpmConfig, RpmResponse, RpmStatus} from "../src/types.js";
 
 const original: RpmConfig = {
   name: "Lane50",
@@ -93,4 +93,51 @@ test("known-clear Tamper baseline rejects duplicate and incomplete inventories",
 
   assert.equal(assessment.passed, false);
   assert.deepEqual(assessment.duplicateIds, ["rpm-01"]);
+});
+
+test("replaceConfig waits for all previously connected OSCAR clients to reconnect", async () => {
+  const client = new RpmEmulatorClient("http://127.0.0.1:8000");
+  let running = true;
+  let postRestartPolls = 0;
+
+  const makeStatus = (connectedClients: number): RpmStatus => ({
+    id: "rpm-50",
+    state: "IDLE",
+    connected_clients: connectedClients,
+    occupancy_count: 10,
+    is_gamma_alarm: false,
+    is_neutron_alarm: false,
+    gh_fault: false,
+    gl_fault: false,
+    nh_fault: false,
+    tamper_fault: false,
+  });
+
+  client.get = async (): Promise<RpmResponse> => ({
+    id: "rpm-50",
+    name: "Lane50",
+    port: 10050,
+    running,
+    config: original,
+  });
+  client.stop = async () => {
+    running = false;
+    return {message: "stopped"};
+  };
+  client.update = async () => ({message: "updated"});
+  client.start = async () => {
+    running = true;
+    postRestartPolls = 0;
+    return {message: "started"};
+  };
+  client.statusOrNull = async () => makeStatus(2);
+  client.status = async () => {
+    postRestartPolls += 1;
+    // Simulate first peer reconnecting immediately and target server reconnecting on second poll
+    return makeStatus(postRestartPolls >= 2 ? 2 : 1);
+  };
+
+  const reconnected = await client.replaceConfig("rpm-50", client.shortAlarmConfig(original));
+  assert.equal(reconnected.connected_clients, 2);
+  assert.ok(postRestartPolls >= 2);
 });

@@ -169,11 +169,13 @@ export class RpmEmulatorClient {
     );
   }
 
-  async waitForConnected(rpmId: string, timeoutMs = 60_000): Promise<RpmStatus> {
+  async waitForConnected(rpmId: string, timeoutMs = 60_000, minClients = 1): Promise<RpmStatus> {
+    const requiredClients = Math.max(1, Math.trunc(minClients));
+    const suffix = requiredClients > 1 ? ` (${requiredClients} clients)` : "";
     return this.waitForStatus(
       rpmId,
-      (status) => status.connected_clients >= 1,
-      `${rpmId} to reconnect to OSCAR`,
+      (status) => status.connected_clients >= requiredClients,
+      `${rpmId} to reconnect to OSCAR${suffix}`,
       timeoutMs,
     );
   }
@@ -226,12 +228,19 @@ export class RpmEmulatorClient {
 
   async replaceConfig(rpmId: string, config: RpmConfig): Promise<RpmStatus> {
     const rpm = await this.get(rpmId);
+    let expectedClients = 1;
     if (rpm.running) {
+      const preStopStatus = await this.statusOrNull(rpmId);
+      expectedClients = Math.max(1, preStopStatus?.connected_clients ?? 1);
       await this.stop(rpmId);
       await this.waitForStopped(rpmId);
     }
     await this.update(rpmId, config);
     await this.start(rpmId);
-    return this.waitForConnected(rpmId);
+    const firstConnected = await this.waitForConnected(rpmId, 60_000, 1);
+    if (expectedClients <= 1 || firstConnected.connected_clients >= expectedClients) {
+      return firstConnected;
+    }
+    return this.waitForConnected(rpmId, 25_000, expectedClients).catch(() => this.status(rpmId));
   }
 }

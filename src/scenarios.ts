@@ -2528,6 +2528,10 @@ export class RegressionScenarios {
 
   private async connectionFault(): Promise<void> {
     const page = await this.browser.oscarPage();
+    const preStopClients = Math.max(
+      1,
+      (await this.emulator.statusOrNull(this.config.testRpmId))?.connected_clients ?? 1,
+    );
     let stopped = false;
     try {
       await this.emulator.stop(this.config.testRpmId);
@@ -2557,7 +2561,10 @@ export class RegressionScenarios {
     } finally {
       if (stopped) {
         await this.emulator.start(this.config.testRpmId).catch(() => undefined);
-        await this.emulator.waitForConnected(this.config.testRpmId);
+        const reconnected = await this.emulator.waitForConnected(this.config.testRpmId, 60_000, 1);
+        if (preStopClients > 1 && reconnected.connected_clients < preStopClients) {
+          await this.emulator.waitForConnected(this.config.testRpmId, 25_000, preStopClients).catch(() => undefined);
+        }
       }
     }
     await this.check({
@@ -3097,6 +3104,7 @@ export class RegressionScenarios {
         this.config.testRpmId,
         this.emulator.shortAlarmConfig(this.originalRpmConfig),
       );
+      await this.waitHealthRpmConnection(page, "online", 60_000);
       // Trigger both one-second occupancies before doing any Viewer work. The second OPEN is
       // consequently allowed to queue behind the first generation's keyframe-gated OPEN/CLOSE;
       // resolving the events afterwards also proves that neither generation inherited the
