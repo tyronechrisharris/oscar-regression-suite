@@ -17,7 +17,7 @@ const metadata: RunMetadata = {
   oscarLaneConfigSha256: "test-sha256",
   operationalViewLaneCounts: {"east-gate": 10, entrance: 25},
   eventUuidWorkflow: "auto", alarmTransferCameraWorkflow: "required",
-  storageWorkflow: "auto", storageExpectedRelease: "3.9.2", storageBackupWorkflow: "auto",
+  storageWorkflow: "auto", storageExpectedRelease: "3.11.0", storageBackupWorkflow: "auto",
   storageBackupMode: "disabled",
   storageProbeTimeoutMs: 1_800_000, storageRestoreProbeTimeoutMs: 7_200_000,
   remoteMetricsExpected: false,

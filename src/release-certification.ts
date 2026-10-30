@@ -97,7 +97,7 @@ export function validateRestoreEvidenceBundle(
       !Array.isArray(environment.scenarioFilter) || environment.scenarioFilter.length !== 0) {
     throw new Error("Restore evidence must be an unfiltered restore-drill profile");
   }
-  if (environment.storageExpectedRelease !== "3.9.2" ||
+  if (environment.storageExpectedRelease !== "3.11.0" ||
       environment.storageWorkflow !== "required" ||
       environment.storageBackupWorkflow !== "required" ||
       environment.storageBackupMode !== "single") {

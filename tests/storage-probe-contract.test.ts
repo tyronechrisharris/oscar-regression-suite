@@ -160,7 +160,7 @@ printf accepted`, "uuid", "123e4567-e89b-42d3-a456-426614174000"], {encoding: "u
 test("storage probe remains valid Bash and gates exact 3.9.2 image identity", () => {
   assert.doesNotThrow(() => execFileSync("bash", ["-n", probePath]));
   for (const required of [
-    "expected_release=3.9.2",
+    "expected_release=3.11.0",
     "org.opencontainers.image.version",
     "com.botts.oscar.storage-profile",
     "nginxinc/nginx-unprivileged:",

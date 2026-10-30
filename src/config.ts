@@ -302,7 +302,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     eventUuidWorkflow,
     alarmTransferCameraWorkflow,
     storageWorkflow,
-    storageExpectedRelease: "3.9.2",
+    storageExpectedRelease: "3.11.0",
     storageBackupWorkflow,
     storageBackupMode,
     storageTargetAcknowledgement: process.env.OSCAR_STORAGE_TARGET_ACK?.trim() || "",

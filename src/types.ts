@@ -43,7 +43,7 @@ export interface SuiteConfig {
   eventUuidWorkflow: CapabilityMode;
   alarmTransferCameraWorkflow: CapabilityMode;
   storageWorkflow: CapabilityMode;
-  storageExpectedRelease: "3.9.2";
+  storageExpectedRelease: "3.11.0";
   storageBackupWorkflow: CapabilityMode;
   storageBackupMode: BackupMode;
   storageTargetAcknowledgement: string;
@@ -209,7 +209,7 @@ export interface RunMetadata {
   eventUuidWorkflow: CapabilityMode;
   alarmTransferCameraWorkflow: CapabilityMode;
   storageWorkflow: CapabilityMode;
-  storageExpectedRelease: "3.9.2";
+  storageExpectedRelease: "3.11.0";
   storageBackupWorkflow: CapabilityMode;
   storageBackupMode: BackupMode;
   storageProbeTimeoutMs: number;
