@@ -59,7 +59,7 @@ test("Dashboard probe retains the unadjudicated alarm predicate when adding the 
   const source = new URL(baseSource);
   source.searchParams.set(
     "filter",
-    "(gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0",
+    "((gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0) AND (gammaAlarm=true AND neutronAlarm=false)",
   );
   assert.equal(hasDashboardAlarmPredicate(source.toString()), true);
   const probe = buildAdvancedDateFilterProbeUrls(
@@ -71,6 +71,11 @@ test("Dashboard probe retains the unadjudicated alarm predicate when adding the 
   assert.match(filter, /gammaAlarm=true OR neutronAlarm=true/);
   assert.match(filter, /adjudicatedIdsCount=0/);
   assert.match(filter, /startTime<'2026-10-23T15:10:00.000Z'/);
+
+  const eventLogBucket = new URL(baseSource);
+  eventLogBucket.searchParams.set("filter", "gammaAlarm=false AND neutronAlarm=false");
+  assert.equal(hasDashboardAlarmPredicate(eventLogBucket.toString()), false);
+  assert.equal(isEventObservationPageUrl(eventLogBucket.toString(), origin), true);
 });
 
 test("advanced date-filter response requires two successes, a positive count, and rows before cutoff", () => {

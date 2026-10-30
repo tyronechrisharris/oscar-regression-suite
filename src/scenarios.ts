@@ -34,6 +34,7 @@ import {
   assessAdvancedDateFilterResponses,
   buildAdvancedDateFilterProbeUrls,
   deriveExclusiveDateCutoff,
+  eventObservationStartTimes,
   hasDashboardAlarmPredicate,
   isEventObservationPageUrl,
 } from "./event-filter-oracle.js";
@@ -291,7 +292,7 @@ const SHIPPING_STORAGE_POLICY = {
   maximumDeletionsPerCycle: 2,
   deleteHotAfterArchive: true,
   videoRetentionDays: 0,
-  videoQueryPeriodMinutes: 5,
+  videoQueryPeriodMinutes: 1,
   maximumCatchUpHours: 6,
   lateArrivalOverlapHours: 24,
   lateArrivalScanPeriodMinutes: 360,
@@ -1669,13 +1670,17 @@ export class RegressionScenarios {
     page: Page,
     expected: "event-log" | "dashboard-alarms",
   ): Promise<Response> {
-    return page.waitForResponse(response => {
+    return page.waitForResponse(async response => {
       if (response.request().method() !== "GET" || response.status() < 200 || response.status() >= 300 ||
           !isEventObservationPageUrl(response.url(), this.config.oscarBaseUrl)) return false;
-      const sourceFilter = new URL(response.url()).searchParams.get("filter") ?? "";
-      return expected === "dashboard-alarms"
-        ? hasDashboardAlarmPredicate(response.url())
-        : sourceFilter === "";
+      const isDashboardAlarmQuery = hasDashboardAlarmPredicate(response.url());
+      if ((expected === "dashboard-alarms") !== isDashboardAlarmQuery) return false;
+      try {
+        const payload = await response.json();
+        return eventObservationStartTimes(payload).length > 0;
+      } catch {
+        return false;
+      }
     }, {timeout: this.config.eventTimeoutMs});
   }
 
